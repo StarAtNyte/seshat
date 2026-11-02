@@ -1,0 +1,19 @@
+[package]
+name = "zlib-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Z-Library desktop client (search + download) — native UI, no webview"
+license = "MIT"
+
+[dependencies]
+eframe = "0.31"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "socks", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+rfd = "0.15"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
