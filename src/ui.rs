@@ -1,10 +1,12 @@
-//! Visual design system: reader palettes, egui styling, painted icons.
+//! Visual identity: paper + ink + one vermilion accent, sharp edges, thin
+//! rules, grotesk display type and mono index labels. No gradients, no shadows.
 
-use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, Ui};
+use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, Ui};
 
 use crate::store::{ReaderSettings, Theme};
 
-pub const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
+/// The single accent: vermilion.
+pub const ACCENT: Color32 = Color32::from_rgb(255, 61, 0);
 
 #[derive(Clone, Copy)]
 pub struct Palette {
@@ -22,24 +24,27 @@ fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+pub const PAPER: Color32 = Color32::from_rgb(242, 239, 232);
+pub const INK: Color32 = Color32::from_rgb(14, 14, 14);
+
 pub fn palette_for(theme: Theme, custom_bg: [u8; 3], custom_fg: [u8; 3]) -> Palette {
     let (bg, fg, link) = match theme {
-        Theme::Light => (rgb([255, 255, 255]), rgb([31, 35, 40]), rgb([37, 99, 235])),
-        Theme::Paper => (rgb([251, 248, 241]), rgb([43, 42, 39]), rgb([30, 90, 200])),
-        Theme::Sepia => (rgb([244, 236, 216]), rgb([91, 70, 54]), rgb([150, 80, 30])),
-        Theme::Gray => (rgb([218, 218, 214]), rgb([34, 34, 34]), rgb([30, 80, 170])),
-        Theme::Dark => (rgb([30, 31, 34]), rgb([212, 212, 212]), rgb([120, 170, 255])),
-        Theme::Nord => (rgb([46, 52, 64]), rgb([216, 222, 233]), rgb([136, 192, 208])),
-        Theme::Black => (rgb([0, 0, 0]), rgb([190, 190, 190]), rgb([110, 160, 240])),
+        Theme::Light => (rgb([255, 255, 255]), rgb([20, 20, 20]), rgb([200, 45, 0])),
+        Theme::Paper => (PAPER, INK, rgb([200, 45, 0])),
+        Theme::Sepia => (rgb([240, 230, 208]), rgb([74, 56, 40]), rgb([170, 60, 20])),
+        Theme::Gray => (rgb([214, 213, 208]), rgb([24, 24, 24]), rgb([180, 40, 0])),
+        Theme::Dark => (rgb([20, 20, 19]), rgb([226, 223, 216]), rgb([255, 110, 60])),
+        Theme::Nord => (rgb([34, 39, 48]), rgb([216, 222, 233]), rgb([136, 192, 208])),
+        Theme::Black => (rgb([0, 0, 0]), rgb([196, 194, 188]), rgb([255, 100, 50])),
         Theme::Custom => {
             let bg = rgb(custom_bg);
             let fg = rgb(custom_fg);
-            (bg, fg, mix(fg, ACCENT, 0.6))
+            (bg, fg, mix(fg, ACCENT, 0.7))
         }
     };
     let dark = luminance(bg) < 0.45;
@@ -48,9 +53,9 @@ pub fn palette_for(theme: Theme, custom_bg: [u8; 3], custom_fg: [u8; 3]) -> Pale
         fg,
         muted: mix(bg, fg, 0.55),
         link,
-        panel: if dark { mix(bg, Color32::WHITE, 0.06) } else { mix(bg, Color32::BLACK, 0.035) },
-        border: mix(bg, fg, 0.14),
-        hover: mix(bg, fg, 0.08),
+        panel: bg,
+        border: mix(bg, fg, 0.18),
+        hover: mix(bg, fg, 0.06),
         dark,
     }
 }
@@ -63,53 +68,88 @@ pub fn luminance(c: Color32) -> f32 {
     (0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32) / 255.0
 }
 
-/// App-wide style tuned for a clean, modern look.
+pub fn ui_m(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-m".into()))
+}
+pub fn ui_b(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-b".into()))
+}
+pub fn mono(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("label".into()))
+}
+pub fn mono_m(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("label-m".into()))
+}
+
+/// Small uppercase mono label: "LIBRARY / 024 BOOKS".
+pub fn tag(text: impl Into<String>) -> RichText {
+    RichText::new(text.into().to_uppercase()).font(mono(10.5)).extra_letter_spacing(0.6)
+}
+
+/// Display headline in bold grotesk.
+pub fn display(text: impl Into<String>, size: f32) -> RichText {
+    RichText::new(text.into()).font(ui_b(size)).extra_letter_spacing(-size * 0.02)
+}
+
 pub fn style(ctx: &egui::Context, p: &Palette) {
     let mut v = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let sharp = CornerRadius::ZERO;
     v.panel_fill = p.bg;
-    v.window_fill = p.panel;
-    v.extreme_bg_color = if p.dark { mix(p.bg, Color32::BLACK, 0.3) } else { mix(p.bg, Color32::WHITE, 0.6) };
+    v.window_fill = p.bg;
+    v.extreme_bg_color = p.bg;
     v.faint_bg_color = p.hover;
-    v.window_stroke = Stroke::new(1.0, p.border);
-    v.window_corner_radius = CornerRadius::same(12);
-    v.menu_corner_radius = CornerRadius::same(10);
-    v.window_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(if p.dark { 110 } else { 40 }) };
-    v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(if p.dark { 100 } else { 35 }) };
-    v.selection.bg_fill = ACCENT.linear_multiply(if p.dark { 0.55 } else { 0.25 });
+    v.code_bg_color = p.hover;
+    v.window_stroke = Stroke::new(1.0, p.fg);
+    v.window_corner_radius = sharp;
+    v.menu_corner_radius = sharp;
+    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
+    v.selection.bg_fill = ACCENT.linear_multiply(if p.dark { 0.5 } else { 0.28 });
     v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.hyperlink_color = p.link;
     v.override_text_color = Some(p.fg);
+    v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
+    v.slider_trailing_fill = true;
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-        w.corner_radius = CornerRadius::same(8);
+        w.corner_radius = sharp;
+        w.expansion = 0.0;
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.fg);
-    v.widgets.inactive.weak_bg_fill = p.hover;
-    v.widgets.inactive.bg_fill = p.hover;
-    v.widgets.inactive.bg_stroke = Stroke::NONE;
+    v.widgets.noninteractive.bg_fill = p.bg;
+    v.widgets.noninteractive.weak_bg_fill = p.bg;
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.inactive.bg_fill = p.border;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.fg);
-    v.widgets.hovered.weak_bg_fill = mix(p.hover, p.fg, 0.08);
-    v.widgets.hovered.bg_fill = mix(p.hover, p.fg, 0.08);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border);
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_fill = p.fg;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.fg);
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, p.fg);
-    v.widgets.active.weak_bg_fill = mix(p.hover, p.fg, 0.15);
+    v.widgets.active.weak_bg_fill = p.fg;
     v.widgets.active.bg_fill = ACCENT;
-    v.widgets.active.fg_stroke = Stroke::new(1.5, p.fg);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, p.fg);
+    v.widgets.active.fg_stroke = Stroke::new(1.5, p.bg);
+    v.widgets.open.weak_bg_fill = p.hover;
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
-        s.spacing.item_spacing = vec2(8.0, 6.0);
+        s.spacing.item_spacing = vec2(10.0, 6.0);
         s.spacing.button_padding = vec2(10.0, 5.0);
         s.spacing.interact_size.y = 26.0;
         s.spacing.slider_width = 170.0;
-        s.spacing.menu_margin = egui::Margin::same(8);
-        s.spacing.window_margin = egui::Margin::same(14);
-        use egui::{FontFamily::Proportional, FontId, TextStyle::*};
+        s.spacing.slider_rail_height = 2.0;
+        s.spacing.menu_margin = egui::Margin::same(10);
+        s.spacing.window_margin = egui::Margin::same(18);
+        s.spacing.scroll = egui::style::ScrollStyle::thin();
+        s.interaction.selectable_labels = false;
+        use egui::{FontFamily::Proportional, TextStyle::*};
         s.text_styles = [
-            (Heading, FontId::new(21.0, Proportional)),
-            (Body, FontId::new(14.5, Proportional)),
-            (Button, FontId::new(14.0, Proportional)),
-            (Small, FontId::new(12.0, Proportional)),
-            (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
+            (Heading, ui_b(24.0)),
+            (Body, FontId::new(14.0, Proportional)),
+            (Button, FontId::new(13.5, Proportional)),
+            (Small, mono(11.0)),
+            (Monospace, mono(12.5)),
         ]
         .into();
     });
@@ -335,16 +375,13 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
 }
 
 pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, active: bool) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-    let vis = ui.visuals();
-    let fg = vis.override_text_color.unwrap_or(vis.text_color());
-    if active {
-        ui.painter().rect_filled(rect.shrink(1.0), CornerRadius::same(8), ACCENT.linear_multiply(0.18));
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect.shrink(1.0), CornerRadius::same(8), vis.widgets.hovered.weak_bg_fill);
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+    let fg = ui.visuals().override_text_color.unwrap_or(ui.visuals().text_color());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::ZERO, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    let color = if active { ACCENT } else { fg.linear_multiply(if resp.hovered() { 1.0 } else { 0.85 }) };
-    paint_icon(ui.painter(), rect.shrink(7.0), icon, color);
+    let color = if active { ACCENT } else { fg };
+    paint_icon(ui.painter(), rect.shrink(7.5), icon, color);
     if tip.is_empty() {
         resp
     } else {
@@ -352,59 +389,84 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, active: bool) -> Response
     }
 }
 
-/// Primary call-to-action button.
-pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
-    ui.add(egui::Button::new(egui::RichText::new(text).color(Color32::WHITE).strong()).fill(ACCENT).corner_radius(CornerRadius::same(8)).min_size(vec2(0.0, 30.0)))
+/// Uppercase mono text button; active = accent with a square marker.
+pub fn text_button(ui: &mut Ui, text: &str, active: bool) -> Response {
+    let fg = ui.visuals().override_text_color.unwrap_or(ui.visuals().text_color());
+    let font = mono_m(11.0);
+    let g = ui.painter().layout_no_wrap(text.to_uppercase(), font, fg);
+    let size = vec2(g.size().x + if active { 14.0 } else { 0.0 } + 12.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let color = if active { ACCENT } else if resp.hovered() { fg } else { fg.linear_multiply(0.78) };
+    let mut x = rect.left() + 6.0;
+    if active {
+        ui.painter().rect_filled(Rect::from_center_size(pos2(x + 3.0, rect.center().y), vec2(6.0, 6.0)), CornerRadius::ZERO, ACCENT);
+        x += 14.0;
+    }
+    ui.painter().galley(pos2(x, rect.center().y - g.size().y / 2.0), g, color);
+    if resp.hovered() {
+        ui.painter().line_segment([pos2(x, rect.bottom() - 3.0), pos2(rect.right() - 6.0, rect.bottom() - 3.0)], Stroke::new(1.0, color));
+    }
+    resp
 }
 
-/// Pill-style toggle chip.
+/// Solid ink block button; turns vermilion on hover.
+pub fn primary_button(ui: &mut Ui, text: &str) -> Response {
+    let ink = ui.visuals().override_text_color.unwrap_or(INK);
+    let bg = ui.visuals().panel_fill;
+    let g = ui.painter().layout_no_wrap(text.to_uppercase(), mono_m(11.5), bg);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 28.0, 32.0), Sense::click());
+    let fill = if resp.hovered() { ACCENT } else { ink };
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, bg);
+    resp
+}
+
+/// Navigation / filter item: text with optional count.
 pub fn chip(ui: &mut Ui, selected: bool, text: &str) -> Response {
-    let fg = ui.visuals().override_text_color.unwrap_or(ui.visuals().text_color());
-    let b = egui::Button::new(egui::RichText::new(text).color(if selected { Color32::WHITE } else { fg }).size(13.0))
-        .fill(if selected { ACCENT } else { ui.visuals().widgets.inactive.weak_bg_fill })
-        .corner_radius(CornerRadius::same(14))
-        .min_size(vec2(0.0, 26.0));
-    ui.add(b)
+    text_button(ui, text, selected)
 }
 
 pub fn section_label(ui: &mut Ui, text: &str) {
+    ui.add_space(8.0);
+    let c = ui.visuals().weak_text_color();
+    ui.label(tag(text).color(c));
+    let r = ui.available_rect_before_wrap();
+    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(text.to_uppercase()).size(11.0).strong().color(ui.visuals().weak_text_color()));
 }
 
-/// Generated cover for books without one.
+pub fn rule(ui: &mut Ui) {
+    let r = ui.available_rect_before_wrap();
+    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+    ui.add_space(1.0);
+}
+
+const COVER_INKS: &[[u8; 3]] = &[[14, 14, 14], [255, 61, 0], [36, 64, 160], [206, 200, 186], [62, 84, 58], [228, 196, 64], [120, 40, 40], [90, 90, 96]];
+
+/// Flat, typographic cover for books without one.
 pub fn paint_placeholder_cover(painter: &egui::Painter, rect: Rect, title: &str, author: &str) {
     let h = title.bytes().fold(5381u32, |a, b| a.wrapping_mul(33) ^ b as u32);
-    let hues = [[67, 97, 238], [214, 92, 92], [46, 160, 120], [180, 120, 50], [130, 80, 200], [40, 140, 170], [200, 80, 140], [90, 110, 130]];
-    let base = hues[(h % hues.len() as u32) as usize];
-    let c1 = Color32::from_rgb(base[0], base[1], base[2]);
-    let c2 = mix(c1, Color32::BLACK, 0.35);
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.left_top(), c1);
-    mesh.colored_vertex(rect.right_top(), c1);
-    mesh.colored_vertex(rect.right_bottom(), c2);
-    mesh.colored_vertex(rect.left_bottom(), c2);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    painter.add(mesh);
-    painter.rect_filled(Rect::from_min_size(rect.left_top() + vec2(rect.width() * 0.06, 0.0), vec2(2.0, rect.height())), CornerRadius::ZERO, Color32::from_white_alpha(40));
-    let w = rect.width() * 0.8;
-    let font = egui::FontId::new((rect.width() / 9.0).clamp(10.0, 20.0), egui::FontFamily::Name("book-b".into()));
-    let job = egui::text::LayoutJob {
-        wrap: egui::text::TextWrapping { max_width: w, max_rows: 5, ..Default::default() },
-        halign: egui::Align::Center,
-        ..egui::text::LayoutJob::single_section(title.to_string(), egui::TextFormat::simple(font, Color32::WHITE))
-    };
+    let c = COVER_INKS[(h % COVER_INKS.len() as u32) as usize];
+    let bg = Color32::from_rgb(c[0], c[1], c[2]);
+    let fg = if luminance(bg) > 0.55 { INK } else { PAPER };
+    painter.rect_filled(rect, CornerRadius::ZERO, bg);
+    let pad = (rect.width() * 0.08).max(4.0);
+    let w = rect.width() - 2.0 * pad;
+    // a bold stripe as the only ornament
+    let stripe_y = rect.top() + rect.height() * 0.62;
+    painter.rect_filled(Rect::from_min_size(pos2(rect.left(), stripe_y), vec2(rect.width(), (rect.height() * 0.02).max(2.0))), CornerRadius::ZERO, fg);
+    let size = (rect.width() / 7.5).clamp(9.0, 30.0);
+    let mut job = egui::text::LayoutJob::single_section(title.to_string(), egui::TextFormat { font_id: ui_b(size), color: fg, line_height: Some(size * 1.02), extra_letter_spacing: -size * 0.02, ..Default::default() });
+    job.wrap = egui::text::TextWrapping { max_width: w, max_rows: 5, overflow_character: Some('…'), ..Default::default() };
     let g = painter.layout_job(job);
-    painter.galley(pos2(rect.center().x, rect.top() + rect.height() * 0.18), g, Color32::WHITE);
-    if !author.is_empty() {
-        let font = egui::FontId::proportional((rect.width() / 13.0).clamp(9.0, 14.0));
-        let job = egui::text::LayoutJob {
-            wrap: egui::text::TextWrapping { max_width: w, max_rows: 2, ..Default::default() },
-            halign: egui::Align::Center,
-            ..egui::text::LayoutJob::single_section(author.to_string(), egui::TextFormat::simple(font, Color32::from_white_alpha(210)))
-        };
+    painter.galley(pos2(rect.left() + pad, stripe_y - g.size().y - pad * 0.6), g, fg);
+    if !author.is_empty() && rect.width() > 50.0 {
+        let mut job = egui::text::LayoutJob::single_section(author.to_uppercase(), egui::TextFormat::simple(mono((rect.width() / 16.0).clamp(7.0, 11.0)), fg));
+        job.wrap = egui::text::TextWrapping { max_width: w, max_rows: 2, overflow_character: Some('…'), ..Default::default() };
         let g = painter.layout_job(job);
-        painter.galley(pos2(rect.center().x, rect.bottom() - rect.height() * 0.12 - g.size().y), g, Color32::WHITE);
+        painter.galley(pos2(rect.left() + pad, stripe_y + pad), g, fg);
     }
 }
+
+#[allow(dead_code)]
+fn _keep(_: Pos2, _: Shape) {}

@@ -9,11 +9,16 @@ use std::sync::Arc;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
+static SG_R: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Regular.ttf");
+static SG_M: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf");
+static SG_B: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf");
+static PLEX_R: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
+static PLEX_M: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
+
 pub const SERIF_PREFS: &[&str] = &[
     "Literata", "Bookerly", "Charis SIL", "Source Serif 4", "Source Serif Pro", "Noto Serif", "Georgia", "Iowan Old Style", "Palatino Linotype",
     "Palatino", "Cambria", "Constantia", "DejaVu Serif", "Liberation Serif", "Times New Roman", "FreeSerif",
 ];
-const SANS_PREFS: &[&str] = &["Inter", "Segoe UI", "SF Pro Text", "Helvetica Neue", "Noto Sans", "Ubuntu", "Cantarell", "Open Sans", "Roboto", "DejaVu Sans", "Arial"];
 const MONO_PREFS: &[&str] = &["JetBrains Mono", "Cascadia Mono", "Consolas", "SF Mono", "Menlo", "Fira Mono", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Courier New"];
 const CJK_PREFS: &[&str] = &[
     "Noto Sans CJK SC", "Noto Serif CJK SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Hiragino Sans", "Yu Gothic",
@@ -103,15 +108,17 @@ pub fn install(ctx: &egui::Context, db: Option<&mut FontDb>, book_family: &str, 
 
     let mut names: HashMap<&str, Vec<String>> = HashMap::new();
     let mut cjk_name: Option<String> = None;
+    // Embedded identity fonts (OFL): identical look on every OS.
+    for (k, b) in [("sg-r", SG_R), ("sg-m", SG_M), ("sg-b", SG_B), ("plex-r", PLEX_R), ("plex-m", PLEX_M)] {
+        defs.font_data.insert(k.into(), Arc::new(FontData::from_static(b)));
+    }
+    defs.families.entry(FontFamily::Proportional).or_default().insert(0, "sg-r".into());
+    for (fam, face, mono) in [("ui-m", "sg-m", false), ("ui-b", "sg-b", false), ("label", "plex-r", true), ("label-m", "plex-m", true)] {
+        let mut chain = vec![face.to_string()];
+        chain.extend(if mono { base_mono.clone() } else { base_prop.clone() });
+        defs.families.insert(FontFamily::Name(fam.into()), chain);
+    }
     if let Some(db) = db {
-        // UI font
-        if let Some(sans) = db.first_available(SANS_PREFS) {
-            if let Some(f) = db.face(&sans, false, false) {
-                defs.font_data.insert("ui".into(), data(&f));
-                let fam = defs.families.entry(FontFamily::Proportional).or_default();
-                fam.insert(0, "ui".into());
-            }
-        }
         let fam = if !book_family.is_empty() && db.has(book_family) { Some(book_family.to_string()) } else { db.default_serif() };
         if let Some(fam) = fam {
             inst.book_family = fam.clone();
@@ -158,6 +165,7 @@ pub fn install(ctx: &egui::Context, db: Option<&mut FontDb>, book_family: &str, 
             chain.extend(names.get("book").cloned().unwrap_or_default());
         }
         if fam == "mono" {
+            chain.push("plex-r".into());
             chain.extend(base_mono.clone());
         } else {
             chain.extend(base_prop.clone());
