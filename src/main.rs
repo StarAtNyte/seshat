@@ -1,5 +1,8 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+/// Display name (single place to rename the app).
+pub const APP_NAME: &str = "zlib-reader";
+
 mod api;
 mod app;
 mod book;
@@ -42,7 +45,12 @@ fn main() -> eframe::Result<()> {
             .with_app_id("zlib-reader")
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([560.0, 420.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_decorations(false)
+            .with_transparent(false),
+        // Multiple windows on Wayland: a vsync'd swap can block forever on a
+        // window the compositor isn't drawing. We repaint on demand anyway.
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native("zlib-reader", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open)))))

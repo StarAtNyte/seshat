@@ -606,3 +606,35 @@ pub fn desk(p: &Palette) -> Color32 {
         mix(p.bg, p.fg, 0.07)
     }
 }
+
+/// Segmented control with a sliding indicator. Returns the clicked index.
+pub fn segmented(ui: &mut Ui, id: &str, labels: &[&str], selected: usize) -> Option<usize> {
+    let fg = ui.visuals().override_text_color.unwrap_or(ui.visuals().text_color());
+    let font = ui_m(13.0);
+    let widths: Vec<f32> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), fg).size().x + 20.0).collect();
+    let total: f32 = widths.iter().sum::<f32>() + 4.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(total, 30.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(15), ui.visuals().faint_bg_color);
+    let mut x = rect.left() + 2.0;
+    let mut xs = Vec::new();
+    for w in &widths {
+        xs.push(x);
+        x += w;
+    }
+    let sel = selected.min(labels.len().saturating_sub(1));
+    let ax = ui.ctx().animate_value_with_time(egui::Id::new((id, "x")), xs[sel], 0.18);
+    let aw = ui.ctx().animate_value_with_time(egui::Id::new((id, "w")), widths[sel], 0.18);
+    ui.painter().rect_filled(Rect::from_min_size(pos2(ax, rect.top() + 2.0), vec2(aw, 26.0)), CornerRadius::same(13), ui.visuals().panel_fill);
+    ui.painter().rect_stroke(Rect::from_min_size(pos2(ax, rect.top() + 2.0), vec2(aw, 26.0)), CornerRadius::same(13), Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+    let mut clicked = None;
+    for (i, l) in labels.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(xs[i], rect.top()), vec2(widths[i], 30.0));
+        let resp = ui.interact(r, egui::Id::new((id, i)), Sense::click());
+        let c = if i == sel { ACCENT } else if resp.hovered() { fg } else { fg.linear_multiply(0.7) };
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *l, font.clone(), c);
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}

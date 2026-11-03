@@ -4,6 +4,7 @@
 
 pub mod layout;
 
+mod chrome;
 mod fixed;
 mod flow;
 mod panels;
@@ -142,6 +143,15 @@ pub struct Reader {
 
     fx: fixed::FixedState,
     cjk_checked: bool,
+    goto_text: String,
+    hl_mode: Option<HlColor>,
+    auto: bool,
+    auto_last: Instant,
+    opened_at: Option<Instant>,
+    turn: Option<(Instant, i8)>,
+    page_anim: bool,
+    notebook: bool,
+    quick_note: String,
 }
 
 impl Reader {
@@ -222,7 +232,18 @@ impl Reader {
             toast: None,
             fx,
             cjk_checked: false,
+            goto_text: String::new(),
+            hl_mode: None,
+            auto: false,
+            auto_last: Instant::now(),
+            opened_at: None,
+            turn: None,
+            page_anim: true,
+            notebook: false,
+            quick_note: String::new(),
         };
+        r.side = Some(Side::Toc);
+        r.toc_scroll = true;
         r.data.last_read = store::now();
         r.clamp_loc();
         if app.kosync.enabled && !app.kosync.username.is_empty() {
@@ -710,12 +731,17 @@ impl Reader {
         }
 
         self.keyboard(ctx, &s, env, &mut actions);
+        self.tick_auto(ctx, &s);
 
-        if let Some(side) = self.side {
-            panels::sidebar(self, ctx, side, &pal, env);
+        if !self.fullscreen {
+            self.title_bar(ctx, &pal, &mut actions);
+            self.toolbar(ctx, &s, &pal, env);
+            if let Some(side) = self.side {
+                panels::sidebar(self, ctx, side, &pal, env);
+            }
         }
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::desk(&pal))).show(ctx, |ui| {
             let rect = ui.max_rect();
             match &self.book.content {
                 Content::Flow(_) => self.flow_view(ui, rect, &s, &pal, env),
@@ -723,13 +749,16 @@ impl Reader {
             }
         });
 
+        if self.fullscreen {
+            self.floating_toolbar(ctx, &s, &pal, env);
+        }
         let screen = ctx.screen_rect();
-        let near_top = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < screen.top() + 56.0 && p.x > ctx.available_rect().left());
-        let near_bottom = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y > screen.bottom() - 70.0 && p.x > ctx.available_rect().left());
-        let show_chrome = self.chrome || near_top || near_bottom || self.settings_open;
-        if show_chrome {
-            self.top_bar(ctx, &pal, env, &mut actions);
+        let near_bottom = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y > screen.bottom() - 64.0);
+        if near_bottom {
             self.bottom_bar(ctx, &pal, env);
+        }
+        if !self.fullscreen {
+            ui::resize_edges(ctx);
         }
         if self.speaker.is_some() || !self.tts_error.is_empty() {
             self.tts_bar(ctx, &pal, env);
@@ -778,8 +807,9 @@ impl Reader {
                 } else if self.side.is_some() {
                     self.side = None;
                 } else if self.fullscreen {
-                    self.fullscreen = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    self.toggle_fullscreen(ctx);
+                } else if self.hl_mode.is_some() {
+                    self.hl_mode = None;
                 } else {
                     actions.push(Action::Close);
                 }
@@ -832,9 +862,13 @@ impl Reader {
                     self.side = if self.side == Some(want) { None } else { Some(want) };
                     self.toc_scroll = true;
                 }
-                Key::F11 | Key::F => {
-                    self.fullscreen = !self.fullscreen;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                Key::F11 | Key::F => self.toggle_fullscreen(ctx),
+                Key::H if self.book.flow().is_some() => {
+                    self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };
+                }
+                Key::A => {
+                    self.auto = !self.auto;
+                    self.auto_last = Instant::now();
                 }
                 Key::Plus | Key::Equals if mods.command => self.bump_font(env, 1.0),
                 Key::Minus if mods.command => self.bump_font(env, -1.0),
@@ -1348,4 +1382,9 @@ pub fn deco_color(c: HlColor, dark: bool) -> Color32 {
 #[allow(dead_code)]
 fn _unused(_: Rect) {
     let _ = ACCENT;
+}
+
+pub(crate) fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
 }

@@ -77,7 +77,7 @@ pub struct App {
     query: String,
     format: String,
     covers: TexLoader,
-    reader: Option<Reader>,
+    readers: Vec<Reader>,
     opening: Option<String>,
     pending_jump: Option<(String, Loc)>,
     error: Option<String>,
@@ -134,7 +134,7 @@ impl App {
             query: String::new(),
             format: String::new(),
             covers: TexLoader::new(&ctx, 2),
-            reader: None,
+            readers: Vec::new(),
             opening: None,
             pending_jump: None,
             error: None,
@@ -272,10 +272,12 @@ impl App {
                     self.opening = None;
                     match r {
                         Ok((id, path, book)) => {
-                            if let Some(mut old) = self.reader.take() {
-                                old.close(&self.settings);
+                            if let Some(r) = self.readers.iter().find(|r| r.id == id) {
+                                // already open: bring its window forward
+                                self.ctx.send_viewport_cmd_to(r.viewport_id(), egui::ViewportCommand::Focus);
+                                self.pending_jump = None;
+                                continue;
                             }
-                            self.ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — zlib-reader", book.meta.title)));
                             let mut r = Reader::new(&self.ctx, id.clone(), path.clone(), book, &self.settings);
                             if let Some((pid, loc)) = self.pending_jump.take() {
                                 if pid == id {
@@ -285,7 +287,7 @@ impl App {
                             if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {
                                 e.last_read = store::now();
                             }
-                            self.reader = Some(r);
+                            self.readers.push(r);
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -305,8 +307,9 @@ impl App {
         }
     }
 
-    fn close_reader(&mut self) {
-        if let Some(mut r) = self.reader.take() {
+    fn close_reader(&mut self, i: usize) {
+        if i < self.readers.len() {
+            let mut r = self.readers.remove(i);
             r.close(&self.settings);
             if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == r.id) {
                 e.fraction = r.data.fraction;
@@ -316,8 +319,6 @@ impl App {
             self.index.save();
             self.refresh_overview();
             self.view_changed = Instant::now();
-            self.ctx.send_viewport_cmd(egui::ViewportCommand::Title("zlib-reader".into()));
-            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
     }
 
@@ -339,7 +340,7 @@ impl App {
     }
 
     fn sync_fonts(&mut self, ctx: &egui::Context) {
-        let family = match &self.reader {
+        let family = match self.readers.last() {
             Some(r) => r.effective(&self.settings.reader).font,
             None => self.settings.reader.font.clone(),
         };
@@ -471,7 +472,9 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.close_reader();
+        while !self.readers.is_empty() {
+            self.close_reader(0);
+        }
         self.settings.save();
         self.index.save();
     }
@@ -479,6 +482,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.debug_screenshot(ctx);
         self.drain();
+
         self.covers.poll();
         for _ in std::mem::take(&mut self.online.downloaded) {
             self.rescan();
@@ -494,29 +498,6 @@ impl eframe::App for App {
         self.sync_fonts(ctx);
         self.persist_settings();
 
-        if self.reader.is_some() {
-            let s = self.reader.as_ref().unwrap().effective(&self.settings.reader);
-            let pal = ui::palette(&s);
-            self.apply_style(ctx, &pal);
-            let actions = {
-                let r = self.reader.as_mut().unwrap();
-                let mut env = Env { app: &mut self.settings, families: &self.families, installed: &self.installed };
-                r.ui(ctx, &mut env)
-            };
-            for a in actions {
-                match a {
-                    Action::Close => self.close_reader(),
-                    Action::InstallFont { cjk, .. } => {
-                        if cjk {
-                            self.want_cjk = true;
-                        }
-                    }
-                }
-            }
-            self.handle_drops(ctx);
-            return;
-        }
-
         let pal = self.library_palette(ctx);
         self.apply_style(ctx, &pal);
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
@@ -528,6 +509,7 @@ impl eframe::App for App {
         }
         let q = self.query.clone();
         self.online.tick(&q, &self.settings);
+        self.title_bar(ctx, &pal);
         self.nav(ctx, &pal);
         // view transition: quick fade + rise
         let vt = ease(self.view_changed.elapsed().as_secs_f32() / 0.28);
@@ -561,6 +543,120 @@ impl eframe::App for App {
         self.settings_window(ctx, &pal);
         self.status_overlays(ctx, &pal);
         self.handle_drops(ctx);
+        ui::resize_edges(ctx);
+        self.reader_windows(ctx);
+    }
+}
+
+// ---------- windows ----------
+
+impl App {
+    /// Every open book lives in its own native window.
+    fn reader_windows(&mut self, ctx: &egui::Context) {
+        let mut close = Vec::new();
+        for i in 0..self.readers.len() {
+            let vid = self.readers[i].viewport_id();
+            let builder = self.readers[i].viewport_builder();
+            let mut actions = Vec::new();
+            {
+                let settings = &mut self.settings;
+                let families = &self.families;
+                let installed = &self.installed;
+                let r = &mut self.readers[i];
+                let debug_start = &mut self.debug_start;
+                let keys_sent = &mut self.debug_keys_sent;
+                let shot_req = &mut self.debug_shot_requested;
+                ctx.show_viewport_immediate(vid, builder, |vctx, _class| {
+                    let s = r.effective(&settings.reader);
+                    ui::style(vctx, &ui::palette(&s));
+                    let mut env = Env { app: settings, families, installed };
+                    actions = r.ui(vctx, &mut env);
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        actions.push(Action::Close);
+                    }
+                    // debug aid: ZR_SHOT_READER=out.png captures this window
+                    if let Ok(path) = std::env::var("ZR_SHOT_READER") {
+                        let started = *debug_start.get_or_insert_with(Instant::now);
+                        vctx.request_repaint_after(Duration::from_millis(50));
+                        if let Ok(keys) = std::env::var("ZR_READER_KEYS") {
+                            let steps: Vec<&str> = keys.split(',').filter(|k| !k.is_empty()).collect();
+                            let n = ((started.elapsed().as_millis() as i64 - 2500) / 500).max(-1);
+                            if n >= 0 && (n as usize) < steps.len() && *keys_sent <= n as usize {
+                                *keys_sent = n as usize + 1;
+                                if let Some(k) = egui::Key::from_name(steps[n as usize]) {
+                                    vctx.input_mut(|inp| inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }));
+                                }
+                            }
+                        }
+                        let wait = std::env::var("ZR_WAIT").ok().and_then(|w| w.parse().ok()).unwrap_or(4000u64);
+                        if started.elapsed() > Duration::from_millis(wait) && !*shot_req {
+                            *shot_req = true;
+                            vctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                        }
+                        let shot = vctx.input(|i| i.raw.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+                        if let Some(img) = shot {
+                            let [w, h] = img.size;
+                            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                            if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, bytes) {
+                                let _ = buf.save(&path);
+                            }
+                            std::process::exit(0);
+                        }
+                    }
+                });
+            }
+            for a in actions {
+                match a {
+                    Action::Close => close.push(i),
+                    Action::InstallFont { cjk, .. } => {
+                        if cjk {
+                            self.want_cjk = true;
+                        }
+                    }
+                }
+            }
+        }
+        // the shared style now belongs to the last reader; restore the library's next frame
+        if !self.readers.is_empty() {
+            self.style_key = None;
+        }
+        for i in close.into_iter().rev() {
+            self.close_reader(i);
+        }
+    }
+
+    /// Library title bar: wordmark, a live reading line, and playful window controls.
+    fn title_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
+        egui::TopBottomPanel::top("titlebar").exact_height(46.0).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 18, right: 12, top: 0, bottom: 0 })).show_separator_line(false).show(ctx, |ui| {
+            let rect = ui.max_rect();
+            let drag = ui.interact(rect, egui::Id::new("lib-drag"), Sense::click_and_drag());
+            ui::titlebar_behaviour(ctx, &drag);
+            ui.horizontal_centered(|ui| {
+                // wordmark: a tiny open book + name
+                let (m, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                let c = m.center();
+                ui.painter().add(egui::Shape::convex_polygon(vec![c + vec2(0.0, -6.0), c + vec2(-10.0, -9.0), c + vec2(-10.0, 7.0), c + vec2(0.0, 10.0)], ACCENT, Stroke::NONE));
+                ui.painter().add(egui::Shape::convex_polygon(vec![c + vec2(0.0, -6.0), c + vec2(10.0, -9.0), c + vec2(10.0, 7.0), c + vec2(0.0, 10.0)], ui::LIME, Stroke::NONE));
+                ui.label(RichText::new(crate::APP_NAME).font(ui_b(18.0)));
+                ui.add_space(14.0);
+                let week: f64 = (0..7).map(|d| self.overview.daily.get(&store::date_string(store::now() - d * 86400)).copied().unwrap_or(0.0)).sum();
+                let open = self.readers.len();
+                let line = if open > 0 {
+                    format!("{open} book{} open", if open == 1 { "" } else { "s" })
+                } else if week >= 60.0 {
+                    format!("{} min read this week", (week / 60.0).round())
+                } else {
+                    "Pick something good".into()
+                };
+                ui.label(RichText::new(line).font(ui_m(13.0)).color(pal.muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui::window_controls(ui, pal.fg) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+            ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.border));
+        });
     }
 }
 
@@ -980,12 +1076,21 @@ impl App {
             }
             self.shelf_open = None;
         }
-        // jump strip
+        // jump strip — text flush with the shelf titles below
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            ui.spacing_mut().item_spacing = vec2(22.0, 8.0);
             for (k, idx) in &groups {
-                let label = format!("{k}  {}", idx.len());
-                if text_button(ui, &label, false).clicked() {
+                let g = ui.painter().layout_no_wrap(k.clone(), ui_m(13.5), pal.fg);
+                let n = ui.painter().layout_no_wrap(idx.len().to_string(), ui_m(12.0), pal.muted);
+                let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 6.0 + n.size().x, 24.0), Sense::click());
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                let gw = g.size().x;
+                ui.painter().galley(pos2(r.left(), r.center().y - g.size().y / 2.0), g, pal.fg);
+                ui.painter().galley(pos2(r.left() + gw + 6.0, r.center().y - n.size().y / 2.0 + 1.0), n, pal.muted);
+                if t > 0.01 {
+                    ui.painter().hline(r.left()..=r.left() + gw * t, r.bottom() - 2.0, Stroke::new(1.5, ACCENT));
+                }
+                if resp.clicked() {
                     self.shelf_jump = Some(k.clone());
                 }
             }
@@ -1765,9 +1870,8 @@ fn trunc(s: &str, n: usize) -> String {
 
 /// Pill dropdown: label chip that opens a small menu.
 fn dropdown(ui: &mut egui::Ui, id: &str, label: &str, active: bool, body: impl FnOnce(&mut egui::Ui)) {
-    let r = text_button(ui, label, active);
-    let (cr, _) = ui.allocate_exact_size(vec2(10.0, 28.0), Sense::hover());
-    let c = cr.center() - vec2(4.0, 0.0);
+    let r = text_button(ui, &format!("{label}    "), active);
+    let c = pos2(r.rect.right() - 14.0, r.rect.center().y);
     let col = if active { ACCENT } else { ui.visuals().text_color() };
     ui.painter().line_segment([c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0)], Stroke::new(1.3, col));
     ui.painter().line_segment([c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)], Stroke::new(1.3, col));

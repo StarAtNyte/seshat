@@ -3,16 +3,20 @@
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Sense, Ui, Vec2};
+use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use super::layout::{Deco, DecoKind, SectionLayout, Typo};
 use super::{deco_color, Env, Reader};
 use crate::book::{BlockKind, Loc};
 use crate::store::{HlStyle, Layout, ReaderSettings};
 use crate::texload::Src;
-use crate::ui::{Palette, ACCENT};
+use crate::ui::{self, Palette, ACCENT};
 
 pub(super) struct Geo {
+    /// Paper sheets (one per visible page; scrolled mode = one tall sheet).
+    pub sheets: Vec<Rect>,
+    pub spine: Option<f32>,
+    pub pad: f32,
     pub x0: f32,
     pub col_w: f32,
     pub gap: f32,
@@ -25,29 +29,86 @@ impl Geo {
     fn origin(&self, col: usize) -> Pos2 {
         pos2(self.x0 + col as f32 * (self.col_w + self.gap), self.top)
     }
+    fn sheet(&self, col: usize) -> Rect {
+        self.sheets[col.min(self.sheets.len() - 1)]
+    }
 }
 
 impl Reader {
+    /// The open book on the desk: sheets, spine, text columns.
     fn geometry(&self, rect: Rect, s: &ReaderSettings) -> Geo {
-        let header = if s.show_header { 40.0 } else { 20.0 };
-        let footer = if s.show_footer { 40.0 } else { 20.0 };
-        let margin = s.margin.min(rect.width() * 0.15).max(12.0);
-        let avail = rect.width() - 2.0 * margin;
+        let desk = vec2((rect.width() * 0.025).clamp(10.0, 36.0), (rect.height() * 0.025).clamp(8.0, 22.0));
+        let book = rect.shrink2(desk);
+        let header = if s.show_header { 44.0 } else { 26.0 };
+        let footer = if s.show_footer { 44.0 } else { 26.0 };
         let paginated = s.layout == Layout::Paginated;
+        let pad = s.margin.clamp(16.0, 160.0).min(book.width() * 0.09);
         let two = paginated
             && match s.columns {
                 crate::store::Columns::One => false,
-                crate::store::Columns::Two => avail > 640.0,
-                crate::store::Columns::Auto => avail > 1050.0 && rect.width() > rect.height() * 1.1,
+                crate::store::Columns::Two => book.width() > 760.0,
+                crate::store::Columns::Auto => book.width() > 1100.0 && rect.width() > rect.height() * 1.15,
             };
-        let gap = if two { (margin * 1.5).clamp(40.0, 120.0) } else { 0.0 };
-        let col_w = if two { ((avail - gap) / 2.0).min(s.max_width) } else { avail.min(s.max_width) };
-        let cols = if two { 2 } else { 1 };
-        let total = col_w * cols as f32 + gap;
-        let x0 = (rect.center().x - total / 2.0).round();
-        let top = rect.top() + header;
-        let page_h = (rect.bottom() - footer - top).max(80.0);
-        Geo { x0, col_w: col_w.max(120.0), gap, cols, top, page_h }
+        let (sheets, spine) = if two {
+            let sw = (book.width() / 2.0).min(s.max_width + 2.0 * pad).floor();
+            let c = book.center().x.round();
+            (vec![Rect::from_min_max(pos2(c - sw, book.top()), pos2(c, book.bottom())), Rect::from_min_max(pos2(c, book.top()), pos2(c + sw, book.bottom()))], Some(c))
+        } else {
+            let sw = book.width().min(s.max_width + 2.0 * pad).floor();
+            (vec![Rect::from_center_size(book.center(), vec2(sw, book.height()))], None)
+        };
+        let col_w = (sheets[0].width() - 2.0 * pad).max(120.0);
+        let x0 = sheets[0].left() + pad;
+        let top = book.top() + header;
+        let page_h = (book.bottom() - footer - top).max(80.0);
+        Geo { sheets, spine, pad, x0, col_w, gap: if two { 2.0 * pad } else { 0.0 }, cols: if two { 2 } else { 1 }, top, page_h }
+    }
+
+    /// Paper, shadow, page-edge stacks and the spine gutter.
+    fn paint_book(&self, painter: &egui::Painter, g: &Geo, pal: &Palette, frac: f32) {
+        let all = g.sheets.iter().fold(g.sheets[0], |a, r| a.union(*r));
+        // soft stacked shadow (three cheap layers, no blur)
+        for (o, a) in [(2.0, 18u8), (5.0, 10), (9.0, 5)] {
+            painter.rect_filled(all.translate(vec2(0.0, o)).expand(o * 0.5), CornerRadius::same(4), Color32::from_black_alpha(if pal.dark { a * 3 } else { a }));
+        }
+        // page edges: thicker on the side you've read / still to read
+        let edge = |x: f32, dir: f32, n: usize| {
+            for i in 1..=n {
+                let xi = x + dir * i as f32 * 1.6;
+                let inset = i as f32 * 0.8;
+                painter.vline(xi, all.top() + inset..=all.bottom() - inset, Stroke::new(1.0, ui::mix(pal.bg, pal.fg, if i % 2 == 0 { 0.08 } else { 0.2 })));
+            }
+        };
+        let left_n = ((frac * 7.0).round() as usize).min(7);
+        let right_n = (((1.0 - frac) * 7.0).round() as usize).min(7);
+        if g.spine.is_some() {
+            edge(all.left(), -1.0, left_n.max(1));
+        }
+        edge(all.right(), 1.0, right_n.max(1));
+        for sh in &g.sheets {
+            painter.rect_filled(*sh, CornerRadius::same(2), pal.bg);
+        }
+        // gutter: shading into the spine
+        let shade = Color32::from_black_alpha(if pal.dark { 70 } else { 26 });
+        let clear = Color32::TRANSPARENT;
+        let band = |x0: f32, x1: f32, c0: Color32, c1: Color32| {
+            let mut m = egui::Mesh::default();
+            m.colored_vertex(pos2(x0, all.top()), c0);
+            m.colored_vertex(pos2(x1, all.top()), c1);
+            m.colored_vertex(pos2(x1, all.bottom()), c1);
+            m.colored_vertex(pos2(x0, all.bottom()), c0);
+            m.add_triangle(0, 1, 2);
+            m.add_triangle(0, 2, 3);
+            painter.add(m);
+        };
+        match g.spine {
+            Some(x) => {
+                band(x - 46.0, x, clear, shade);
+                band(x, x + 46.0, shade, clear);
+                painter.vline(x, all.y_range(), Stroke::new(1.0, Color32::from_black_alpha(if pal.dark { 90 } else { 30 })));
+            }
+            None => band(all.left(), all.left() + 22.0, shade, clear),
+        }
     }
 
     fn ensure_layout(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &Env, g: &Geo) {
@@ -122,6 +183,9 @@ impl Reader {
         if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
             return self.scroll_by(self.view_h * 0.9);
         }
+        if self.page_anim {
+            self.turn = Some((Instant::now(), 1));
+        }
         if self.page + self.step < l.pages.len() {
             self.page += self.step;
             let (b, o) = l.page_start(self.page);
@@ -144,6 +208,9 @@ impl Reader {
         let Some(l) = &self.layout else { return };
         if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
             return self.scroll_by(-self.view_h * 0.9);
+        }
+        if self.page_anim && (self.page > 0 || l.section > 0) {
+            self.turn = Some((Instant::now(), -1));
         }
         if self.page >= self.step {
             self.page -= self.step;
@@ -272,6 +339,15 @@ impl Reader {
         let g = self.geometry(rect, s);
         self.view_h = g.page_h;
         self.ensure_layout(ui.ctx(), s, pal, env, &g);
+        self.page_anim = s.page_anim;
+        if self.opened_at.is_none() {
+            let _ = self.cover_tex();
+            if self.tex.get("__cover").is_some() || self.book.meta.cover.is_none() || self.tex.state("__cover").is_some_and(|s| matches!(s, crate::texload::State::Failed)) {
+                self.opened_at = Some(std::time::Instant::now());
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
         let Some(l) = &self.layout else { return };
         if l.section != self.loc.section {
             return;
@@ -311,7 +387,10 @@ impl Reader {
         if resp.drag_stopped() {
             self.drag_anchor = None;
             if self.sel.is_some() {
-                self.sel_popup = resp.interact_pointer_pos();
+                match self.hl_mode {
+                    Some(c) => self.add_annotation(c, false),
+                    None => self.sel_popup = resp.interact_pointer_pos(),
+                }
             }
         }
         if resp.double_clicked() {
@@ -392,52 +471,133 @@ impl Reader {
             return;
         }
         let painter = ui.painter_at(rect);
+        let frac = self.book.flow().map(|f| f.fraction(self.loc)).unwrap_or(0.0);
+        self.paint_book(&painter, &g, pal, frac);
+        // opening: the cover swings away toward the spine
+        let now = std::time::Instant::now();
+        let open_t = self.opened_at.map(|t| (now - t).as_secs_f32() / 0.75).unwrap_or(0.0);
+        let turn_t = self.turn.map(|(t, _)| (now - t).as_secs_f32() / 0.26).unwrap_or(1.0);
+        if open_t < 1.0 || turn_t < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let mut text_painter = painter.clone();
+        if open_t < 1.0 {
+            text_painter.multiply_opacity(super::ease((open_t - 0.35) / 0.65));
+        } else if turn_t < 1.0 {
+            text_painter.multiply_opacity(0.35 + 0.65 * super::ease(turn_t));
+        }
         let tex = &self.tex;
         let texfn = |k: &str| tex.get(k).map(|t| t.tex.id());
         let dim = s.dim_images && pal.dark;
         if paginated {
             for col in 0..g.cols {
                 if let Some(pg) = l.pages.get(self.page + col) {
-                    l.paint(&painter, g.origin(col), pg.top, pg.bottom, &texfn, &decos, pal.fg, dim);
+                    l.paint(&text_painter, g.origin(col), pg.top, pg.bottom, &texfn, &decos, pal.fg, dim);
                 }
             }
         } else {
-            l.paint(&painter, g.origin(0), self.scroll_y, self.scroll_y + g.page_h, &texfn, &decos, pal.fg, dim);
+            let clip = Rect::from_min_max(pos2(rect.left(), g.top - 4.0), pos2(rect.right(), g.top + g.page_h + 4.0));
+            l.paint(&text_painter.with_clip_rect(clip), g.origin(0), self.scroll_y, self.scroll_y + g.page_h, &texfn, &decos, pal.fg, dim);
         }
 
-        // running header / footer
-        let small = egui::FontId::proportional(12.5);
+        // chapter numeral hanging in the margin on a chapter's first page
+        if paginated && self.page == 0 && g.pad >= 64.0 {
+            let n = self.book.toc_index_for(self.loc).map(|i| i + 1).unwrap_or(self.loc.section + 1);
+            painter.text(pos2(g.origin(0).x - 16.0, g.top - 6.0), egui::Align2::RIGHT_TOP, format!("{n:02}"), ui::ui_b(34.0), ACCENT);
+        }
+
+        // running heads and folios, set like a printed book
+        let small = ui::ui_m(12.0);
+        let chapter = self.chapter_title(self.loc);
+        let trunc = |t: &str, n: usize| if t.chars().count() > n { t.chars().take(n).collect::<String>() + "…" } else { t.to_string() };
         if s.show_header {
-            let t = self.chapter_title(self.loc);
-            let t: String = if t.chars().count() > 80 { t.chars().take(80).collect::<String>() + "…" } else { t };
-            painter.text(pos2(rect.center().x, rect.top() + 20.0), egui::Align2::CENTER_CENTER, t, small.clone(), pal.muted);
+            if g.cols == 2 {
+                let (l0, l1) = (g.sheet(0), g.sheet(1));
+                painter.text(pos2(l0.center().x, l0.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&self.book.meta.title, 60), small.clone(), pal.muted);
+                painter.text(pos2(l1.center().x, l1.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&chapter, 60), small.clone(), pal.muted);
+            } else {
+                let sh = g.sheet(0);
+                painter.text(pos2(sh.center().x, sh.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&chapter, 80), small.clone(), pal.muted);
+            }
         }
         if s.show_footer {
-            let y = rect.bottom() - 20.0;
             if let Some(flow) = self.book.flow() {
                 let pct = (flow.fraction(self.loc) * 100.0).round();
-                let step = self.step.max(1);
+                let left = flow.section_chars_after(self.loc) as f32 / env.app.reading_speed_cpm.max(100.0);
+                let left_txt = if left < 1.0 { "under a minute left in chapter".to_string() } else { format!("{} min left in chapter", left.round()) };
+                let last = g.sheet(g.cols - 1);
+                let first = g.sheet(0);
+                let y = first.bottom() - 24.0;
                 if paginated {
                     for col in 0..g.cols {
                         let pi = self.page + col;
                         if pi < l.pages.len() {
-                            let o = g.origin(col);
-                            painter.text(pos2(o.x + g.col_w / 2.0, y), egui::Align2::CENTER_CENTER, format!("{} / {}", pi + 1, l.pages.len()), small.clone(), pal.muted);
+                            let sh = g.sheet(col);
+                            let (x, al) = if col == 0 && g.cols == 2 { (sh.left() + g.pad, egui::Align2::LEFT_CENTER) } else { (sh.right() - g.pad, egui::Align2::RIGHT_CENTER) };
+                            painter.text(pos2(x, y), al, format!("{}", pi + 1), ui::ui_b(13.0), pal.muted);
                         }
                     }
                 }
-                painter.text(pos2(g.x0 + g.col_w * g.cols as f32 + g.gap, y), egui::Align2::RIGHT_CENTER, format!("{pct}%"), small.clone(), pal.muted);
-                let left = flow.section_chars_after(self.loc) as f32 / env.app.reading_speed_cpm.max(100.0);
-                let left_txt = if left < 1.0 { "less than a minute left in chapter".to_string() } else { format!("{} min left in chapter", left.round()) };
-                let _ = step;
-                painter.text(pos2(g.x0, y), egui::Align2::LEFT_CENTER, left_txt, small, pal.muted);
+                painter.text(pos2(first.center().x, y), egui::Align2::CENTER_CENTER, left_txt, small.clone(), pal.muted);
+                if g.cols == 2 {
+                    painter.text(pos2(last.center().x, y), egui::Align2::CENTER_CENTER, format!("{pct}% of the book"), small, pal.muted);
+                }
             }
         }
-        // bookmark ribbon
+        // bookmark ribbon hanging from the top edge of the page
         if self.bookmark_here().is_some() {
-            let x = g.x0 + g.col_w * g.cols as f32 + g.gap + 12.0;
-            let r = Rect::from_min_size(pos2(x.min(rect.right() - 26.0), rect.top()), vec2(14.0, 26.0));
-            painter.add(egui::Shape::convex_polygon(vec![r.left_top(), r.right_top(), r.right_bottom(), pos2(r.center().x, r.bottom() - 6.0), r.left_bottom()], Color32::from_rgb(220, 60, 60), egui::Stroke::NONE));
+            let sh = g.sheet(g.cols - 1);
+            let r = Rect::from_min_size(pos2(sh.right() - g.pad.min(60.0) - 7.0, sh.top()), vec2(14.0, 34.0));
+            painter.add(egui::Shape::convex_polygon(vec![r.left_top(), r.right_top(), r.right_bottom(), pos2(r.center().x, r.bottom() - 7.0), r.left_bottom()], ACCENT, egui::Stroke::NONE));
+        }
+
+        // page-turn leaf: a sheet sweeping into the spine with a shadowed edge
+        if turn_t < 1.0 && paginated {
+            let dir = self.turn.map(|t| t.1).unwrap_or(1);
+            let e = super::ease(turn_t);
+            let target = if dir > 0 { g.sheet(g.cols - 1) } else { g.sheet(0) };
+            let hinge = match (g.spine, dir > 0) {
+                (Some(x), _) => x,
+                (None, true) => target.left(),
+                (None, false) => target.right(),
+            };
+            let w = target.width() * (1.0 - e);
+            let leaf = if dir > 0 { Rect::from_min_max(pos2(hinge, target.top()), pos2(hinge + w, target.bottom())) } else { Rect::from_min_max(pos2(hinge - w, target.top()), pos2(hinge, target.bottom())) };
+            if w > 1.0 {
+                painter.rect_filled(leaf, CornerRadius::ZERO, ui::mix(pal.bg, pal.fg, 0.03));
+                let edge_x = if dir > 0 { leaf.right() } else { leaf.left() };
+                let sh = Color32::from_black_alpha((60.0 * (1.0 - e)) as u8);
+                let mut m = egui::Mesh::default();
+                let (a, b) = if dir > 0 { (edge_x, edge_x + 18.0) } else { (edge_x - 18.0, edge_x) };
+                let (ca, cb) = if dir > 0 { (sh, Color32::TRANSPARENT) } else { (Color32::TRANSPARENT, sh) };
+                m.colored_vertex(pos2(a, leaf.top()), ca);
+                m.colored_vertex(pos2(b, leaf.top()), cb);
+                m.colored_vertex(pos2(b, leaf.bottom()), cb);
+                m.colored_vertex(pos2(a, leaf.bottom()), ca);
+                m.add_triangle(0, 1, 2);
+                m.add_triangle(0, 2, 3);
+                painter.add(m);
+            }
+        } else if turn_t >= 1.0 {
+            self.turn = None;
+        }
+
+        // the cover swinging open
+        if open_t < 1.0 {
+            let e = super::ease(open_t.min(1.0) / 0.8);
+            let target = g.sheet(g.cols - 1);
+            let hinge = g.spine.unwrap_or(target.left());
+            let w = target.width() * (1.0 - e);
+            if w > 1.0 {
+                let r = Rect::from_min_max(pos2(hinge, target.top()), pos2(hinge + w, target.bottom()));
+                match self.tex.get("__cover").map(|t| t.tex.id()) {
+                    Some(id) => {
+                        painter.image(id, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    None => ui::paint_placeholder_cover(&painter, r, &self.book.meta.title, &self.book.meta.author),
+                }
+                painter.rect_filled(r, CornerRadius::ZERO, Color32::from_black_alpha((90.0 * e) as u8));
+            }
         }
     }
 
