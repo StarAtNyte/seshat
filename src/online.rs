@@ -564,9 +564,6 @@ impl Online {
     /// Download status block for the navigation sidebar.
     pub fn downloads_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<PathBuf> {
         let mut open = None;
-        if self.session.is_some() {
-            self.quota_ui(ui, pal);
-        }
         if let Some((t, w, total)) = &self.active_dl {
             ui.label(RichText::new(if self.dl_temp { "Opening online" } else { "Downloading" }).font(ui::ui_m(12.0)).color(ui::ACCENT));
             ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());

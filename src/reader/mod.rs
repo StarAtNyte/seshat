@@ -883,6 +883,7 @@ impl Reader {
                     self.toc_scroll = true;
                 }
                 Key::N => self.notebook = !self.notebook,
+                Key::S => self.settings_open = !self.settings_open,
                 Key::F11 | Key::F => self.toggle_fullscreen(ctx),
                 Key::H if self.book.flow().is_some() => {
                     self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };

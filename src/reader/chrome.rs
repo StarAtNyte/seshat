@@ -62,6 +62,11 @@ impl Reader {
                 if ui::icon_button(ui, Icon::Back, "Library (Esc)").clicked() {
                     actions.push(Action::Close);
                 }
+                if ui::icon_toggle(ui, Icon::PanelLeft, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
+                    self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
+                    self.toc_scroll = true;
+                }
+                ui.add_space(6.0);
                 let (cr, _) = ui.allocate_exact_size(vec2(22.0, 32.0), Sense::hover());
                 match self.cover_tex() {
                     Some(id) => {
@@ -109,17 +114,9 @@ impl Reader {
         let flow = self.book.flow().is_some();
         let w = ctx.screen_rect().width();
         let (compact, tight) = (w < 1500.0, w < 1180.0);
-        if ui::icon_toggle(ui, Icon::Menu, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
-            self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
-            self.toc_scroll = true;
-        }
         if ui::icon_toggle(ui, Icon::Search, "Find in book (Ctrl+K)", self.side == Some(Side::Search)).clicked() {
             self.side = Some(Side::Search);
             self.focus_search = true;
-        }
-        if ui::icon_toggle(ui, Icon::Note, "Notebook (N)", self.notebook).clicked() {
-            self.notebook = !self.notebook;
-            self.settings_open = false;
         }
         if !self.history.is_empty() && ui::icon_button(ui, Icon::Undo, "Back to where you were (Backspace)").clicked() {
             self.back();
@@ -210,6 +207,11 @@ impl Reader {
         let flow = self.book.flow().is_some();
         let w = ui.ctx().screen_rect().width();
         let (compact, tight) = (w < 1500.0, w < 1180.0);
+        // right-hand panels live on the right
+        if ui::icon_toggle(ui, Icon::PanelRight, "Notebook (N)", self.notebook).clicked() {
+            self.notebook = !self.notebook;
+            self.settings_open = false;
+        }
         if text_button(ui, "Aa", self.settings_open).on_hover_text("All reading settings").clicked() {
             self.settings_open = !self.settings_open;
             if self.settings_open {
@@ -288,6 +290,9 @@ impl Reader {
                 ui.set_height(BAR_H);
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
+                    if ui::icon_toggle(ui, Icon::PanelLeft, "Contents (C)", self.side.is_some()).clicked() {
+                        self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
+                    }
                     self.tools_left(ui, ctx, s, pal, env);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;

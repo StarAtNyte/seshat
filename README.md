@@ -130,6 +130,7 @@ public server or your own.
 | `T` | Show or hide the toolbar |
 | `C` | Contents sidebar |
 | `N` | Notebook |
+| `S` | Reading settings |
 | `B` | Bookmark this page |
 | `H` | Highlighter mode |
 | `A` | Auto-advance |

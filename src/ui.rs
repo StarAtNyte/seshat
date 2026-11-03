@@ -198,6 +198,8 @@ pub enum Icon {
     ZoomIn,
     ZoomOut,
     Sync,
+    PanelLeft,
+    PanelRight,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -361,6 +363,12 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(p(10.0, 3.5), p(10.0, 12.5));
             poly(vec![p(6.0, 8.5), p(10.0, 12.5), p(14.0, 8.5)], false);
             line(p(4.0, 16.0), p(16.0, 16.0));
+        }
+        Icon::PanelLeft | Icon::PanelRight => {
+            let r = Rect::from_min_max(p(3.0, 4.0), p(17.0, 16.0));
+            painter.rect_stroke(r, CornerRadius::same((2.0 * s) as u8), st, egui::StrokeKind::Middle);
+            let x = if icon == Icon::PanelLeft { 8.0 } else { 12.0 };
+            line(p(x, 4.0), p(x, 16.0));
         }
         Icon::Refresh | Icon::Sync => {
             let pts: Vec<Pos2> = (0..=14).map(|i| {

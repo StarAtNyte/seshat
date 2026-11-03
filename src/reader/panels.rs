@@ -609,8 +609,10 @@ fn group(ui: &mut egui::Ui, pal: &Palette, title: &str) {
 
 fn row_slider(ui: &mut egui::Ui, pal: &Palette, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, step: f64, suffix: &str) {
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(96.0, 22.0), egui::Label::new(RichText::new(label).color(pal.fg)));
-        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
+        let (lr, _) = ui.allocate_exact_size(vec2(92.0, 24.0), Sense::hover());
+        ui.painter().text(lr.left_center(), egui::Align2::LEFT_CENTER, label, ui::ui_m(13.0), pal.fg);
+        ui.spacing_mut().slider_width = (ui.available_width() - 78.0).max(80.0);
+        ui.spacing_mut().interact_size.x = 70.0;
         ui.add(egui::Slider::new(v, range).step_by(step).suffix(suffix));
     });
 }
