@@ -21,6 +21,7 @@ enum Msg {
     DlProgress(u64, Option<u64>),
     DlDone(Result<(String, PathBuf), String>),
     Quiet(u64, Result<api::SearchPage, String>),
+    CoverFetched(String, bool),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -71,6 +72,8 @@ pub struct Online {
     dl_error: String,
     /// Finished downloads (title, path) for the app to pick up.
     pub downloaded: Vec<(String, PathBuf)>,
+    /// Book ids whose cover was replaced from the catalogue.
+    pub covers_updated: Vec<String>,
     pub recent: Vec<(String, PathBuf)>,
     covers: TexLoader,
     quiet_q: String,
@@ -118,6 +121,7 @@ impl Online {
             active_dl: None,
             dl_error: String::new(),
             downloaded: Vec::new(),
+            covers_updated: Vec::new(),
             recent: Vec::new(),
             covers: TexLoader::new(ctx, 3),
             quiet_q: String::new(),
@@ -260,6 +264,13 @@ impl Online {
                         d.2 = t;
                     }
                 }
+                Msg::CoverFetched(id, ok) => {
+                    if ok {
+                        self.covers_updated.push(id);
+                    } else {
+                        self.dl_error = "No catalogue cover found".into();
+                    }
+                }
                 Msg::Quiet(gen, r) => {
                     if gen == self.quiet_gen {
                         self.quiet_busy = false;
@@ -345,7 +356,32 @@ impl Online {
                     ctx2.request_repaint();
                 }
             });
+            if let Ok(p) = &res {
+                // carry the catalogue's cover and metadata over to the library
+                attach_catalogue_data(p, &book, &proxy);
+            }
             let _ = tx.send(Msg::DlDone(res.map(|p| (title, p))));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Look a local book up in the catalogue and adopt its cover.
+    pub fn fetch_cover_for(&mut self, id: String, path: PathBuf, title: String, author: String, app: &AppSettings) {
+        let Some(sess) = self.session.clone() else {
+            self.dl_error = "Connect the Z-Library source first".into();
+            return;
+        };
+        let proxy = app.proxy_opt();
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let q = format!("{} {}", title, author.split(',').next().unwrap_or("")).trim().to_string();
+            let ok = api::search(&sess, &proxy, &q, 1, &api::Filters::default())
+                .ok()
+                .and_then(|p| p.books.into_iter().find(|b| !b.cover.is_empty()))
+                .map(|b| attach_catalogue_data(&path, &b, &proxy))
+                .unwrap_or(false);
+            let _ = tx.send(Msg::CoverFetched(id, ok));
             ctx.request_repaint();
         });
     }
@@ -828,4 +864,34 @@ fn order_label(o: &str) -> &'static str {
         "titleA" => "Title A–Z",
         _ => "Best match",
     }
+}
+
+/// Save the catalogue cover as the book's thumbnail and a metadata sidecar.
+fn attach_catalogue_data(path: &std::path::Path, book: &api::Book, proxy: &Option<String>) -> bool {
+    let Some(id) = store::book_id(path) else { return false };
+    let mut ok = false;
+    if !book.cover.is_empty() {
+        let client = api::build_client(proxy, Some(std::time::Duration::from_secs(20)));
+        // catalogue thumbnails often have a larger sibling without the size suffix
+        let big = book.cover.replace("/covers100/", "/covers299/");
+        for url in [big.as_str(), book.cover.as_str()] {
+            if let Ok(r) = client.get(url).send() {
+                if r.status().is_success() {
+                    if let Ok(b) = r.bytes() {
+                        if crate::library::save_thumbnail(&id, &b).is_some() {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let meta = serde_json::json!({
+        "title": book.title, "author": book.author, "publisher": book.publisher,
+        "language": book.language, "year": book.year, "description": book.description,
+    });
+    let _ = std::fs::create_dir_all(store::covers_dir());
+    let _ = std::fs::write(store::covers_dir().join(format!("{id}.meta.json")), meta.to_string());
+    ok
 }

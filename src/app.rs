@@ -479,6 +479,14 @@ impl eframe::App for App {
         for _ in std::mem::take(&mut self.online.downloaded) {
             self.rescan();
         }
+        for id in std::mem::take(&mut self.online.covers_updated) {
+            if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {
+                e.has_cover = true;
+                e.cover_aspect = library::thumb_aspect_of(&id);
+            }
+            self.covers.forget(&id);
+            self.index.save();
+        }
         self.sync_fonts(ctx);
         self.persist_settings();
 
@@ -1231,6 +1239,10 @@ impl App {
                 }
             }
             self.index.save();
+            ui.close_menu();
+        }
+        if self.settings.zlib_enabled && ui.button("Fetch cover from Z-Library").clicked() {
+            self.online.fetch_cover_for(e.id.clone(), PathBuf::from(&e.path), e.title.clone(), e.author.clone(), &self.settings);
             ui.close_menu();
         }
         ui.separator();

@@ -84,6 +84,10 @@ fn mtime(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+pub fn thumb_aspect_of(id: &str) -> f32 {
+    thumb_aspect(id)
+}
+
 pub fn save_thumbnail(id: &str, bytes: &[u8]) -> Option<f32> {
     let img = image::load_from_memory(bytes).ok()?;
     let aspect = img.height() as f32 / img.width().max(1) as f32;
@@ -123,6 +127,27 @@ fn make_entry(path: &Path, meta: &std::fs::Metadata) -> Option<Entry> {
         cover_aspect,
         ..Default::default()
     };
+    // catalogue metadata saved at download time beats sparse embedded metadata
+    if let Ok(t) = std::fs::read_to_string(store::covers_dir().join(format!("{id}.meta.json"))) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+            let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if let Some(x) = get("title") {
+                e.title = x;
+            }
+            if let Some(x) = get("author") {
+                e.author = x;
+            }
+            if e.publisher.is_empty() {
+                e.publisher = get("publisher").unwrap_or_default();
+            }
+            if e.language.is_empty() {
+                e.language = get("language").unwrap_or_default();
+            }
+            if e.description.is_empty() {
+                e.description = get("description").unwrap_or_default();
+            }
+        }
+    }
     // existing reading data (e.g. after the library index was deleted)
     if BookData::path_for(&id).exists() {
         let d = BookData::load(&id);
