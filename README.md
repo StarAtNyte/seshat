@@ -93,13 +93,27 @@ spread, or continuous scroll.
   book, and a Back button returns you to where you were
 - Look up a word in the dictionary or on Wikipedia, or translate a passage,
   from the selection menu
-- Read aloud using your system's own voices, following along sentence by
-  sentence
+- Read aloud, following along sentence by sentence, with your system's own
+  voices or the optional natural voice (below)
 - Auto-advance, which turns pages on a timer or scrolls slowly
 - Go to any percentage or page
 - Reading time, days read, and a reading-speed estimate that learns from you,
   so "12 min left in chapter" is actually close
 - Export your highlights and notes to Markdown
+
+**Natural voice.** For read-aloud that sounds like a person rather than a
+robot, Settings → Read aloud offers optional natural voices that run offline
+on your CPU, faster than real time on an ordinary laptop:
+
+- English: Kokoro, with 28 voices (US and UK), about a 360 MB download.
+- 38 other languages (German, French, Spanish, Russian, Arabic, Hindi,
+  Chinese and more): one Piper voice each, about 60–70 MB per language.
+
+Seshat picks the voice by the book's language, and falls back to your system
+voice for a language you haven't downloaded. None of this is part of the app:
+each voice is downloaded only if you ask for it, checked against a published
+checksum, and removed again with one click. Old versions are replaced, never
+kept, and speech is generated in memory, so nothing builds up on disk.
 
 **Sync.** Seshat speaks the KOReader sync protocol, so your progress follows
 you between Seshat, KOReader and other compatible readers. You can use the
@@ -154,6 +168,10 @@ cover and metadata attached, which helps with PDFs whose embedded titles are
 often useless. For books you already have, "Fetch cover from Z-Library" in a
 book's menu does the same retroactively.
 
+"Read online" opens Z-Library's own online reader in your browser. Nothing is
+downloaded and it does not use your daily download quota. It is shown only for
+books Z-Library offers to read online.
+
 Signing in works with email and password, with session cookies if your account
 requires them, or by creating a new account. Seshat looks for a reachable
 mirror automatically, and you can set a SOCKS or HTTP proxy (Tor works).
@@ -168,7 +186,8 @@ Everything stays on your machine unless you turn on sync or use a lookup.
 | What | Where |
 |---|---|
 | Settings, library index, progress, highlights | `~/.config/seshat` (Linux), `~/Library/Application Support/seshat` (macOS), `%APPDATA%\seshat` (Windows) |
-| Cover thumbnails | your OS cache directory, under `seshat` |
+| Cover thumbnails | your OS cache directory, under `seshat` (thumbnails of books no longer in your library are cleared after each scan) |
+| Natural voice, if installed | `~/.local/share/seshat/voice` (Linux), `~/Library/Application Support/seshat/voice` (macOS), `%LOCALAPPDATA%\seshat\voice` (Windows) |
 
 Book files are never modified. The dictionary, Wikipedia and translation
 lookups send the selected text to those services only when you ask for a
@@ -192,7 +211,20 @@ sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev
 
 `seshat --info book.epub` prints what Seshat makes of a book (title, author,
 sections and timing), which is handy when a file misbehaves.
+`seshat --say book.epub [seconds]` reads a book aloud with your chosen voice
+and prints each sentence as it is spoken.
 `seshat --make-icons dir/` regenerates the icon set from the vector logo.
+
+The natural-voice helper lives in `voice/` and builds separately, so a plain
+`cargo build` never pulls in its speech engine:
+
+```sh
+sudo apt install libasound2-dev     # Linux only, for audio output
+cargo build --release -p seshat-voice
+```
+
+A `seshat-voice` binary next to `seshat` (or one named by `$SESHAT_VOICE`) is
+used instead of the downloaded one, which is handy during development.
 
 Releases are built by GitHub Actions: pushing a tag such as `v0.3.0` produces
 every package listed above.
@@ -206,13 +238,18 @@ every package listed above.
 | `reader/` | The reading window: the spread, motion, chrome, sidebars, search, highlights, read-aloud |
 | `library.rs` | Parallel, incremental indexing with cached metadata and covers |
 | `online.rs`, `api.rs` | The Z-Library add-on |
+| `tts.rs`, `voice.rs` | Read-aloud: system voices, and installing and driving the natural voice |
+| `voice/` | `seshat-voice`, the optional natural-voice helper (Kokoro and Piper via sherpa-onnx), shipped as a separate download |
 | `kosync.rs` | KOReader-compatible progress sync |
 | `logo.rs` | The Seshat mark, drawn live in the app and rasterised for the icons |
 
 ## Credits
 
 Built with [egui](https://github.com/emilk/egui). PDFs are rendered by
-[hayro](https://github.com/LaurenzV/hayro). The interface is set in
+[hayro](https://github.com/LaurenzV/hayro). The natural voices are
+[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) and
+[Piper](https://github.com/rhasspy/piper) voices (licences per voice, listed in
+each download's MODEL_CARD), run by [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). The interface is set in
 [Bricolage Grotesque](https://github.com/ateliertriay/bricolage) and
 IBM Plex Mono, both under the SIL Open Font License (see `assets/fonts`).
 Feature inspiration comes from [Readest](https://github.com/readest/readest)

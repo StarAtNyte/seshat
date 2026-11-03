@@ -1,5 +1,6 @@
 //! Z-Library tab: mirror discovery, sign-in/registration, search, details, downloads.
 
+use crate::i18n::tr;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -81,10 +82,7 @@ pub struct Online {
     refresh_quota_after: bool,
     quota_asked: bool,
     dl_started: std::time::Instant,
-    dl_temp: bool,
     dl_book: Option<String>,
-    /// A book fetched with “Read online”, ready to open without shelving it.
-    pub read_now: Option<PathBuf>,
     quiet_q: String,
     quiet_sent: String,
     quiet_changed: std::time::Instant,
@@ -137,9 +135,7 @@ impl Online {
             refresh_quota_after: false,
             quota_asked: false,
             dl_started: std::time::Instant::now(),
-            dl_temp: false,
             dl_book: None,
-            read_now: None,
             quiet_q: String::new(),
             quiet_sent: String::new(),
             quiet_changed: std::time::Instant::now(),
@@ -248,7 +244,7 @@ impl Online {
                     match r {
                         Ok(()) => {
                             self.code_sent = true;
-                            self.reg_info = "Check your email for the confirmation code.".into();
+                            self.reg_info = tr("Check your email for the confirmation code.").into();
                         }
                         Err(e) => self.login_error = e,
                     }
@@ -256,7 +252,7 @@ impl Online {
                 Msg::ResendDone(r) => {
                     self.busy = false;
                     match r {
-                        Ok(()) => self.reg_info = "Code resent — check your email.".into(),
+                        Ok(()) => self.reg_info = tr("Code resent — check your email.").into(),
                         Err(e) => self.login_error = e,
                     }
                 }
@@ -285,7 +281,7 @@ impl Online {
                     if ok {
                         self.covers_updated.push(id);
                     } else {
-                        self.dl_error = "No catalogue cover found".into();
+                        self.dl_error = tr("No catalogue cover found").into();
                     }
                 }
                 Msg::Quiet(gen, r) => {
@@ -299,12 +295,8 @@ impl Online {
                     match r {
                         Ok((title, p)) => {
                             self.dl_error.clear();
-                            if self.dl_temp {
-                                self.read_now = Some(p);
-                            } else {
-                                self.downloaded.push((title.clone(), p.clone()));
-                                self.recent.insert(0, (title, p));
-                            }
+                            self.downloaded.push((title.clone(), p.clone()));
+                            self.recent.insert(0, (title, p));
                             self.refresh_quota_after = true;
                         }
                         Err(e) => self.dl_error = e,
@@ -355,16 +347,15 @@ impl Online {
         self.spawn(move || Msg::DetailsDone(api::book_details(&sess, &proxy, &id, &hash)));
     }
 
-    fn do_download(&mut self, book: api::Book, app: &AppSettings, temp: bool) {
+    fn do_download(&mut self, book: api::Book, app: &AppSettings) {
         if self.active_dl.is_some() {
             return;
         }
         let Some(sess) = self.session.clone() else { return };
         self.dl_error.clear();
-        self.dl_temp = temp;
         self.dl_started = std::time::Instant::now();
         let proxy = app.proxy_opt();
-        let dest = if temp { store::cache_dir().join("online") } else { PathBuf::from(&app.download_dir) };
+        let dest = PathBuf::from(&app.download_dir);
         let title = book.title.clone();
         self.active_dl = Some((title.clone(), 0, None));
         let tx = self.tx.clone();
@@ -382,9 +373,7 @@ impl Online {
             });
             if let Ok(p) = &res {
                 // carry the catalogue's cover and metadata over to the library
-                if !temp {
-                    attach_catalogue_data(p, &book, &proxy);
-                }
+                attach_catalogue_data(p, &book, &proxy);
             }
             let _ = tx.send(Msg::DlDone(res.map(|p| (title, p))));
             ctx.request_repaint();
@@ -394,7 +383,7 @@ impl Online {
     /// Look a local book up in the catalogue and adopt its cover.
     pub fn fetch_cover_for(&mut self, id: String, path: PathBuf, title: String, author: String, app: &AppSettings) {
         let Some(sess) = self.session.clone() else {
-            self.dl_error = "Connect the Z-Library source first".into();
+            self.dl_error = tr("Connect the Z-Library source first").into();
             return;
         };
         let proxy = app.proxy_opt();
@@ -428,7 +417,7 @@ impl Online {
         let Some((used, limit)) = self.quota else { return };
         let limit = limit.max(1);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} of {} left today", limit.saturating_sub(used), limit)).font(ui::ui_m(12.0)).color(pal.muted));
+            ui.label(RichText::new(trf!("{left} of {limit} left today", left = limit.saturating_sub(used), limit = limit)).font(ui::ui_m(12.0)).color(pal.muted));
         });
         let n = limit.min(20);
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(n as f32 * 12.0), 10.0), Sense::hover());
@@ -483,9 +472,9 @@ impl Online {
         let mut go_source = false;
         ui.add_space(18.0);
         ui.horizontal(|ui| {
-            ui.label(ui::tag("Elsewhere — Z-Library").color(pal.muted));
+            ui.label(ui::tag(tr("Elsewhere — Z-Library")).color(pal.muted));
             if self.session.is_none() {
-                if ui::text_button(ui, "Connect source →", false).clicked() {
+                if ui::text_button(ui, tr("Connect source →"), false).clicked() {
                     go_source = true;
                 }
                 return;
@@ -495,7 +484,7 @@ impl Online {
             } else if let Some(Ok(b)) = &self.quiet {
                 ui.label(ui::tag(format!("{:02} results", b.len())).color(pal.muted));
             }
-            if ui::text_button(ui, "Open in source →", false).clicked() {
+            if ui::text_button(ui, tr("Open in source →"), false).clicked() {
                 self.query = self.quiet_q.clone();
                 go_source = true;
             }
@@ -565,7 +554,7 @@ impl Online {
     pub fn downloads_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<PathBuf> {
         let mut open = None;
         if let Some((t, w, total)) = &self.active_dl {
-            ui.label(RichText::new(if self.dl_temp { "Opening online" } else { "Downloading" }).font(ui::ui_m(12.0)).color(ui::ACCENT));
+            ui.label(RichText::new(tr("Downloading")).font(ui::ui_m(12.0)).color(ui::ACCENT));
             ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
             self.progress_bar(ui, pal, *w, *total);
         }
@@ -573,9 +562,9 @@ impl Online {
             ui.label(RichText::new(&self.dl_error).size(11.5).color(ui::ACCENT));
         }
         if let Some((t, p)) = self.recent.first() {
-            ui.label(ui::tag("Downloaded").color(pal.muted));
+            ui.label(ui::tag(tr("Downloaded")).color(pal.muted));
             ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
-            if ui::text_button(ui, "Read now →", false).clicked() {
+            if ui::text_button(ui, tr("Read now →"), false).clicked() {
                 open = Some(p.clone());
             }
         }
@@ -615,12 +604,12 @@ impl Online {
                     if self.probing {
                         ui.spinner();
                     }
-                    ui.heading(if self.probing { "Finding a reachable Z-Library mirror…" } else { "No mirror reachable" });
+                    ui.heading(if self.probing { tr("Finding a reachable Z-Library mirror…") } else { tr("No mirror reachable") });
                     ui.add_space(12.0);
                     for (d, ok) in &self.probe_results {
                         ui.label(format!("{d}  {}", if *ok { "reachable" } else { "—" }));
                     }
-                    if !self.probing && ui.button("Retry").clicked() {
+                    if !self.probing && ui.button(tr("Retry")).clicked() {
                         self.start_probe(app);
                     }
                 });
@@ -635,17 +624,17 @@ impl Online {
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
             ui.add_space(30.0);
-            ui.label(ui::tag("Source / plugin").color(ui.visuals().weak_text_color()));
-            ui.label(ui::display("Connect Z-Library", 34.0));
+            ui.label(ui::tag(tr("Source / plugin")).color(ui.visuals().weak_text_color()));
+            ui.label(ui::display(tr("Connect Z-Library"), 34.0));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui::text_button(ui, "Sign in", self.auth_mode == AuthMode::SignIn).clicked() {
+                if ui::text_button(ui, tr("Sign in"), self.auth_mode == AuthMode::SignIn).clicked() {
                     self.auth_mode = AuthMode::SignIn;
                 }
-                if ui::text_button(ui, "Create account", self.auth_mode == AuthMode::Register).clicked() {
+                if ui::text_button(ui, tr("Create account"), self.auth_mode == AuthMode::Register).clicked() {
                     self.auth_mode = AuthMode::Register;
                 }
-                if ui.small_button("Rescan mirrors").clicked() {
+                if ui.small_button(tr("Rescan mirrors")).clicked() {
                     self.start_probe(app);
                 }
             });
@@ -659,34 +648,34 @@ impl Online {
                     ui.text_edit_singleline(&mut self.cookie_userkey);
                     ui.end_row();
                 } else {
-                    ui.label("Email");
+                    ui.label(tr("Email"));
                     ui.text_edit_singleline(&mut self.email);
                     ui.end_row();
-                    ui.label("Password");
+                    ui.label(tr("Password"));
                     ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                     ui.end_row();
                     if self.auth_mode == AuthMode::Register {
-                        ui.label("Nickname");
+                        ui.label(tr("Nickname"));
                         ui.text_edit_singleline(&mut self.reg_nickname);
                         ui.end_row();
                     }
                 }
-                ui.label("Mirror");
+                ui.label(tr("Mirror"));
                 ui.text_edit_singleline(&mut self.manual_domain);
                 ui.end_row();
-                ui.label("Proxy");
-                ui.add(egui::TextEdit::singleline(&mut app.proxy).hint_text("optional, e.g. socks5://127.0.0.1:9050"));
+                ui.label(tr("Proxy"));
+                ui.add(egui::TextEdit::singleline(&mut app.proxy).hint_text(tr("optional, e.g. socks5://127.0.0.1:9050")));
                 ui.end_row();
             });
             if self.auth_mode == AuthMode::SignIn {
-                ui.checkbox(&mut self.use_cookies, "Use session cookies instead of password");
+                ui.checkbox(&mut self.use_cookies, tr("Use session cookies instead of password"));
             }
             ui.add_space(8.0);
             let domain = self.domain();
             let proxy = app.proxy_opt();
             match self.auth_mode {
                 AuthMode::SignIn => {
-                    if ui.add_enabled(!self.busy, egui::Button::new(if self.busy { "Signing in…" } else { "Sign in" }).min_size(vec2(160.0, 30.0))).clicked() {
+                    if ui.add_enabled(!self.busy, egui::Button::new(if self.busy { tr("Signing in…") } else { tr("Sign in") }).min_size(vec2(160.0, 30.0))).clicked() {
                         self.busy = true;
                         self.login_error.clear();
                         if self.use_cookies {
@@ -701,22 +690,22 @@ impl Online {
                 AuthMode::Register => {
                     let (e, p, n) = (self.email.clone(), self.password.clone(), self.reg_nickname.clone());
                     if !self.code_sent {
-                        if ui.add_enabled(!self.busy, egui::Button::new("Create account").min_size(vec2(160.0, 30.0))).clicked() {
+                        if ui.add_enabled(!self.busy, egui::Button::new(tr("Create account")).min_size(vec2(160.0, 30.0))).clicked() {
                             self.busy = true;
                             self.login_error.clear();
                             self.spawn(move || Msg::RegisterDone(api::register(&domain, &proxy, &e, &p, &n)));
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label("Code from email:");
+                            ui.label(tr("Code from email:"));
                             ui.add(egui::TextEdit::singleline(&mut self.reg_code).desired_width(120.0));
                             let code = self.reg_code.trim().to_string();
-                            if ui.add_enabled(!self.busy && !code.is_empty(), egui::Button::new("Confirm")).clicked() {
+                            if ui.add_enabled(!self.busy && !code.is_empty(), egui::Button::new(tr("Confirm"))).clicked() {
                                 self.busy = true;
                                 let (d2, p2, e2, pw2, n2) = (domain.clone(), proxy.clone(), e.clone(), p.clone(), n.clone());
                                 self.spawn(move || Msg::ConfirmDone(api::confirm_code(&d2, &p2, &e2, &pw2, &n2, &code)));
                             }
-                            if ui.add_enabled(!self.busy, egui::Button::new("Resend")).clicked() {
+                            if ui.add_enabled(!self.busy, egui::Button::new(tr("Resend"))).clicked() {
                                 self.busy = true;
                                 self.spawn(move || Msg::ResendDone(api::resend_code(&domain, &proxy, &e, &p, &n)));
                             }
@@ -729,12 +718,12 @@ impl Online {
             }
             if !self.login_error.is_empty() {
                 ui.colored_label(Color32::from_rgb(220, 70, 60), &self.login_error);
-                ui.small("If password login is disabled for your account, use session cookies: copy remix_userid / remix_userkey from a logged-in browser (DevTools → Storage → Cookies).");
+                ui.small(tr("If password login is disabled for your account, use session cookies: copy remix_userid / remix_userkey from a logged-in browser (DevTools → Storage → Cookies)."));
             }
             let reachable: Vec<String> = self.probe_results.iter().filter(|(_, ok)| *ok).map(|(d, _)| d.clone()).collect();
             if !reachable.is_empty() {
                 ui.add_space(6.0);
-                ui.small(format!("Reachable mirrors: {}", reachable.join(", ")));
+                ui.small(trf!("Reachable mirrors: {list}", list = reachable.join(", ")));
             }
         });
     }
@@ -743,19 +732,19 @@ impl Online {
         // header: name on the left, account + quota on the right
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Source").font(ui::ui_m(12.0)).color(pal.muted));
+                ui.label(RichText::new(tr("Source")).font(ui::ui_m(12.0)).color(pal.muted));
                 ui.label(ui::display("Z-Library", 30.0));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.session.is_some() && ui::text_button(ui, "Sign out", false).clicked() {
+                if self.session.is_some() && ui::text_button(ui, tr("Sign out"), false).clicked() {
                     self.logout(app);
                 }
                 if let Some(s) = &self.session {
-                    ui.label(RichText::new(if s.email.is_empty() { "Signed in".to_string() } else { s.email.clone() }).font(ui::ui_m(12.5)).color(pal.muted));
+                    ui.label(RichText::new(if s.email.is_empty() { tr("Signed in").to_string() } else { s.email.clone() }).font(ui::ui_m(12.5)).color(pal.muted));
                 }
                 if let Some((used, limit)) = self.quota {
                     ui.add_space(12.0);
-                    ui.label(RichText::new(format!("{} of {} downloads left today", limit.saturating_sub(used), limit)).font(ui::ui_m(12.5)).color(ui::ACCENT));
+                    ui.label(RichText::new(trf!("{left} of {limit} downloads left today", left = limit.saturating_sub(used), limit = limit)).font(ui::ui_m(12.5)).color(ui::ACCENT));
                 }
             });
         });
@@ -767,10 +756,10 @@ impl Online {
             ui::paint_icon(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.left() + 20.0, sr.center().y), vec2(15.0, 15.0)), ui::Icon::Search, pal.muted);
             let inner = egui::Rect::from_min_max(egui::pos2(sr.left() + 38.0, sr.top() + 8.0), egui::pos2(sr.right() - 16.0, sr.bottom() - 6.0));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-            let r = child.add(egui::TextEdit::singleline(&mut self.query).frame(false).hint_text(RichText::new("Title, author or ISBN").color(pal.muted)).desired_width(f32::INFINITY).font(ui::ui_m(15.0)));
+            let r = child.add(egui::TextEdit::singleline(&mut self.query).frame(false).hint_text(RichText::new(tr("Title, author or ISBN")).color(pal.muted)).desired_width(f32::INFINITY).font(ui::ui_m(15.0)));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
-            if ui::primary_button(ui, if self.searching { "Searching" } else { "Search" }).clicked() || enter {
+            if ui::primary_button(ui, if self.searching { tr("Searching") } else { tr("Search") }).clicked() || enter {
                 self.do_search(1, app);
             }
         });
@@ -778,23 +767,23 @@ impl Online {
         // filters, quietly
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if ui::text_button(ui, "Exact", self.filters.exact).on_hover_text("Exact title match").clicked() {
+            if ui::text_button(ui, tr("Exact"), self.filters.exact).on_hover_text(tr("Exact title match")).clicked() {
                 self.filters.exact = !self.filters.exact;
             }
             egui::ComboBox::from_id_salt("ext").selected_text(if self.filters.extension.is_empty() { "Any format".to_string() } else { self.filters.extension.clone() }).width(110.0).show_ui(ui, |ui| {
                 for e in ["", "EPUB", "PDF", "MOBI", "AZW3", "FB2", "TXT", "DJVU", "CBZ"] {
-                    ui.selectable_value(&mut self.filters.extension, e.into(), if e.is_empty() { "Any format" } else { e });
+                    ui.selectable_value(&mut self.filters.extension, e.into(), if e.is_empty() { tr("Any format") } else { e });
                 }
             });
             egui::ComboBox::from_id_salt("order").selected_text(order_label(&self.filters.order)).width(130.0).show_ui(ui, |ui| {
-                for (v, l) in [("bestmatch", "Best match"), ("popular", "Popular"), ("date_created", "Newest"), ("date_updated", "Recently updated"), ("year", "Year"), ("titleA", "Title A–Z")] {
+                for (v, l) in [("bestmatch", tr("Best match")), ("popular", tr("Popular")), ("date_created", tr("Newest")), ("date_updated", tr("Recently updated")), ("year", tr("Year")), ("titleA", tr("Title A–Z"))] {
                     ui.selectable_value(&mut self.filters.order, v.into(), l);
                 }
             });
-            ui.add(egui::TextEdit::singleline(&mut self.filters.language).desired_width(96.0).hint_text("Language").margin(vec2(8.0, 4.0)));
-            ui.add(egui::TextEdit::singleline(&mut self.filters.year_from).desired_width(58.0).hint_text("From").margin(vec2(8.0, 4.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.filters.language).desired_width(96.0).hint_text(tr("Language")).margin(vec2(8.0, 4.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.filters.year_from).desired_width(58.0).hint_text(tr("From")).margin(vec2(8.0, 4.0)));
             ui.label(RichText::new("–").color(pal.muted));
-            ui.add(egui::TextEdit::singleline(&mut self.filters.year_to).desired_width(58.0).hint_text("To").margin(vec2(8.0, 4.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.filters.year_to).desired_width(58.0).hint_text(tr("To")).margin(vec2(8.0, 4.0)));
         });
         if !self.search_error.is_empty() {
             ui.add_space(6.0);
@@ -808,14 +797,14 @@ impl Online {
             if self.searching {
                 ui.spinner();
             } else {
-                ui.label(RichText::new("Search for a book. Add it to your library, or open it right away with Read online.").font(ui::ui_m(15.0)).color(pal.muted));
+                ui.label(RichText::new(tr("Search for a book. Add it to your library, or read it online in your browser.")).font(ui::ui_m(15.0)).color(pal.muted));
             }
             return;
         }
         let books = self.results.books.clone();
         let proxy = app.proxy_opt();
         let mut clicked = None;
-        let mut get: Option<(api::Book, bool)> = None;
+        let mut get: Option<api::Book> = None;
         let downloading = self.active_dl.clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for b in &books {
@@ -862,7 +851,11 @@ impl Online {
                     ui.painter().text(egui::pos2(bar.center().x, bar.bottom() + 12.0), egui::Align2::CENTER_CENTER, format!("{:.0}%", frac * 100.0), ui::ui_m(11.0), pal.muted);
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
                 } else {
-                    for (i, (icon, tip, temp)) in [(ui::Icon::Download, "Add to library", false), (ui::Icon::Book, "Read online (opens right away, not shelved)", true)].into_iter().enumerate() {
+                    let online = !b.read_online_url.is_empty();
+                    for (i, (icon, tip, read)) in [(ui::Icon::Download, tr("Add to library (uses one download from today's quota)"), false), (ui::Icon::Book, if online { tr("Read online in your browser (no download, no quota)") } else { tr("Not available to read online") }, true)].into_iter().enumerate() {
+                        if read && !online {
+                            continue;
+                        }
                         let c = egui::pos2(rect.right() - 28.0 - i as f32 * 42.0, rect.center().y);
                         let br = egui::Rect::from_center_size(c, vec2(36.0, 36.0));
                         let bresp = ui.interact(br, resp.id.with(i), Sense::click());
@@ -870,8 +863,12 @@ impl Online {
                         ui.painter().circle_filled(c, 17.0, if h > 0.01 { ui::ACCENT.linear_multiply(0.15 + 0.85 * h) } else { pal.bg });
                         ui.painter().circle_stroke(c, 17.0, egui::Stroke::new(1.0, pal.border.lerp_to_gamma(ui::ACCENT, h)));
                         ui::paint_icon(ui.painter(), br.shrink(10.0), icon, if h > 0.5 { Color32::WHITE } else { pal.fg });
-                        if bresp.on_hover_text(tip).clicked() && downloading.is_none() {
-                            get = Some((b.clone(), temp));
+                        if bresp.on_hover_text(tip).clicked() {
+                            if read {
+                                crate::platform::open_url(&b.read_online_url);
+                            } else if downloading.is_none() {
+                                get = Some(b.clone());
+                            }
                         }
                     }
                 }
@@ -881,18 +878,18 @@ impl Online {
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if self.page > 1 && !self.searching && ui::text_button(ui, "← Previous", false).clicked() {
+                if self.page > 1 && !self.searching && ui::text_button(ui, tr("← Previous"), false).clicked() {
                     self.do_search(self.page - 1, app);
                 }
-                ui.label(RichText::new(format!("Page {} of {}", self.results.page, self.results.total_pages.max(1))).font(ui::ui_m(12.5)).color(pal.muted));
-                if self.page < self.results.total_pages && !self.searching && ui::text_button(ui, "Next →", false).clicked() {
+                ui.label(RichText::new(trf!("Page {n} of {total}", n = self.results.page, total = self.results.total_pages.max(1))).font(ui::ui_m(12.5)).color(pal.muted));
+                if self.page < self.results.total_pages && !self.searching && ui::text_button(ui, tr("Next →"), false).clicked() {
                     self.do_search(self.page + 1, app);
                 }
             });
         });
-        if let Some((b, temp)) = get {
+        if let Some(b) = get {
             self.dl_book = Some(b.id.clone());
-            self.do_download(b, app, temp);
+            self.do_download(b, app);
         }
         if let Some(b) = clicked {
             self.fetch_details(&b, app);
@@ -903,7 +900,7 @@ impl Online {
         let Some(book) = self.selected.clone() else { return };
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if ui::icon_button(ui, ui::Icon::Close, "Close").clicked() {
+                if ui::icon_button(ui, ui::Icon::Close, tr("Close")).clicked() {
                     self.selected = None;
                     self.details = None;
                 }
@@ -922,7 +919,7 @@ impl Online {
             ui.label(RichText::new(&book.author).color(pal.muted));
             ui.add_space(6.0);
             egui::Grid::new("zl-meta").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-                for (k, v) in [("Year", &book.year), ("Publisher", &book.publisher), ("Language", &book.language), ("Format", &book.extension), ("Pages", &book.pages), ("Size", &book.size)] {
+                for (k, v) in [(tr("Year"), &book.year), (tr("Publisher"), &book.publisher), (tr("Language"), &book.language), (tr("Format"), &book.extension), (tr("Pages"), &book.pages), (tr("Size"), &book.size)] {
                     if !v.is_empty() {
                         ui.label(RichText::new(k).color(pal.muted));
                         ui.label(v.as_str());
@@ -947,11 +944,11 @@ impl Online {
                         self.progress_bar(ui, pal, w, total);
                     } else {
                         ui.horizontal(|ui| {
-                            if ui::primary_button(ui, "Add to library").clicked() {
-                                self.do_download(d.clone(), app, false);
+                            if ui::primary_button(ui, tr("Add to library")).clicked() {
+                                self.do_download(d.clone(), app);
                             }
-                            if ui::text_button(ui, "Read online", false).on_hover_text("Opens it straight away without shelving it. Uses one download from today's quota.").clicked() {
-                                self.do_download(d.clone(), app, true);
+                            if !d.read_online_url.is_empty() && ui::text_button(ui, tr("Read online"), false).on_hover_text(tr("Opens Z-Library's reader in your browser. Nothing is downloaded and no quota is used.")).clicked() {
+                                crate::platform::open_url(&d.read_online_url);
                             }
                         });
                     }
@@ -989,12 +986,12 @@ fn trunc(s: &str, n: usize) -> String {
 
 fn order_label(o: &str) -> &'static str {
     match o {
-        "popular" => "Popular",
-        "date_created" => "Newest",
-        "date_updated" => "Recently updated",
-        "year" => "Year",
-        "titleA" => "Title A–Z",
-        _ => "Best match",
+        "popular" => tr("Popular"),
+        "date_created" => tr("Newest"),
+        "date_updated" => tr("Recently updated"),
+        "year" => tr("Year"),
+        "titleA" => tr("Title A–Z"),
+        _ => tr("Best match"),
     }
 }
 
@@ -1002,8 +999,7 @@ fn order_label(o: &str) -> &'static str {
 fn attach_catalogue_data(path: &std::path::Path, book: &api::Book, proxy: &Option<String>) -> bool {
     let Some(id) = store::book_id(path) else { return false };
     let mut ok = false;
-    if !book.cover.is_empty() {
-        let client = api::build_client(proxy, Some(std::time::Duration::from_secs(20)));
+    if let (false, Ok(client)) = (book.cover.is_empty(), api::client(proxy, Some(std::time::Duration::from_secs(20)))) {
         // catalogue thumbnails often have a larger sibling without the size suffix
         let big = book.cover.replace("/covers100/", "/covers299/");
         for url in [big.as_str(), book.cover.as_str()] {

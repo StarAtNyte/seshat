@@ -44,13 +44,19 @@ pub fn reveal(path: &Path) {
     }
 }
 
+/// Open a web link in the default browser. Only http(s) and mailto links are
+/// passed on, so a link inside a book can never launch a local handler.
 pub fn open_url(url: &str) {
+    let lower = url.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     let _ = command("xdg-open").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let _ = command("open").arg(url).spawn();
     #[cfg(windows)]
-    let _ = command("cmd").args(["/C", "start", "", url]).spawn();
+    let _ = command("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let _ = command("xdg-open").arg(url).spawn();
 }

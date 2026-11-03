@@ -1,6 +1,6 @@
 [package]
 name = "seshat"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Seshat: a fast, native ebook reader for EPUB, MOBI/AZW3, FB2, PDF, CBZ and TXT"
 license = "MIT"
@@ -8,20 +8,44 @@ repository = "https://github.com/StarAtNyte/seshat"
 build = "build.rs"
 readme = "README.md"
 
+[workspace]
+# `seshat-voice` is the optional natural-voice helper, shipped as a separate
+# download so the main app stays small. `cargo build` builds only Seshat.
+members = [".", "voice"]
+default-members = ["."]
+
 [dependencies]
 eframe = "0.31"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "socks", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
+sys-locale = "0.3"
 rfd = "0.15"
 
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
 md-5 = "0.10"
 hayro = "0.9"
 fontdb = "0.24"
+# SVG images (no text/raster-image features: shapes only, stays small)
+resvg = { version = "0.45", default-features = false }
+# right-to-left reordering (UAX #9)
+unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data", "std"] }
+# hyphenation patterns (embedded, compact tries)
+hypher = { version = "0.1", default-features = false, features = ["alloc", "english", "german", "french", "spanish", "italian", "portuguese", "dutch", "russian", "polish", "swedish", "danish", "finnish", "czech", "ukrainian", "catalan", "croatian", "slovak", "slovenian", "turkish", "greek"] }
+sha2 = "0.10"
+encoding_rs = "0.8.44"
+chardetng = "1.0.0"
+# EPUB3 media overlays (read-along narration): MP3 and AAC/M4A, the EPUB3
+# core audio types, plus playback. Nothing else.
+rodio = { version = "0.21", default-features = false, features = ["playback", "mp3", "mp4"] }
+
+[dev-dependencies]
+# tests decode a generated WAV clip (tests only; not in the shipped binary)
+rodio = { version = "0.21", default-features = false, features = ["playback", "mp3", "mp4", "wav"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

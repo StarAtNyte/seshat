@@ -2,6 +2,7 @@
 //! highlighter, Bricolage Grotesque throughout, thin rules, playful details
 //! (pill toggles, wavy hover underlines, geometric placeholder covers).
 
+use crate::i18n::tr;
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, Ui};
 
 use crate::store::{ReaderSettings, Theme};
@@ -382,6 +383,15 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
     }
 }
 
+/// Give a custom-painted control an accessible name (and toggle state) for screen readers.
+pub fn name(resp: &Response, label: &str, selected: Option<bool>) {
+    let label = label.to_string();
+    resp.widget_info(move || match selected {
+        Some(on) => egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label.clone()),
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()),
+    });
+}
+
 pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
     icon_toggle(ui, icon, tip, false)
 }
@@ -394,11 +404,33 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, active: bool) -> Response
     }
     let color = if active { ACCENT } else { fg };
     paint_icon(ui.painter(), rect.shrink(7.5), icon, color);
+    name(&resp, tip, if active { Some(true) } else { None });
     if tip.is_empty() {
         resp
     } else {
         resp.on_hover_text(tip)
     }
+}
+
+/// `text` shortened with an ellipsis so it fits `max_w` points in `font`
+/// (translated labels can run longer than the English they replace).
+pub fn fit(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
+    let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let t: String = chars[..mid].iter().collect::<String>() + "…";
+        if width(&t) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().collect::<String>() + "…"
 }
 
 /// Text toggle. Active: soft accent pill. Hover: a little wavy underline.
@@ -554,7 +586,7 @@ pub fn window_controls(ui: &mut Ui, fg: Color32) -> bool {
         ui.painter().line_segment([c + vec2(-3.0, -3.0), c + vec2(3.0, 3.0)], s);
         ui.painter().line_segment([c + vec2(3.0, -3.0), c + vec2(-3.0, 3.0)], s);
     }
-    if resp.on_hover_text("Close").clicked() {
+    if resp.on_hover_text(tr("Close")).clicked() {
         close = true;
     }
     // maximise: outlined square
@@ -562,7 +594,7 @@ pub fn window_controls(ui: &mut Ui, fg: Color32) -> bool {
     let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     let sq = Rect::from_center_size(r.center(), vec2(10.0 + 2.0 * t, 10.0 + 2.0 * t));
     ui.painter().rect_stroke(sq, CornerRadius::same(2), Stroke::new(1.5, mix(fg, ACCENT, t)), egui::StrokeKind::Middle);
-    if resp.on_hover_text("Maximise").clicked() {
+    if resp.on_hover_text(tr("Maximise")).clicked() {
         let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
     }
@@ -570,7 +602,7 @@ pub fn window_controls(ui: &mut Ui, fg: Color32) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
     let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     ui.painter().rect_filled(Rect::from_center_size(r.center(), vec2(14.0 + 4.0 * t, 5.0)), CornerRadius::same(3), mix(LIME, ACCENT, t * 0.3));
-    if resp.on_hover_text("Minimise").clicked() {
+    if resp.on_hover_text(tr("Minimise")).clicked() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
     close
@@ -638,6 +670,7 @@ pub fn segmented(ui: &mut Ui, id: &str, labels: &[&str], selected: usize) -> Opt
     for (i, l) in labels.iter().enumerate() {
         let r = Rect::from_min_size(pos2(xs[i], rect.top()), vec2(widths[i], 30.0));
         let resp = ui.interact(r, egui::Id::new((id, i)), Sense::click());
+        name(&resp, l, Some(i == sel));
         let c = if i == sel { ACCENT } else if resp.hovered() { fg } else { fg.linear_multiply(0.7) };
         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, *l, font.clone(), c);
         if resp.clicked() {

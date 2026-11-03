@@ -309,7 +309,7 @@ pub fn open(path: &Path) -> Result<Book, String> {
     let mut text = raw.clone();
     let fdst_rec = part.header.fdst.checked_add(part.base).filter(|&i| i < pdb.len()).map(|i| pdb.record(i));
     if let Some(f) = fdst_rec.filter(|f| f.starts_with(b"FDST")) {
-        let count = be32(f, 8) as usize;
+        let count = (be32(f, 8) as usize).min(f.len().saturating_sub(12) / 8);
         for k in 0..count {
             let s = be32(f, 12 + k * 8) as usize;
             let e = be32(f, 16 + k * 8) as usize;
@@ -322,6 +322,19 @@ pub fn open(path: &Path) -> Result<Book, String> {
         }
     }
     let src = decode(&text, part.header.utf8);
+    // Raw byte offset → offset in `src` (identity for UTF-8; CP1252 chars may be multi-byte).
+    let offset_map: Option<Vec<usize>> = if part.header.utf8 {
+        None
+    } else {
+        let mut m = Vec::with_capacity(text.len() + 1);
+        let mut acc = 0;
+        for &c in &text {
+            m.push(acc);
+            acc += if c < 0x80 { 1 } else { decode_cp1252(&[c]).len() };
+        }
+        m.push(acc);
+        Some(m)
+    };
 
     // MOBI6 filepos anchors: collect targets up front.
     let mut pos_anchors: Vec<usize> = Vec::new();
@@ -337,11 +350,11 @@ pub fn open(path: &Path) -> Result<Book, String> {
         pos_anchors.sort_unstable();
         pos_anchors.dedup();
     }
-    // filepos values are byte offsets into the raw text; our string is decoded.
-    // For UTF-8 books byte offsets match; for CP1252 they match as well since
-    // the tokenizer offsets are into the decoded string — approximate only for
-    // non-ASCII content.
-
+    // filepos values are raw byte offsets; translate to offsets in the decoded string.
+    let pos_anchors: Vec<(usize, usize)> = pos_anchors
+        .iter()
+        .map(|&raw| (offset_map.as_ref().map_or(raw, |m| m[raw.min(m.len() - 1)]), raw))
+        .collect();
     let mut resources: HashMap<String, ResRef> = HashMap::new();
     let mut raw_links: Vec<String> = Vec::new();
     let out = {

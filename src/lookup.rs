@@ -1,6 +1,7 @@
 //! Online lookups for selected text: dictionary, Wikipedia, translation.
 //! Only runs when the user explicitly asks for a lookup.
 
+use crate::i18n::tr;
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -13,9 +14,9 @@ pub enum Kind {
 impl Kind {
     pub fn title(self) -> &'static str {
         match self {
-            Kind::Dictionary => "Dictionary",
+            Kind::Dictionary => tr("Dictionary"),
             Kind::Wikipedia => "Wikipedia",
-            Kind::Translate => "Translation",
+            Kind::Translate => tr("Translation"),
         }
     }
 }
@@ -38,9 +39,14 @@ fn client(proxy: &Option<String>) -> reqwest::blocking::Client {
     b.build().unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
-pub fn run(kind: Kind, text: &str, book_lang: &str, target_lang: &str, proxy: &Option<String>) -> Result<Answer, String> {
-    let c = client(proxy);
+pub fn run(kind: Kind, text: &str, book_lang: &str, target_lang: &str, proxy: &Option<String>, dict_dirs: &[String]) -> Result<Answer, String> {
     let text = text.trim();
+    if kind == Kind::Dictionary && !dict_dirs.is_empty() {
+        if let Some(a) = offline(text, dict_dirs) {
+            return Ok(a);
+        }
+    }
+    let c = client(proxy);
     match kind {
         Kind::Dictionary => dictionary(&c, text, book_lang),
         Kind::Wikipedia => wikipedia(&c, text, book_lang),
@@ -48,9 +54,26 @@ pub fn run(kind: Kind, text: &str, book_lang: &str, target_lang: &str, proxy: &O
     }
 }
 
+/// Offline dictionaries first (StarDict / dictd); None when nothing matches.
+fn offline(text: &str, dirs: &[String]) -> Option<Answer> {
+    let dicts = crate::dict::load_all(dirs);
+    let hits = crate::dict::lookup(&dicts, text);
+    let (_, head, _) = hits.first()?;
+    let heading = head.clone();
+    let mut body = String::new();
+    for (name, _, def) in &hits {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&format!("[{name}]\n{def}"));
+    }
+    Some(Answer { heading, body, url: None })
+}
+
 fn lang2(l: &str) -> String {
     let l = l.split(['-', '_']).next().unwrap_or("").to_lowercase();
-    if l.len() == 2 {
+    // used as a Wikipedia/Wiktionary subdomain: only accept a plain two-letter code
+    if l.len() == 2 && l.bytes().all(|b| b.is_ascii_lowercase()) {
         l
     } else {
         "en".into()
@@ -210,4 +233,20 @@ pub fn urlenc(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lang2;
+
+    #[test]
+    fn lang2_only_accepts_two_letters() {
+        assert_eq!(lang2("fr-CA"), "fr");
+        assert_eq!(lang2("DE"), "de");
+        assert_eq!(lang2("a/"), "en");
+        assert_eq!(lang2("1x"), "en");
+        assert_eq!(lang2("é"), "en");
+        assert_eq!(lang2(""), "en");
+        assert_eq!(lang2("eng"), "en");
+    }
 }

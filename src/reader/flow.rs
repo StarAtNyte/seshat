@@ -1,5 +1,6 @@
 //! Reflowable view: geometry, layout cache, painting, pointer interaction.
 
+use crate::i18n::tr;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,7 @@ impl Reader {
         let book = rect.shrink2(desk);
         let header = if s.show_header { 44.0 } else { 26.0 };
         let footer = if s.show_footer { 44.0 } else { 26.0 };
-        let paginated = s.layout == Layout::Paginated;
+        let paginated = s.layout == Layout::Paginated || self.book.meta.vertical;
         let pad = s.margin.clamp(16.0, 160.0).min(book.width() * 0.09);
         let two = paginated
             && match s.columns {
@@ -117,6 +118,7 @@ impl Reader {
         let book = self.book.clone();
         let Some(flow) = book.flow() else { return };
         let si = self.loc.section.min(flow.sections.len() - 1);
+        self.ensure_sec_chars(si);
         let sec = &flow.sections[si];
         // request images of this section (and the next one, as prefetch)
         let mut known = 0usize;
@@ -147,10 +149,13 @@ impl Reader {
             width: g.col_w,
             page_h: g.page_h,
             fake_italic: !env.installed.has_italic,
-            font_tag: format!("{}{}", env.installed.book_family, env.installed.cjk),
+            // font set + display scale: either changes glyph widths, so line breaks
+            font_tag: format!("{}{}#{}{}@{}", env.installed.book_family, env.installed.cjk, env.installed.generation, if ctx.cumulative_pass_nr() <= env.installed.pass { "~" } else { "" }, ctx.pixels_per_point()),
+            lang: self.book.meta.language.clone(),
+            vertical: self.book.meta.vertical,
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (si, typo.key(), known, s.layout == Layout::Paginated).hash(&mut h);
+        (si, typo.key(), known, s.layout == Layout::Paginated || self.book.meta.vertical).hash(&mut h);
         let key = h.finish();
         if self.layout.as_ref().is_some_and(|l| l.key == key) {
             return;
@@ -168,13 +173,15 @@ impl Reader {
         } else {
             self.page = lay.page_for(self.loc.block, self.loc.offset);
             self.page -= self.page % self.step;
-            if self.layout.as_ref().map(|l| l.section) != Some(si) || s.layout == Layout::Paginated {
-                self.scroll_y = (lay.y_of(self.loc.block, self.loc.offset) - 4.0).max(0.0);
-            }
+            // The layout key changed (section, font, width, mode, images): the old pixel offset is
+            // meaningless now, so always re-derive it from the logical location.
+            self.scroll_y = (lay.y_of(self.loc.block, self.loc.offset) - 4.0).max(0.0);
         }
         // keep the previous chapter alive so a page can flip across the boundary
         if let Some(old) = self.layout.take() {
             if old.section != si {
+                // selection points are block indices of the old section; they mean nothing here
+                self.clear_selection();
                 self.prev_layout = Some(old);
             }
         }
@@ -188,7 +195,7 @@ impl Reader {
         let Some(flow) = self.book.flow() else { return };
         let n = flow.sections.len();
         let Some(l) = &self.layout else { return };
-        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
+        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical {
             return self.scroll_by(self.view_h * 0.9);
         }
         if self.motion < 2 {
@@ -214,7 +221,7 @@ impl Reader {
             return self.fixed_prev();
         }
         let Some(l) = &self.layout else { return };
-        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
+        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical {
             return self.scroll_by(-self.view_h * 0.9);
         }
         if self.motion < 2 && (self.page > 0 || l.section > 0) {
@@ -245,6 +252,7 @@ impl Reader {
         if target > max + 1.0 {
             if self.scroll_y >= max - 1.0 && l.section + 1 < n {
                 self.loc = Loc::new(l.section + 1, 0, 0);
+                self.clear_selection();
                 self.scroll_y = 0.0;
                 self.dirty = true;
                 return;
@@ -253,6 +261,7 @@ impl Reader {
         } else if target < 0.0 {
             if self.scroll_y <= 1.0 && l.section > 0 {
                 self.loc = Loc::new(l.section - 1, 0, 0);
+                self.clear_selection();
                 self.go_end = true;
                 self.dirty = true;
                 return;
@@ -294,10 +303,20 @@ impl Reader {
         let col = if g.cols == 2 && pos.x > g.x0 + g.col_w + g.gap / 2.0 { 1 } else { 0 };
         let o = g.origin(col);
         if paginated {
-            let pg = l.pages.get(self.page + col)?;
+            let pg = l.pages.get(self.page + self.page_col(g, col))?;
             Some((col, pos - o, pg.top, pg.bottom))
         } else {
             Some((0, pos - o, self.scroll_y, self.scroll_y + g.page_h))
+        }
+    }
+
+    /// Page offset (from `self.page`) shown in visual column `col`: in
+    /// right-to-left books the first page of a spread is the right-hand one.
+    fn page_col(&self, g: &Geo, col: usize) -> usize {
+        if self.book.meta.rtl && g.cols == 2 {
+            1 - col.min(1)
+        } else {
+            col
         }
     }
 
@@ -343,7 +362,8 @@ impl Reader {
 
     pub(super) fn flow_view(&mut self, ui: &mut Ui, rect: Rect, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
         self.last_layout = s.layout;
-        let paginated = s.layout == Layout::Paginated;
+        let paginated = s.layout == Layout::Paginated || self.book.meta.vertical;
+        let rtl = self.book.meta.rtl;
         let g = self.geometry(rect, s);
         self.view_h = g.page_h;
         self.ensure_layout(ui.ctx(), s, pal, env, &g);
@@ -404,6 +424,7 @@ impl Reader {
             }
         }
         if resp.double_clicked() {
+            self.pending_tap = None;
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some((b, c)) = self.hit(&g, p, paginated, false) {
                     let text = self.book.flow().and_then(|f| f.sections.get(self.loc.section)).and_then(|s| s.blocks.get(b)).map(|b| b.text()).unwrap_or_default();
@@ -416,7 +437,18 @@ impl Reader {
             }
         } else if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                self.on_click(&g, p, rect, s, paginated);
+                self.on_click(&g, p, rect, paginated);
+            }
+        }
+        if let Some(fx) = self.due_tap(ui.ctx()) {
+            // right-to-left books turn forward from the left edge
+            let (back, fwd) = if self.book.meta.rtl { (fx > 0.72, fx < 0.28) } else { (fx < 0.28, fx > 0.72) };
+            if s.tap_zones && back {
+                self.prev_page();
+            } else if s.tap_zones && fwd {
+                self.next_page();
+            } else {
+                self.tools = !self.tools;
             }
         }
         if resp.secondary_clicked() {
@@ -481,7 +513,7 @@ impl Reader {
             return;
         }
         let painter = ui.painter_at(rect);
-        let frac = self.book.flow().map(|f| f.fraction(self.loc)).unwrap_or(0.0);
+        let frac = self.fraction();
         self.paint_book(&painter, &g, pal, frac);
         // opening: the cover swings away toward the spine
         let now = std::time::Instant::now();
@@ -491,7 +523,8 @@ impl Reader {
         let cross = turn.is_some_and(|t| t.section != l.section);
         let dur = if self.motion == 0 { 0.55 } else { 0.22 };
         let turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
-        let flip3d = self.motion == 0 && turn_t < 1.0;
+        // the 3D leaf is built for left-to-right books; rtl books use the sweep
+        let flip3d = self.motion == 0 && turn_t < 1.0 && !rtl;
         if open_t < 1.0 || turn_t < 1.0 {
             ui.ctx().request_repaint();
         }
@@ -516,7 +549,7 @@ impl Reader {
                     }
                 }
                 (true, Some(t)) if t.dir < 0 => vec![(cross, t.from)],
-                _ => (0..g.cols).map(|c| (false, self.page + c)).collect(),
+                _ => (0..g.cols).map(|c| (false, self.page + self.page_col(&g, c))).collect(),
             };
             for (col, (old, pi)) in base.into_iter().enumerate() {
                 let lay = if old { self.prev_layout.as_ref().unwrap_or(l) } else { l };
@@ -539,7 +572,11 @@ impl Reader {
         // running heads and folios, set like a printed book
         let small = ui::ui_m(12.0);
         let chapter = self.chapter_title(self.loc);
-        let trunc = |t: &str, n: usize| if t.chars().count() > n { t.chars().take(n).collect::<String>() + "…" } else { t.to_string() };
+        // shaped and reordered for display (Arabic/Hebrew titles), after truncating
+        let trunc = |t: &str, n: usize| {
+            let cut = if t.chars().count() > n { t.chars().take(n).collect::<String>() + "…" } else { t.to_string() };
+            crate::book::script::visual(&cut).into_owned()
+        };
         if s.show_header {
             if g.cols == 2 {
                 let (l0, l1) = (g.sheet(0), g.sheet(1));
@@ -551,16 +588,16 @@ impl Reader {
             }
         }
         if s.show_footer {
-            if let Some(flow) = self.book.flow() {
-                let pct = (flow.fraction(self.loc) * 100.0).round();
-                let left = flow.section_chars_after(self.loc) as f32 / env.app.reading_speed_cpm.max(100.0);
-                let left_txt = if left < 1.0 { "under a minute left in chapter".to_string() } else { format!("{} min left in chapter", left.round()) };
+            if self.book.flow().is_some() {
+                let pct = (self.fraction() * 100.0).round();
+                let left = self.chars_after(self.loc) as f32 / env.app.reading_speed_cpm.max(100.0);
+                let left_txt = if left < 1.0 { tr("under a minute left in chapter").to_string() } else { trf!("{n} min left in chapter", n = left.round()) };
                 let last = g.sheet(g.cols - 1);
                 let first = g.sheet(0);
                 let y = first.bottom() - 24.0;
                 if paginated {
                     for col in 0..g.cols {
-                        let pi = self.page + col;
+                        let pi = self.page + self.page_col(&g, col);
                         if pi < l.pages.len() {
                             let sh = g.sheet(col);
                             let (x, al) = if col == 0 && g.cols == 2 { (sh.left() + g.pad, egui::Align2::LEFT_CENTER) } else { (sh.right() - g.pad, egui::Align2::RIGHT_CENTER) };
@@ -570,7 +607,7 @@ impl Reader {
                 }
                 painter.text(pos2(first.center().x, y), egui::Align2::CENTER_CENTER, left_txt, small.clone(), pal.muted);
                 if g.cols == 2 {
-                    painter.text(pos2(last.center().x, y), egui::Align2::CENTER_CENTER, format!("{pct}% of the book"), small, pal.muted);
+                    painter.text(pos2(last.center().x, y), egui::Align2::CENTER_CENTER, trf!("{pct}% of the book", pct = pct), small, pal.muted);
                 }
             }
         }
@@ -589,6 +626,7 @@ impl Reader {
         // simple motion: a sheet sweeping into the spine with a shadowed edge
         if turn_t < 1.0 && paginated && !flip3d {
             let dir = turn.map(|t| t.dir).unwrap_or(1);
+            let dir = if rtl { -dir } else { dir };
             let e = super::ease(turn_t);
             let target = if dir > 0 { g.sheet(g.cols - 1) } else { g.sheet(0) };
             let hinge = match (g.spine, dir > 0) {
@@ -672,7 +710,8 @@ impl Reader {
             }
             let by = origin.y + b.y - top;
             match &b.item {
-                super::layout::Item::Text { galley, ax } => shapes.push(egui::Shape::galley(pos2(origin.x + ax, by), ctx.fonts(|f| f.layout_job((*galley.job).clone())), fg)),
+                super::layout::Item::Text { galley, ax, .. } => shapes.push(egui::Shape::galley(pos2(origin.x + ax, by), ctx.fonts(|f| f.layout_job((*galley.job).clone())), fg)),
+                super::layout::Item::Table(lt) => shapes.extend(ctx.fonts(|f| lt.shapes(f, pos2(origin.x, by), fg, clip))),
                 super::layout::Item::Image { key, size, x } => {
                     if let Some(t) = self.tex.get(key) {
                         let tint = if dim { Color32::from_gray(225) } else { Color32::WHITE };
@@ -786,7 +825,7 @@ impl Reader {
         ctx.request_repaint();
     }
 
-    fn on_click(&mut self, g: &Geo, p: Pos2, rect: Rect, s: &ReaderSettings, paginated: bool) {
+    fn on_click(&mut self, g: &Geo, p: Pos2, rect: Rect, paginated: bool) {
         if self.sel_popup.is_some() || self.hl_popup.is_some() || self.footnote.is_some() || self.sel.is_some() {
             self.clear_selection();
             self.footnote = None;
@@ -817,13 +856,30 @@ impl Reader {
                 return;
             }
         }
-        let fx = (p.x - rect.left()) / rect.width();
-        if s.tap_zones && fx < 0.28 {
-            self.prev_page();
-        } else if s.tap_zones && fx > 0.72 {
-            self.next_page();
+        // A click on a word might be the first half of a double-click (select
+        // word), so its page turn / toolbar toggle waits out the double-click
+        // interval. Clicks on margins and blank space act at once: turning
+        // pages by clicking must not lag.
+        let on_word = self.hit(g, p, paginated, false).is_some_and(|(b, c)| {
+            let text = self.book.flow().and_then(|f| f.sections.get(self.loc.section)).and_then(|s| s.blocks.get(b)).map(|b| b.text()).unwrap_or_default();
+            let (ws, we) = super::layout::word_at(&text, c);
+            we > ws
+        });
+        let at = if on_word { Instant::now() } else { Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now) };
+        self.pending_tap = Some(((p.x - rect.left()) / rect.width(), at));
+    }
+
+    /// The pending single click, once it's clear it isn't the start of a double-click.
+    pub(super) fn due_tap(&mut self, ctx: &egui::Context) -> Option<f32> {
+        let (fx, at) = self.pending_tap?;
+        let wait = Duration::from_secs_f64(ctx.options(|o| o.input_options.max_double_click_delay)) + Duration::from_millis(30);
+        let el = at.elapsed();
+        if el >= wait {
+            self.pending_tap = None;
+            Some(fx)
         } else {
-            self.tools = !self.tools;
+            ctx.request_repaint_after(wait - el);
+            None
         }
     }
 }

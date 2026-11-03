@@ -68,6 +68,8 @@ pub struct Book {
     pub description: String,
     pub cover: String,
     pub download_url: String,
+    /// Z-Library's own web reader for this book (signed URL), if it offers one.
+    pub read_online_url: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -112,24 +114,28 @@ fn parse_book(item: &Value, domain: &str) -> Book {
         description: vstr(get(item, "description")),
         cover: vstr(get(item, "cover")),
         download_url: String::new(),
+        read_online_url: {
+            let u = vstr(get(item, "readOnlineUrl"));
+            let ok = get(item, "readOnlineAvailable").as_bool().unwrap_or(!u.is_empty());
+            if ok && u.starts_with("https://") { u } else { String::new() }
+        },
     }
 }
 
 // ---------- HTTP plumbing ----------
 
-pub fn build_client(proxy: &Option<String>, timeout: Option<Duration>) -> reqwest::blocking::Client {
+/// HTTP client honouring the user's proxy. A proxy that is set but unusable is
+/// an error: silently falling back to a direct connection would leak traffic
+/// (bad for Tor users).
+pub fn client(proxy: &Option<String>, timeout: Option<Duration>) -> Result<reqwest::blocking::Client, String> {
     let mut b = reqwest::blocking::Client::builder()
         .user_agent("zlib-lite/0.1 (Z-Library desktop client)")
         .timeout(timeout.unwrap_or(Duration::from_secs(30)));
-    if let Some(p) = proxy {
-        if !p.is_empty() {
-            b = match reqwest::Proxy::all(p) {
-                Ok(px) => b.proxy(px),
-                Err(_) => b,
-            };
-        }
+    if let Some(p) = proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let px = reqwest::Proxy::all(p).map_err(|e| format!("invalid proxy \"{p}\": {e}"))?;
+        b = b.proxy(px);
     }
-    b.build().unwrap_or_default()
+    b.build().map_err(|e| if proxy.as_deref().is_some_and(|p| !p.trim().is_empty()) { format!("invalid proxy: {e}") } else { format!("cannot create HTTP client: {e}") })
 }
 
 fn auth_header(sess: &Session) -> String {
@@ -138,7 +144,7 @@ fn auth_header(sess: &Session) -> String {
 
 /// Probe one mirror: GET /eapi/info/ok must return {success:1}.
 pub fn probe(domain: &str, proxy: &Option<String>) -> bool {
-    let client = build_client(proxy, Some(Duration::from_secs(8)));
+    let Ok(client) = client(proxy, Some(Duration::from_secs(8))) else { return false };
     let url = format!("{}/eapi/info/ok", normalize(domain));
     match client.get(&url).send() {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>() {
@@ -166,7 +172,7 @@ pub fn login(
     password: &str,
 ) -> Result<Session, String> {
     let domain = normalize(domain);
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let resp = client
         .post(format!("{}/eapi/user/login", domain))
         .header("desktop-app-version", "3.2.1")
@@ -218,7 +224,7 @@ pub fn login_with_cookies(
         email: String::new(),
     };
     // Validate: user-info endpoint must accept the cookies.
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let url = format!("{}/eapi/desktop-app/user-info/{}/{}", sess.domain, sess.user_id, sess.user_key);
     let resp = client
         .get(&url)
@@ -233,7 +239,7 @@ pub fn login_with_cookies(
 
 /// Daily download quota: (used today, daily limit).
 pub fn quota(sess: &Session, proxy: &Option<String>) -> Result<(u32, u32), String> {
-    let client = build_client(proxy, Some(Duration::from_secs(15)));
+    let client = client(proxy, Some(Duration::from_secs(15)))?;
     let num = |v: &Value| v.as_u64().or_else(|| vstr(v).parse().ok()).map(|n| n as u32);
     for url in [format!("{}/eapi/user/profile", sess.domain), format!("{}/eapi/desktop-app/user-info/{}/{}", sess.domain, sess.user_id, sess.user_key)] {
         let Ok(resp) = client.get(&url).header("Cookie", auth_header(sess)).send() else { continue };
@@ -255,7 +261,7 @@ pub fn register(
     name: &str,
 ) -> Result<(), String> {
     let domain = normalize(domain);
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let mut form: Vec<(&str, &str)> = vec![("email", email), ("password", password)];
     if !name.is_empty() {
         form.push(("name", name));
@@ -284,7 +290,7 @@ pub fn confirm_code(
     code: &str,
 ) -> Result<Session, String> {
     let domain = normalize(domain);
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let mut form: Vec<(&str, &str)> = vec![("email", email), ("password", password), ("code", code)];
     if !name.is_empty() {
         form.push(("name", name));
@@ -323,7 +329,7 @@ pub fn resend_code(
     name: &str,
 ) -> Result<(), String> {
     let domain = normalize(domain);
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let mut form: Vec<(&str, &str)> = vec![("email", email), ("password", password)];
     if !name.is_empty() {
         form.push(("name", name));
@@ -360,7 +366,7 @@ pub fn search(
     page: u32,
     filters: &Filters,
 ) -> Result<SearchPage, String> {
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let mut form: Vec<(&str, String)> = vec![
         ("message", query.to_string()),
         ("page", page.to_string()),
@@ -420,7 +426,7 @@ pub fn search(
 
 /// Book details via /eapi/book/{id}/{hash}.
 pub fn book_details(sess: &Session, proxy: &Option<String>, id: &str, hash: &str) -> Result<Book, String> {
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
     let url = format!("{}/eapi/book/{}/{}", sess.domain, id, hash);
     let resp = client
         .get(&url)
@@ -486,11 +492,36 @@ fn sanitize_filename(name: &str) -> String {
     if s.is_empty() {
         s = "book".into();
     }
-    // cap length
-    if s.len() > 180 {
-        s.truncate(180);
+    // cap length (bytes), cutting the stem on a char boundary and keeping the extension
+    const MAX: usize = 180;
+    if s.len() > MAX {
+        let (stem, ext) = match s.rfind('.') {
+            Some(i) if i > 0 && s.len() - i <= 12 => (&s[..i], &s[i..]),
+            _ => (s.as_str(), ""),
+        };
+        let mut cut = MAX.saturating_sub(ext.len()).min(stem.len());
+        while !stem.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s = format!("{}{}", stem[..cut].trim_end(), ext);
     }
     s
+}
+
+/// `dir/name`, or `dir/name (2).ext`, `(3)`… if that file already exists.
+fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 fn filename_from_response(resp: &reqwest::blocking::Response, fallback: &str) -> String {
@@ -514,21 +545,16 @@ fn filename_from_response(resp: &reqwest::blocking::Response, fallback: &str) ->
 }
 
 fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 + 1 {
-            if i + 2 < bytes.len() || i + 2 == bytes.len() - 0 {
-                // enough data
-            }
-            if i + 2 <= bytes.len() - 1 {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                    continue;
-                }
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
             }
         }
         out.push(bytes[i]);
@@ -547,7 +573,7 @@ pub fn download_book(
     mut progress: impl FnMut(u64, Option<u64>) + Send,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create download dir: {e}"))?;
-    let client = build_client(proxy, None);
+    let client = client(proxy, None)?;
 
     let link = resolve_file_link(sess, &client, book)?;
 
@@ -573,24 +599,47 @@ pub fn download_book(
         if book.extension.is_empty() { "bin".into() } else { book.extension.clone() }
     );
     let filename = filename_from_response(&resp, &fallback_name);
-    let dest_path = dest_dir.join(filename);
     let tmp_path = dest_dir.join(format!(".zlib-lite-{}.part", std::process::id()));
-
-    let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("cannot write file: {e}"))?;
-    let mut reader = resp;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("download error: {e}"))?;
-        if n == 0 {
-            break;
+    // Partial files left by a crash or kill of an earlier run.
+    if let Ok(rd) = std::fs::read_dir(dest_dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(".zlib-lite-") && n.ends_with(".part") {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("write error: {e}"))?;
-        written += n as u64;
-        progress(written, total);
     }
-    drop(file);
-    std::fs::rename(&tmp_path, &dest_path).map_err(|e| format!("cannot finish file: {e}"))?;
+
+    let res = (|| -> Result<(), String> {
+        let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("cannot write file: {e}"))?;
+        let mut reader = resp;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("download error: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| format!("write error: {e}"))?;
+            written += n as u64;
+            progress(written, total);
+        }
+        // a connection that drops mid-body just ends the stream; don't shelve half a book
+        if total.is_some_and(|t| written != t) {
+            return Err("download was cut off before it finished; please try again".into());
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    // never clobber an existing book with the same name
+    let dest_path = unique_path(dest_dir, &filename);
+    if let Err(e) = std::fs::rename(&tmp_path, &dest_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("cannot finish file: {e}"));
+    }
     Ok(dest_path)
 }
 

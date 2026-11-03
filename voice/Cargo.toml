@@ -1,0 +1,23 @@
+[package]
+name = "seshat-voice"
+version = "0.4.0"
+edition = "2021"
+description = "Seshat's optional natural-voice helper: Kokoro text-to-speech, run offline on the CPU"
+license = "MIT"
+repository = "https://github.com/StarAtNyte/seshat"
+
+[[bin]]
+name = "seshat-voice"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to 1.x: 2.x dropped the espeak-ng fallback, so every name and number
+# missing from the lexicon was silently skipped.
+sherpa-onnx = "=1.13.8"
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+bzip2 = "0.6"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.10"

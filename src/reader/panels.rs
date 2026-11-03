@@ -1,5 +1,6 @@
 //! Sidebar (contents / notes / bookmarks / search) and the reading settings panel.
 
+use crate::i18n::tr;
 use eframe::egui::{self, vec2, Color32, CornerRadius, RichText, Sense, Stroke};
 
 use super::{Action, Env, Reader, Side};
@@ -25,14 +26,14 @@ pub(super) fn sidebar(r: &mut Reader, ctx: &egui::Context, side: Side, pal: &Pal
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if icon_button(ui, Icon::Close, "Close (C)").clicked() {
+                    if icon_button(ui, Icon::Close, tr("Close (C)")).clicked() {
                         r.side = None;
                     }
                 });
             });
             ui.add_space(12.0);
             // four equal tabs with a sliding underline
-            let tabs = [(Side::Toc, "Contents", Icon::List), (Side::Notes, "Notes", Icon::Note), (Side::Bookmarks, "Marks", Icon::Bookmark), (Side::Search, "Find", Icon::Search)];
+            let tabs = [(Side::Toc, tr("Contents"), Icon::List), (Side::Notes, tr("Notes"), Icon::Note), (Side::Bookmarks, tr("Marks"), Icon::Bookmark), (Side::Search, tr("Find"), Icon::Search)];
             let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
             let cw = row.width() / tabs.len() as f32;
             let mut active_x = row.left();
@@ -87,23 +88,23 @@ pub(super) fn notebook(r: &mut Reader, ctx: &egui::Context, pal: &Palette) {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width() - 34.0);
-                    ui.label(RichText::new("Notebook").font(ui::ui_b(16.0)));
+                    ui.label(RichText::new(tr("Notebook")).font(ui::ui_b(16.0)));
                     ui.add(egui::Label::new(RichText::new(&chapter).font(ui::ui_m(12.5)).color(pal.muted)).truncate());
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if icon_button(ui, Icon::Close, "Close (N)").clicked() {
+                    if icon_button(ui, Icon::Close, tr("Close (N)")).clicked() {
                         r.notebook = false;
                     }
                 });
             });
             ui.add_space(12.0);
             // quick note pinned to the current page
-            let te = ui.add(egui::TextEdit::multiline(&mut r.quick_note).hint_text("Jot something about this page…").desired_rows(3).desired_width(f32::INFINITY));
+            let te = ui.add(egui::TextEdit::multiline(&mut r.quick_note).hint_text(tr("Jot something about this page…")).desired_rows(3).desired_width(f32::INFINITY));
             let send = te.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Ctrl+Enter to save").font(ui::ui_m(11.5)).color(pal.muted));
+                ui.label(RichText::new(tr("Ctrl+Enter to save")).font(ui::ui_m(11.5)).color(pal.muted));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if (ui::text_button(ui, "Save note", false).clicked() || send) && !r.quick_note.trim().is_empty() {
+                    if (ui::text_button(ui, tr("Save note"), false).clicked() || send) && !r.quick_note.trim().is_empty() {
                         r.add_page_note();
                     }
                 });
@@ -113,7 +114,7 @@ pub(super) fn notebook(r: &mut Reader, ctx: &egui::Context, pal: &Palette) {
             ui.add_space(10.0);
             let mine: Vec<store::Annotation> = r.data.annotations.iter().filter(|a| a.start.section == cur.section).cloned().collect();
             if mine.is_empty() {
-                ui.label(RichText::new("Nothing marked in this chapter yet. Select text to highlight, or press H for the highlighter.").font(ui::ui_m(12.5)).color(pal.muted));
+                ui.label(RichText::new(tr("Nothing marked in this chapter yet. Select text to highlight, or press H for the highlighter.")).font(ui::ui_m(12.5)).color(pal.muted));
                 return;
             }
             let mut jump = None;
@@ -135,7 +136,7 @@ pub(super) fn notebook(r: &mut Reader, ctx: &egui::Context, pal: &Palette) {
                             }
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(store::relative_time(a.created)).font(ui::ui_m(11.0)).color(pal.muted));
-                                if ui::text_button(ui, if a.note.is_empty() { "Add note" } else { "Edit" }, false).clicked() {
+                                if ui::text_button(ui, if a.note.is_empty() { tr("Add note") } else { tr("Edit") }, false).clicked() {
                                     edit = Some((a.id, a.note.clone()));
                                 }
                             });
@@ -165,11 +166,12 @@ fn cur_loc(r: &Reader) -> Loc {
 fn toc(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
     let cur = r.book.toc_index_for(cur_loc(r));
     if r.book.toc.is_empty() {
-        ui.label(RichText::new("This book has no table of contents.").color(pal.muted));
+        ui.label(RichText::new(tr("This book has no table of contents.")).color(pal.muted));
         return;
     }
     let mut jump = None;
     let scroll_now = std::mem::take(&mut r.toc_scroll);
+    let fracs = r.toc_fractions().to_vec();
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         let book = r.book.clone();
         for (i, e) in book.toc.iter().enumerate() {
@@ -189,8 +191,8 @@ fn toc(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
             let galley = ui.painter().layout(e.title.clone(), font, color, w - indent - 50.0);
             let g = if galley.rows.len() > 1 { ui.painter().layout_no_wrap(truncate(&e.title, ((w - indent - 50.0) / 7.0) as usize), egui::FontId::proportional(13.5), color) } else { galley };
             ui.painter().galley(rect.left_center() + vec2(indent, -g.size().y / 2.0), g, color);
-            if let Content::Flow(f) = &book.content {
-                let pct = (f.fraction(e.loc) * 100.0).round();
+            if let (Content::Flow(_), Some(fr)) = (&book.content, fracs.get(i)) {
+                let pct = (fr * 100.0).round();
                 ui.painter().text(rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{pct}%"), egui::FontId::proportional(11.0), pal.muted);
             } else {
                 ui.painter().text(rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{}", e.loc.section + 1), egui::FontId::proportional(11.0), pal.muted);
@@ -218,14 +220,14 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn notes(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
     if r.data.annotations.is_empty() {
-        ui.label(RichText::new("Select text in the book to highlight it or add a note.").color(pal.muted));
+        ui.label(RichText::new(tr("Select text in the book to highlight it or add a note.")).color(pal.muted));
         return;
     }
     ui.horizontal(|ui| {
-        if ui.button("Export Markdown…").clicked() {
+        if ui.button(tr("Export Markdown…")).clicked() {
             export_notes(r);
         }
-        if ui.button("Copy all").clicked() {
+        if ui.button(tr("Copy all")).clicked() {
             ui.ctx().copy_text(notes_markdown(r));
         }
     });
@@ -253,10 +255,10 @@ fn notes(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(store::relative_time(a.created)).size(11.0).color(pal.muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Delete").clicked() {
+                        if ui.small_button(tr("Delete")).clicked() {
                             delete = Some(a.id);
                         }
-                        if ui.small_button(if a.note.is_empty() { "Add note" } else { "Edit note" }).clicked() {
+                        if ui.small_button(if a.note.is_empty() { tr("Add note") } else { tr("Edit note") }).clicked() {
                             edit = Some((a.id, a.note.clone()));
                         }
                     });
@@ -307,12 +309,12 @@ fn export_notes(r: &Reader) {
 }
 
 fn bookmarks(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
-    if ui.button(if r.bookmark_here().is_some() { "Remove bookmark on this page" } else { "Bookmark this page" }).clicked() {
+    if ui.button(if r.bookmark_here().is_some() { tr("Remove bookmark on this page") } else { tr("Bookmark this page") }).clicked() {
         r.toggle_bookmark();
     }
     ui.add_space(4.0);
     if r.data.bookmarks.is_empty() {
-        ui.label(RichText::new("No bookmarks yet. Press Ctrl+B to bookmark the current page.").color(pal.muted));
+        ui.label(RichText::new(tr("No bookmarks yet. Press Ctrl+B to bookmark the current page.")).color(pal.muted));
         return;
     }
     let mut jump = None;
@@ -328,7 +330,7 @@ fn bookmarks(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(store::relative_time(b.created)).size(11.0).color(pal.muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Remove").clicked() {
+                        if ui.small_button(tr("Remove")).clicked() {
                             del = Some(i);
                         }
                     });
@@ -347,7 +349,7 @@ fn bookmarks(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
 }
 
 fn search(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette, _env: &mut Env) {
-    let resp = ui.add(egui::TextEdit::singleline(&mut r.search_q).hint_text("Search in book…").desired_width(f32::INFINITY));
+    let resp = ui.add(egui::TextEdit::singleline(&mut r.search_q).hint_text(tr("Search in book…")).desired_width(f32::INFINITY));
     if std::mem::take(&mut r.focus_search) {
         resp.request_focus();
     }
@@ -358,28 +360,28 @@ fn search(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette, _env: &mut Env) {
     ui.horizontal(|ui| {
         if r.search_running {
             ui.spinner();
-            ui.label(RichText::new(format!("{} results so far…", r.search_hits.len())).color(pal.muted));
+            ui.label(RichText::new(trf!("{n} results so far…", n = r.search_hits.len())).color(pal.muted));
         } else if !r.search_hits.is_empty() {
             ui.label(RichText::new(format!("{} results", r.search_hits.len())).color(pal.muted));
-            if ui.small_button("◀").on_hover_text("Previous result").clicked() {
+            if ui.small_button("◀").on_hover_text(tr("Previous result")).clicked() {
                 let i = r.search_cur.map(|i| i.saturating_sub(1)).unwrap_or(0);
                 r.search_cur = Some(i);
                 let l = r.search_hits[i].loc;
                 r.jump(l, false);
                 r.search_cur = Some(i);
             }
-            if ui.small_button("▶").on_hover_text("Next result").clicked() {
+            if ui.small_button("▶").on_hover_text(tr("Next result")).clicked() {
                 let i = r.search_cur.map(|i| (i + 1).min(r.search_hits.len() - 1)).unwrap_or(0);
                 let l = r.search_hits[i].loc;
                 r.jump(l, false);
                 r.search_cur = Some(i);
             }
         } else if r.search_q.trim().chars().count() >= 2 && r.search_gen > 0 {
-            ui.label(RichText::new("No results").color(pal.muted));
+            ui.label(RichText::new(tr("No results")).color(pal.muted));
         }
     });
     if r.book.fixed().is_some() && r.fx.texts.is_none() && r.search_running {
-        ui.label(RichText::new("Extracting PDF text (first search only)…").size(12.0).color(pal.muted));
+        ui.label(RichText::new(tr("Extracting PDF text (first search only)…")).size(12.0).color(pal.muted));
     }
     ui.separator();
     let mut jump = None;
@@ -435,22 +437,23 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
         .frame(egui::Frame::new().fill(ui::desk(&pal)).inner_margin(egui::Margin { left: 20, right: 20, top: 16, bottom: 16 }))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Reading settings").font(ui::ui_b(17.0)));
+                ui.label(RichText::new(tr("Reading settings")).font(ui::ui_b(17.0)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, Icon::Close, "Close").clicked() {
+                    if icon_button(ui, Icon::Close, tr("Close")).clicked() {
                         *open = false;
                     }
                 });
             });
             ui.add_space(14.0);
             // tabs
-            let tabs = ["Text", "Layout", "Theme", "More"];
+            let tabs = [tr("Text"), tr("Layout"), tr("Theme"), tr("More")];
             let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
             let cw = row.width() / tabs.len() as f32;
             for (i, t) in tabs.iter().enumerate() {
                 let cell = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * cw, row.top()), vec2(cw, 34.0));
                 let resp = ui.interact(cell, ui.id().with(("stab", i)), Sense::click());
                 let on = r.settings_tab as usize == i;
+                ui::name(&resp, &format!("{t} settings"), Some(on));
                 ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, *t, ui::ui_m(13.5), if on { ACCENT } else if resp.hovered() { pal.fg } else { pal.muted });
                 if resp.clicked() {
                     r.settings_tab = i as u8;
@@ -465,11 +468,11 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
                 ui.spacing_mut().item_spacing.y = 10.0;
                 match r.settings_tab {
                     0 if !fixed => {
-                        group(ui, &pal, "Typeface");
-                        let current = if s.font.is_empty() { format!("Default · {}", env.installed.book_family) } else { s.font.clone() };
+                        group(ui, &pal, tr("Typeface"));
+                        let current = if s.font.is_empty() { trf!("Default · {name}", name = env.installed.book_family) } else { s.font.clone() };
                         egui::ComboBox::from_id_salt("font").selected_text(current).width(ui.available_width()).height(360.0).show_ui(ui, |ui| {
-                            ui.add(egui::TextEdit::singleline(&mut r.font_filter).hint_text("Filter fonts…"));
-                            if ui.selectable_label(s.font.is_empty(), "Default serif").clicked() {
+                            ui.add(egui::TextEdit::singleline(&mut r.font_filter).hint_text(tr("Filter fonts…")));
+                            if ui.selectable_label(s.font.is_empty(), tr("Default serif")).clicked() {
                                 s.font.clear();
                             }
                             let f = r.font_filter.to_lowercase();
@@ -479,36 +482,46 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
                                 }
                             }
                             if env.families.is_empty() {
-                                ui.label("Scanning system fonts…");
+                                ui.label(tr("Scanning system fonts…"));
                             }
                         });
                         ui.label(RichText::new("The quick brown fox jumps over the lazy dog.").family(egui::FontFamily::Name("book".into())).size(s.font_size.min(22.0)));
-                        group(ui, &pal, "Size & spacing");
-                        row_slider(ui, &pal, "Size", &mut s.font_size, 12.0..=44.0, 0.5, "");
-                        row_slider(ui, &pal, "Line height", &mut s.line_height, 1.0..=2.4, 0.05, "");
-                        row_slider(ui, &pal, "Paragraphs", &mut s.para_spacing, 0.0..=2.0, 0.1, " em");
-                        row_slider(ui, &pal, "Letters", &mut s.letter_spacing, -1.0..=3.0, 0.1, " px");
-                        group(ui, &pal, "Paragraphs");
-                        ui.checkbox(&mut s.justify, "Justify text");
-                        ui.checkbox(&mut s.indent, "Indent first lines");
-                        ui.checkbox(&mut s.override_book, "Ignore the book's own formatting");
+                        group(ui, &pal, tr("Size & spacing"));
+                        row_slider(ui, &pal, tr("Size"), &mut s.font_size, 12.0..=44.0, 0.5, "");
+                        row_slider(ui, &pal, tr("Line height"), &mut s.line_height, 1.0..=2.4, 0.05, "");
+                        row_slider(ui, &pal, tr("Paragraphs"), &mut s.para_spacing, 0.0..=2.0, 0.1, " em");
+                        row_slider(ui, &pal, tr("Letters"), &mut s.letter_spacing, -1.0..=3.0, 0.1, " px");
+                        group(ui, &pal, tr("Paragraphs"));
+                        ui.checkbox(&mut s.justify, tr("Justify text"));
+                        ui.checkbox(&mut s.indent, tr("Indent first lines"));
+                        ui.checkbox(&mut s.override_book, tr("Ignore the book's own formatting"));
                     }
                     0 | 1 if fixed => {
-                        group(ui, &pal, "Page");
-                        if let Some(i) = ui::segmented(ui, "s-zoom", &["Fit page", "Fit width"], r.fx.zoom as usize) {
+                        group(ui, &pal, tr("Page"));
+                        if let Some(i) = ui::segmented(ui, "s-zoom", &[tr("Fit page"), tr("Fit width")], r.fx.zoom as usize) {
                             r.fx.zoom = i as u8;
                         }
-                        row_slider(ui, &pal, "Zoom", &mut r.fx.scale, 0.3..=5.0, 0.05, "×");
-                        ui.checkbox(&mut r.fx.rtl, "Right-to-left page order (manga)");
+                        row_slider(ui, &pal, tr("Zoom"), &mut r.fx.scale, 0.3..=5.0, 0.05, "×");
+                        ui.checkbox(&mut r.fx.rtl, tr("Right-to-left page order (manga)"));
+                        let mut crop = r.fx.crop;
+                        if ui.checkbox(&mut crop, tr("Crop margins")).changed() {
+                            r.set_crop(crop);
+                        }
+                        if matches!(r.book.fixed().map(|f| &f.kind), Some(crate::book::FixedKind::Pdf)) {
+                            let mut rf = r.fx.reflow;
+                            if ui.checkbox(&mut rf, tr("Reflow text (reader font and theme)")).changed() {
+                                r.set_reflow(rf);
+                            }
+                        }
                     }
                     1 => {
-                        group(ui, &pal, "View");
+                        group(ui, &pal, tr("View"));
                         let sel = match (s.layout, s.columns) {
                             (Layout::Scrolled, _) => 2,
                             (_, Columns::One) => 0,
                             _ => 1,
                         };
-                        if let Some(i) = ui::segmented(ui, "s-layout", &["Single page", "Spread", "Scroll"], sel) {
+                        if let Some(i) = ui::segmented(ui, "s-layout", &[tr("Single page"), tr("Spread"), tr("Scroll")], sel) {
                             match i {
                                 0 => {
                                     s.layout = Layout::Paginated;
@@ -521,21 +534,22 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
                                 _ => s.layout = Layout::Scrolled,
                             }
                         }
-                        group(ui, &pal, "Page");
-                        row_slider(ui, &pal, "Margins", &mut s.margin, 0.0..=200.0, 2.0, " px");
-                        row_slider(ui, &pal, "Line width", &mut s.max_width, 360.0..=1800.0, 10.0, " px");
-                        group(ui, &pal, "Around the text");
-                        ui.checkbox(&mut s.show_header, "Running heads (book and chapter)");
-                        ui.checkbox(&mut s.show_footer, "Page numbers and time left");
+                        group(ui, &pal, tr("Page"));
+                        row_slider(ui, &pal, tr("Margins"), &mut s.margin, 0.0..=200.0, 2.0, " px");
+                        row_slider(ui, &pal, tr("Line width"), &mut s.max_width, 360.0..=1800.0, 10.0, " px");
+                        group(ui, &pal, tr("Around the text"));
+                        ui.checkbox(&mut s.show_header, tr("Running heads (book and chapter)"));
+                        ui.checkbox(&mut s.show_footer, tr("Page numbers and time left"));
                     }
                     2 => {
-                        group(ui, &pal, "Theme");
+                        group(ui, &pal, tr("Theme"));
                         let w = (ui.available_width() - 30.0) / 4.0;
                         egui::Grid::new("themes").spacing(vec2(10.0, 10.0)).show(ui, |ui| {
                             for (i, t) in THEMES.iter().enumerate() {
                                 let p = ui::palette_for(*t, s.custom_bg, s.custom_fg);
                                 let (rr, resp) = ui.allocate_exact_size(vec2(w, 64.0), Sense::click());
                                 let on = s.theme == *t;
+                                ui::name(&resp, &format!("{} theme", t.name()), Some(on));
                                 let k = ctx.animate_bool_with_time(resp.id, resp.hovered() || on, 0.12);
                                 ui.painter().rect_filled(rr.shrink(2.0 - 2.0 * k), CornerRadius::same(8), p.bg);
                                 ui.painter().rect_stroke(rr.shrink(2.0 - 2.0 * k), CornerRadius::same(8), Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { pal.border }), egui::StrokeKind::Inside);
@@ -550,39 +564,40 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
                             }
                         });
                         if s.theme == Theme::Custom {
-                            group(ui, &pal, "Custom colours");
+                            group(ui, &pal, tr("Custom colours"));
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Paper").color(pal.muted));
+                                ui.label(RichText::new(tr("Paper")).color(pal.muted));
                                 ui.color_edit_button_srgb(&mut s.custom_bg);
                                 ui.add_space(16.0);
-                                ui.label(RichText::new("Ink").color(pal.muted));
+                                ui.label(RichText::new(tr("Ink")).color(pal.muted));
                                 ui.color_edit_button_srgb(&mut s.custom_fg);
                             });
                         }
-                        group(ui, &pal, "Images");
-                        ui.checkbox(&mut s.dim_images, "Dim images in dark themes");
+                        group(ui, &pal, tr("Images"));
+                        ui.checkbox(&mut s.dim_images, tr("Dim images in dark themes"));
                     }
                     _ => {
-                        group(ui, &pal, "Motion");
-                        if let Some(i) = ui::segmented(ui, "s-motion", &["Full", "Simple", "Off"], s.motion as usize) {
+                        group(ui, &pal, tr("Motion"));
+                        if let Some(i) = ui::segmented(ui, "s-motion", &[tr("Full"), tr("Simple"), tr("Off")], s.motion as usize) {
                             s.motion = i as u8;
                         }
-                        ui.label(RichText::new(["The cover opens and pages curl over the spine.", "Pages cross-fade quickly.", "Pages change instantly."][s.motion.min(2) as usize]).font(ui::ui_m(12.0)).color(pal.muted));
-                        group(ui, &pal, "Turning pages");
-                        ui.checkbox(&mut s.tap_zones, "Click the page edges to turn");
-                        ui.checkbox(&mut s.wheel_turns_page, "Mouse wheel turns pages");
-                        group(ui, &pal, "Auto-advance (A)");
-                        row_slider(ui, &pal, "Seconds/page", &mut s.auto_secs, 5.0..=120.0, 1.0, " s");
-                        row_slider(ui, &pal, "Scroll speed", &mut s.auto_px, 5.0..=200.0, 1.0, " px/s");
-                        group(ui, &pal, "Applies to");
+                        ui.label(RichText::new([tr("The cover opens and pages curl over the spine."), tr("Pages cross-fade quickly."), tr("Pages change instantly.")][s.motion.min(2) as usize]).font(ui::ui_m(12.0)).color(pal.muted));
+                        group(ui, &pal, tr("Turning pages"));
+                        ui.checkbox(&mut s.tap_zones, tr("Click the page edges to turn"));
+                        ui.checkbox(&mut s.wheel_turns_page, tr("Mouse wheel turns pages"));
+                        group(ui, &pal, tr("Auto-advance (A)"));
+                        row_slider(ui, &pal, tr("Seconds/page"), &mut s.auto_secs, 5.0..=120.0, 1.0, " s");
+                        row_slider(ui, &pal, tr("Scroll speed"), &mut s.auto_px, 5.0..=200.0, 1.0, " px/s");
+                        keys_and_dicts(r, ui, &pal, env);
+                        group(ui, &pal, tr("Applies to"));
                         let mut pb = per_book as usize;
-                        if let Some(i) = ui::segmented(ui, "s-scope", &["All books", "This book"], pb) {
+                        if let Some(i) = ui::segmented(ui, "s-scope", &[tr("All books"), tr("This book")], pb) {
                             pb = i;
                             r.data.settings = if pb == 1 { Some(s.clone()) } else { None };
                             r.dirty = true;
                         }
                         ui.add_space(8.0);
-                        if ui::text_button(ui, "Reset to defaults", false).clicked() {
+                        if ui::text_button(ui, tr("Reset to defaults"), false).clicked() {
                             s = ReaderSettings { theme: s.theme, ..Default::default() };
                         }
                     }
@@ -615,4 +630,62 @@ fn row_slider(ui: &mut egui::Ui, pal: &Palette, label: &str, v: &mut f32, range:
         ui.spacing_mut().interact_size.x = 70.0;
         ui.add(egui::Slider::new(v, range).step_by(step).suffix(suffix));
     });
+}
+
+/// Keyboard shortcut editor and offline dictionary folders (the "More" tab).
+fn keys_and_dicts(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette, env: &mut Env) {
+    use crate::keys::{self, KeyAction};
+    group(ui, pal, tr("Offline dictionaries (StarDict, dictd)"));
+    let dirs = env.app.dict_dirs.clone();
+    for (i, d) in dirs.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let n = crate::dict::count_in(d);
+            ui.add(egui::Label::new(RichText::new(format!("{d}  ({n})")).font(ui::ui_m(12.0)).color(pal.muted)).truncate());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Close, tr("Remove dictionary folder")).clicked() {
+                    env.app.dict_dirs.remove(i);
+                }
+            });
+        });
+    }
+    if ui::text_button(ui, tr("Add dictionary folder…"), false).clicked() {
+        if let Some(p) = rfd::FileDialog::new().set_title(tr("Folder with StarDict or dictd dictionaries")).pick_folder() {
+            let p = p.to_string_lossy().into_owned();
+            if !env.app.dict_dirs.contains(&p) {
+                env.app.dict_dirs.push(p);
+            }
+        }
+    }
+    ui.label(RichText::new(tr("Selected words are looked up here first, then online.")).font(ui::ui_m(12.0)).color(pal.muted));
+
+    group(ui, pal, tr("Keyboard shortcuts"));
+    let km = keys::Keymap::from_settings(&env.app.keymap);
+    for a in keys::ALL {
+        ui.label(RichText::new(a.label()).font(ui::ui_m(13.0)).color(pal.fg));
+        ui.horizontal_wrapped(|ui| {
+            for c in km.chords(a) {
+                let b = ui.small_button(c.pretty()).on_hover_text(tr("Click to remove this shortcut"));
+                if b.clicked() {
+                    let rest: Vec<_> = km.chords(a).iter().copied().filter(|x| x != c).collect();
+                    keys::set(&mut env.app.keymap, a, rest);
+                    r.key_conflict = None;
+                }
+            }
+            let capturing = r.key_capture == Some(a);
+            let label = if capturing { tr("Press a key… (Esc cancels)") } else { "+ Add" };
+            if ui.selectable_label(capturing, label).clicked() {
+                r.key_capture = if capturing { None } else { Some(a) };
+                r.key_conflict = None;
+            }
+        });
+    }
+    if let Some(w) = &r.key_conflict {
+        ui.label(RichText::new(trf!("Warning: {warning}. Both will fire; the first match wins.", warning = w)).font(ui::ui_m(12.0)).color(Color32::from_rgb(220, 120, 60)));
+    }
+    let _ = KeyAction::Back;
+    if ui::text_button(ui, tr("Reset shortcuts to defaults"), false).clicked() {
+        env.app.keymap.clear();
+        r.key_conflict = None;
+        r.key_capture = None;
+    }
 }

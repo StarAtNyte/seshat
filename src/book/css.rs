@@ -23,6 +23,8 @@ pub struct Decl {
     pub size: Option<f32>,
     pub indent: Option<f32>,
     pub block: Option<bool>,
+    /// `direction: rtl|ltr`
+    pub rtl: Option<bool>,
 }
 
 impl Decl {
@@ -30,7 +32,7 @@ impl Decl {
         macro_rules! m {
             ($($f:ident),*) => { $( if o.$f.is_some() { self.$f = o.$f; } )* };
         }
-        m!(bold, italic, underline, strike, smallcaps, mono, sup, sub, align, hidden, size, indent, block);
+        m!(bold, italic, underline, strike, smallcaps, mono, sup, sub, align, hidden, size, indent, block, rtl);
     }
     pub fn is_empty(&self) -> bool {
         self.bold.is_none()
@@ -46,6 +48,7 @@ impl Decl {
             && self.size.is_none()
             && self.indent.is_none()
             && self.block.is_none()
+            && self.rtl.is_none()
     }
 }
 
@@ -165,6 +168,24 @@ impl Sheet {
         }
         d
     }
+}
+
+/// Whether a stylesheet sets `writing-mode: vertical-rl` (any vendor prefix)
+/// on any selector. Used to switch a CJK book to vertical layout.
+pub fn declares_vertical(css: &str) -> bool {
+    let css = strip_comments(css).to_ascii_lowercase();
+    let mut rest = css.as_str();
+    while let Some(i) = rest.find("writing-mode") {
+        rest = &rest[i + 12..];
+        let decl = rest.trim_start();
+        if let Some(v) = decl.strip_prefix(':') {
+            let v = v.split([';', '}']).next().unwrap_or("");
+            if v.contains("vertical-rl") || v.contains("tb-rl") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn strip_comments(s: &str) -> String {
@@ -295,6 +316,13 @@ pub fn parse_decls(body: &str) -> Decl {
                 }
             }
             "font-size" => d.size = parse_size(v),
+            "direction" => {
+                d.rtl = match v {
+                    "rtl" => Some(true),
+                    "ltr" => Some(false),
+                    _ => None,
+                }
+            }
             "margin-left" | "padding-left" => {
                 if let Some(em) = parse_em(v) {
                     if em >= 1.0 {
@@ -323,7 +351,7 @@ pub fn parse_decls(body: &str) -> Decl {
 }
 
 fn parse_em(v: &str) -> Option<f32> {
-    if let Some(n) = v.strip_suffix("em").or_else(|| v.strip_suffix("rem")) {
+    if let Some(n) = v.strip_suffix("rem").or_else(|| v.strip_suffix("em")) {
         return n.trim().parse().ok();
     }
     if let Some(n) = v.strip_suffix("px") {
@@ -360,4 +388,16 @@ fn parse_size(v: &str) -> Option<f32> {
         }
     };
     Some(s.clamp(0.6, 2.5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_em;
+
+    #[test]
+    fn rem_and_em() {
+        assert_eq!(parse_em("2rem"), Some(2.0));
+        assert_eq!(parse_em("1.5em"), Some(1.5));
+        assert_eq!(parse_em("16px"), Some(1.0));
+    }
 }

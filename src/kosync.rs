@@ -28,22 +28,46 @@ pub fn md5_hex(s: &str) -> String {
     Md5::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn device_id() -> String {
-    let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "desktop".into());
+/// This install's device id: generated once and persisted in settings
+/// (`KoSync::device_id`). Falls back to a hostname-derived id only when the
+/// settings carry none (e.g. a config built before the field existed).
+fn device_id(cfg: &KoSync) -> String {
+    if !cfg.device_id.is_empty() {
+        return cfg.device_id.clone();
+    }
+    let host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "desktop".into());
     md5_hex(&format!("seshat-{host}"))[..16].to_string()
 }
 
-fn req(cfg: &KoSync, proxy: &Option<String>, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
-    let client = crate::api::build_client(proxy, Some(Duration::from_secs(15)));
-    client
+/// A fresh random device id (32 hex chars, like KOReader's).
+pub fn new_device_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    let a = h.finish();
+    let b = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    md5_hex(&format!("{a:016x}{b:016x}{nanos}")).to_uppercase()
+}
+
+fn req(cfg: &KoSync, proxy: &Option<String>, method: reqwest::Method, path: &str) -> Result<reqwest::blocking::RequestBuilder, String> {
+    let client = crate::api::client(proxy, Some(Duration::from_secs(15)))?;
+    Ok(client
         .request(method, format!("{}{}", cfg.server.trim_end_matches('/'), path))
         .header("accept", "application/vnd.koreader.v1+json")
         .header("x-auth-user", &cfg.username)
-        .header("x-auth-key", &cfg.userkey)
+        .header("x-auth-key", &cfg.userkey))
 }
 
 pub fn register(cfg: &KoSync, proxy: &Option<String>) -> Result<(), String> {
-    let r = req(cfg, proxy, reqwest::Method::POST, "/users/create")
+    let r = req(cfg, proxy, reqwest::Method::POST, "/users/create")?
         .json(&serde_json::json!({ "username": cfg.username, "password": cfg.userkey }))
         .send()
         .map_err(|e| e.to_string())?;
@@ -55,7 +79,7 @@ pub fn register(cfg: &KoSync, proxy: &Option<String>) -> Result<(), String> {
 }
 
 pub fn auth(cfg: &KoSync, proxy: &Option<String>) -> Result<(), String> {
-    let r = req(cfg, proxy, reqwest::Method::GET, "/users/auth").send().map_err(|e| e.to_string())?;
+    let r = req(cfg, proxy, reqwest::Method::GET, "/users/auth")?.send().map_err(|e| e.to_string())?;
     if r.status().is_success() {
         Ok(())
     } else {
@@ -63,15 +87,27 @@ pub fn auth(cfg: &KoSync, proxy: &Option<String>) -> Result<(), String> {
     }
 }
 
+/// Device name on the wire; Seshat's exact position rides along after it.
+const DEVICE: &str = "Seshat";
+const ZR: &str = "#zr:";
+
 pub fn push(cfg: &KoSync, proxy: &Option<String>, document: &str, progress: &str, percentage: f32) -> Result<(), String> {
+    // `progress` may carry Seshat's exact position as a `#zr:s:b:o` suffix
+    // (see encode_flow). That is not a valid crengine XPointer, so the wire
+    // value is the plain `/body/DocFragment[N]/body` KOReader understands and
+    // the exact position goes into the device name, where only Seshat reads it.
+    let (wire, device) = match progress.split_once(ZR) {
+        Some((x, zr)) => (x.to_string(), format!("{DEVICE} zr:{zr}")),
+        None => (progress.to_string(), DEVICE.to_string()),
+    };
     let body = serde_json::json!({
         "document": document,
-        "progress": progress,
+        "progress": wire,
         "percentage": percentage,
-        "device": "Seshat",
-        "device_id": device_id(),
+        "device": device,
+        "device_id": device_id(cfg),
     });
-    let r = req(cfg, proxy, reqwest::Method::PUT, "/syncs/progress").json(&body).send().map_err(|e| e.to_string())?;
+    let r = req(cfg, proxy, reqwest::Method::PUT, "/syncs/progress")?.json(&body).send().map_err(|e| e.to_string())?;
     if r.status().is_success() {
         Ok(())
     } else {
@@ -81,18 +117,30 @@ pub fn push(cfg: &KoSync, proxy: &Option<String>, document: &str, progress: &str
 
 /// Remote progress, if another device has newer progress than ours.
 pub fn pull(cfg: &KoSync, proxy: &Option<String>, document: &str) -> Result<Option<Progress>, String> {
-    let r = req(cfg, proxy, reqwest::Method::GET, &format!("/syncs/progress/{document}")).send().map_err(|e| e.to_string())?;
+    let r = req(cfg, proxy, reqwest::Method::GET, &format!("/syncs/progress/{document}"))?.send().map_err(|e| e.to_string())?;
     if !r.status().is_success() {
         return Err(format!("sync pull failed (HTTP {})", r.status().as_u16()));
     }
-    let p: Progress = r.json().unwrap_or_default();
-    if p.document.is_empty() && p.progress.is_empty() || p.device_id == device_id() {
+    let mut p: Progress = r.json().unwrap_or_default();
+    if p.document.is_empty() && p.progress.is_empty() || p.device_id == device_id(cfg) {
         return Ok(None);
+    }
+    // Another Seshat install: restore the exact position from the device name,
+    // as long as the plain XPointer has not been overwritten by another reader.
+    if let Some((name, zr)) = p.device.split_once(" zr:") {
+        if name == DEVICE && p.progress.starts_with("/body/DocFragment[") && !p.progress.contains(ZR) {
+            p.progress = format!("{}{ZR}{zr}", p.progress);
+        }
+        p.device = name.to_string();
     }
     Ok(Some(p))
 }
 
-/// Progress string: KOReader-style xpointer so KOReader lands in the right chapter.
+/// Progress string: KOReader-style xpointer so KOReader lands in the right
+/// chapter, plus Seshat's exact position as a `#zr:` suffix. `push` strips the
+/// suffix from the wire value (plain `/body/DocFragment[N]/body`) and `pull`
+/// restores it, so `decode` sees the same string either way. Values pushed by
+/// older versions with the suffix in the XPointer itself still decode.
 pub fn encode_flow(spine: usize, section: usize, block: usize, offset: usize) -> String {
     format!("/body/DocFragment[{}]/body#zr:{section}:{block}:{offset}", spine + 1)
 }

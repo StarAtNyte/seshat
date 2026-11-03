@@ -13,6 +13,8 @@ struct Item {
     href: String,
     media_type: String,
     properties: String,
+    /// EPUB3 media overlay: id of the SMIL item narrating this document.
+    media_overlay: String,
 }
 
 struct Opf {
@@ -78,7 +80,7 @@ fn parse_opf(xml: &str) -> Opf {
                 "item" => {
                     let id = a("id");
                     if !id.is_empty() {
-                        o.manifest.insert(id, Item { href: a("href"), media_type: a("media-type"), properties: a("properties") });
+                        o.manifest.insert(id, Item { href: a("href"), media_type: a("media-type"), properties: a("properties"), media_overlay: a("media-overlay") });
                     }
                 }
                 "spine" => o.toc_id = a("toc"),
@@ -197,12 +199,30 @@ struct RawLink {
     href: String,
 }
 
+/// Inspect each `EncryptedData`: font obfuscation (IDPF / Adobe font mangling) is
+/// harmless; any other cipher reference or an Adobe ADEPT algorithm is DRM.
+fn has_drm(enc: &str) -> bool {
+    let lower = enc.to_lowercase();
+    if lower.contains("http://ns.adobe.com/adept") {
+        return true;
+    }
+    for part in lower.split("<encrypteddata").skip(1) {
+        let part = part.split("</encrypteddata>").next().unwrap_or(part);
+        let font_alg = part.contains("http://www.idpf.org/2008/embedding") || part.contains("http://ns.adobe.com/pdf/enc#rc");
+        let uri = part.split("cipherreference").nth(1).and_then(|u| u.split("uri=").nth(1)).map(|u| u.trim_start_matches(['"', '\'']).split(['"', '\'']).next().unwrap_or("").to_string()).unwrap_or_default();
+        let is_font = [".otf", ".ttf", ".woff", ".woff2", ".ttc"].iter().any(|e| uri.ends_with(e));
+        if !(font_alg && (is_font || uri.is_empty())) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn open(path: &Path) -> Result<Book, String> {
     let mut zip = open_zip(path)?;
     if zip.by_name("META-INF/encryption.xml").is_ok() {
         let enc = String::from_utf8_lossy(&zip_read(&mut zip, "META-INF/encryption.xml").unwrap_or_default()).into_owned();
-        // Font obfuscation is harmless; anything else means DRM.
-        if enc.contains("EncryptedData") && !enc.contains("http://www.idpf.org/2008/embedding") && !enc.contains("http://ns.adobe.com/pdf/enc#RC") {
+        if has_drm(&enc) {
             return Err("this EPUB is DRM-protected".into());
         }
     }
@@ -288,6 +308,7 @@ pub fn open(path: &Path) -> Result<Book, String> {
             Some((f, fr)) => (f, Some(fr)),
             None => (h, None),
         };
+        let file_part = file_part.split('?').next().unwrap_or(file_part);
         let file = if file_part.is_empty() { base.to_string() } else { join_path(&parent_of(base), file_part) };
         let key = match frag {
             Some(fr) if !fr.is_empty() => format!("{file}#{}", super::util::percent_decode(fr)),
@@ -300,6 +321,24 @@ pub fn open(path: &Path) -> Result<Book, String> {
             .unwrap_or(LinkTarget::Unresolved)
     };
     let links: Vec<LinkTarget> = links.iter().map(|l| resolve(&l.base, &l.href)).collect();
+
+    // ---- media overlays (the book's own narration) ----
+    let narrated: Vec<(String, String)> = o
+        .spine
+        .iter()
+        .filter_map(|id| o.manifest.get(id))
+        .filter_map(|it| {
+            let smil = o.manifest.get(&it.media_overlay).filter(|_| !it.media_overlay.is_empty())?;
+            Some((join_path(&opf_dir, &it.href), join_path(&opf_dir, &smil.href)))
+        })
+        .collect();
+    if !narrated.is_empty() {
+        let anchor = |file: &str, frag: &str| -> Option<Loc> {
+            let key = if frag.is_empty() { file.to_string() } else { format!("{file}#{frag}") };
+            anchors.get(&key).or_else(|| anchors.get(file)).map(|&(s, b)| remap(&map, s, b))
+        };
+        meta.overlay = crate::overlay::build(&mut zip, path, &narrated, &sections, &anchor).map(std::sync::Arc::new);
+    }
 
     // ---- table of contents ----
     let mut toc: Vec<TocEntry> = Vec::new();

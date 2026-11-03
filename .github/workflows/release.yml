@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libfuse2 file
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libasound2-dev libfuse2 file
       - name: Build
         run: cargo build --release --locked || cargo build --release
       - name: Version
@@ -131,8 +131,79 @@ jobs:
           name: macos
           path: dist/*
 
+  # The optional natural-voice helper (voice/). Users download it from the
+  # release only when they turn on the natural voice, so it is a plain binary
+  # plus a .sha256 that Seshat verifies before running it.
+  voice-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+      - name: Build
+        run: cargo build --release -p seshat-voice
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/seshat-voice dist/seshat-voice-linux-x86_64
+          cd dist && sha256sum seshat-voice-linux-x86_64 > seshat-voice-linux-x86_64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-linux
+          path: dist/*
+
+  voice-windows:
+    runs-on: windows-latest
+    env:
+      # sherpa-onnx ships its Windows static libraries built against the static CRT (/MT)
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p seshat-voice
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/seshat-voice.exe dist/seshat-voice-windows-x64.exe
+          cd dist && sha256sum seshat-voice-windows-x64.exe > seshat-voice-windows-x64.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-windows
+          path: dist/*
+
+  voice-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release -p seshat-voice --target aarch64-apple-darwin
+          cargo build --release -p seshat-voice --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/seshat-voice-macos-universal target/aarch64-apple-darwin/release/seshat-voice target/x86_64-apple-darwin/release/seshat-voice
+          # Apple Silicon refuses to run unsigned arm64 code; an ad-hoc signature is enough
+          codesign --force -s - dist/seshat-voice-macos-universal
+          cd dist && shasum -a 256 seshat-voice-macos-universal > seshat-voice-macos-universal.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-macos
+          path: dist/*
+
   publish:
-    needs: [linux, windows, macos]
+    needs: [linux, windows, macos, voice-linux, voice-windows, voice-macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:

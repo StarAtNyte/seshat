@@ -1,5 +1,6 @@
 //! Persistent settings and per-book data (progress, annotations, stats).
 
+use crate::i18n::tr;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -53,19 +54,90 @@ pub fn covers_dir() -> PathBuf {
     cache_dir().join("covers")
 }
 
+/// Load JSON state, or Default if the file is missing. A file that exists but
+/// fails to parse is moved aside to `<name>.corrupt-<unix ts>` first, so the
+/// next save cannot silently overwrite the user's data.
 pub fn load_json<T: DeserializeOwned + Default>(path: &Path) -> T {
-    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(e) => {
+            eprintln!("seshat: cannot read {}: {e}", path.display());
+            return T::default();
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            name.push(format!(".corrupt-{}", now()));
+            let aside = path.with_file_name(name);
+            match std::fs::rename(path, &aside) {
+                Ok(()) => eprintln!("seshat: {} is unreadable ({e}); moved it to {} and starting fresh", path.display(), aside.display()),
+                Err(re) => eprintln!("seshat: {} is unreadable ({e}) and could not be moved aside: {re}", path.display()),
+            }
+            T::default()
+        }
+    }
 }
 
-/// Atomic write: temp file + rename, so a crash never corrupts state.
+/// Atomic write: temp file + fsync + rename, so a crash never corrupts state.
 pub fn save_json<T: Serialize>(path: &Path, v: &T) {
+    write_json(path, v, false);
+}
+
+/// Like `save_json`, but the file is readable by the owner only (0600 on
+/// unix): for files holding credentials.
+pub fn save_json_private<T: Serialize>(path: &Path, v: &T) {
+    write_json(path, v, true);
+}
+
+/// Tighten an existing credentials file written by older versions (0644).
+pub fn restrict_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(path) {
+            if m.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn write_json<T: Serialize>(path: &Path, v: &T, private: bool) {
+    use std::io::Write;
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
     let Ok(text) = serde_json::to_string(v) else { return };
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let ok = opts.open(&tmp).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    match ok {
+        Ok(()) => {
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Err(e) => {
+            eprintln!("seshat: cannot save {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -91,15 +163,15 @@ pub fn date_string(ts: i64) -> String {
 
 pub fn relative_time(ts: i64) -> String {
     if ts == 0 {
-        return "never".into();
+        return tr("never").into();
     }
     let d = now() - ts;
     match d {
-        i64::MIN..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", d / 60),
-        3600..=86399 => format!("{} h ago", d / 3600),
-        86400..=172799 => "yesterday".into(),
-        _ if d < 86400 * 30 => format!("{} days ago", d / 86400),
+        i64::MIN..=59 => tr("just now").into(),
+        60..=3599 => trf!("{n} min ago", n = d / 60),
+        3600..=86399 => trf!("{n} h ago", n = d / 3600),
+        86400..=172799 => tr("yesterday").into(),
+        _ if d < 86400 * 30 => trf!("{n} days ago", n = d / 86400),
         _ => date_string(ts),
     }
 }
@@ -151,14 +223,14 @@ pub const THEMES: &[Theme] = &[Theme::Light, Theme::Paper, Theme::Sepia, Theme::
 impl Theme {
     pub fn name(self) -> &'static str {
         match self {
-            Theme::Light => "Light",
-            Theme::Paper => "Paper",
-            Theme::Sepia => "Sepia",
-            Theme::Gray => "Gray",
-            Theme::Dark => "Dark",
-            Theme::Nord => "Nord",
-            Theme::Black => "Black",
-            Theme::Custom => "Custom",
+            Theme::Light => tr("Light"),
+            Theme::Paper => tr("Paper"),
+            Theme::Sepia => tr("Sepia"),
+            Theme::Gray => tr("Gray"),
+            Theme::Dark => tr("Dark"),
+            Theme::Nord => tr("Nord"),
+            Theme::Black => tr("Black"),
+            Theme::Custom => tr("Custom"),
         }
     }
 }
@@ -266,6 +338,7 @@ pub enum SortKey {
     Added,
     Progress,
     Size,
+    Rating,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -276,6 +349,35 @@ pub struct KoSync {
     pub username: String,
     /// md5(password), as the protocol expects.
     pub userkey: String,
+    /// This install's sync device id, generated once (see AppSettings::load).
+    pub device_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncBackend {
+    #[default]
+    Off,
+    Folder,
+    WebDav,
+}
+
+/// Highlights / notes / bookmarks / library sync (see sync.rs). The WebDAV
+/// password lives in settings.json, which is written 0600.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncCfg {
+    pub backend: SyncBackend,
+    pub folder: String,
+    pub dav_url: String,
+    pub dav_user: String,
+    pub dav_pass: String,
+    pub reading_time: bool,
+}
+
+impl Default for SyncCfg {
+    fn default() -> Self {
+        SyncCfg { backend: SyncBackend::Off, folder: String::new(), dav_url: String::new(), dav_user: String::new(), dav_pass: String::new(), reading_time: true }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -293,15 +395,28 @@ pub struct AppSettings {
     pub sort_desc: bool,
     pub cover_size: f32,
     pub kosync: KoSync,
+    pub sync: SyncCfg,
     pub translate_to: String,
+    /// Interface language: "" follows the OS, else a code from `i18n::LANGS`.
+    pub language: String,
     pub tts_rate: f32,
+    /// Read aloud with the downloadable natural voice (Kokoro) when installed.
+    pub tts_natural: bool,
+    /// Kokoro speaker id (see voice::VOICES).
+    pub tts_voice: i32,
     pub reading_speed_cpm: f32,
     /// Z-Library source plugin: blend results into library search.
     pub zlib_enabled: bool,
     pub right_panel: bool,
-    /// Library grouping: 0 none, 1 author, 2 status, 3 format, 4 folder.
+    /// Library grouping: 0 none, 1 author, 2 status, 3 format, 4 folder, 5 genre, 6 collection, 7 series.
     pub lib_group: u8,
     pub motion_hint_shown: bool,
+    /// Rescan when the library folders change on disk (polled while focused).
+    pub watch_folders: bool,
+    /// Folders holding offline StarDict / dictd dictionaries.
+    pub dict_dirs: Vec<String>,
+    /// Reader key bindings that differ from the defaults: action id -> chords.
+    pub keymap: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for AppSettings {
@@ -319,13 +434,20 @@ impl Default for AppSettings {
             sort_desc: true,
             cover_size: 168.0,
             kosync: KoSync { server: "https://sync.koreader.rocks".into(), ..Default::default() },
+            sync: SyncCfg::default(),
             translate_to: "en".into(),
+            language: String::new(),
             tts_rate: 1.0,
+            tts_natural: false,
+            tts_voice: crate::voice::DEFAULT_VOICE,
             reading_speed_cpm: 1200.0,
             zlib_enabled: true,
             right_panel: true,
             lib_group: 0,
             motion_hint_shown: false,
+            watch_folders: true,
+            dict_dirs: Vec::new(),
+            keymap: Default::default(),
         }
     }
 }
@@ -333,6 +455,7 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn load() -> Self {
         let p = config_dir().join("settings.json");
+        restrict_perms(&p);
         let mut s: AppSettings = load_json(&p);
         if s.download_dir.is_empty() {
             s.download_dir = AppSettings::default().download_dir;
@@ -353,10 +476,15 @@ impl AppSettings {
         if s.kosync.server.is_empty() {
             s.kosync.server = "https://sync.koreader.rocks".into();
         }
+        if s.kosync.device_id.is_empty() {
+            s.kosync.device_id = crate::kosync::new_device_id();
+            s.save();
+        }
         s
     }
     pub fn save(&self) {
-        save_json(&config_dir().join("settings.json"), self);
+        // holds the KOSync userkey
+        save_json_private(&config_dir().join("settings.json"), self);
     }
     pub fn proxy_opt(&self) -> Option<String> {
         let p = self.proxy.trim();
@@ -447,6 +575,8 @@ pub struct BookData {
     /// Fixed-layout zoom (0 = fit page, 1 = fit width).
     pub fixed_zoom: u8,
     pub fixed_rtl: bool,
+    /// Fixed layout: crop white margins.
+    pub fixed_crop: bool,
 }
 
 impl BookData {
@@ -461,6 +591,74 @@ impl BookData {
     }
 }
 
+// ---------- user library data: collections, ratings, metadata overrides ----------
+
+/// What the user has set on one book. Book files are never modified: these
+/// live in Seshat's own data and are applied on top of the file's metadata.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserBook {
+    /// 0 = unrated, 1..=5 stars
+    pub rating: u8,
+    pub collections: Vec<String>,
+    // metadata overrides; empty / None = use the file's own
+    pub title: String,
+    pub author: String,
+    pub series: String,
+    pub series_index: Option<f32>,
+    pub genre: String,
+}
+
+impl UserBook {
+    pub fn has_override(&self) -> bool {
+        !self.title.is_empty() || !self.author.is_empty() || !self.series.is_empty() || self.series_index.is_some() || !self.genre.is_empty()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rating == 0 && self.collections.is_empty() && !self.has_override()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserLib {
+    /// Collection names, in the order the user created them.
+    pub collections: Vec<String>,
+    pub books: BTreeMap<String, UserBook>,
+}
+
+impl UserLib {
+    fn path() -> PathBuf {
+        config_dir().join("userlib.json")
+    }
+    pub fn load() -> Self {
+        load_json(&Self::path())
+    }
+    pub fn save(&mut self) {
+        self.books.retain(|_, b| !b.is_empty());
+        save_json(&Self::path(), self);
+    }
+    pub fn book(&self, id: &str) -> Option<&UserBook> {
+        self.books.get(id)
+    }
+    pub fn book_mut(&mut self, id: &str) -> &mut UserBook {
+        self.books.entry(id.to_string()).or_default()
+    }
+    pub fn add_collection(&mut self, name: &str) -> bool {
+        let n = name.trim();
+        if n.is_empty() || self.collections.iter().any(|c| c.eq_ignore_ascii_case(n)) {
+            return false;
+        }
+        self.collections.push(n.to_string());
+        true
+    }
+    pub fn remove_collection(&mut self, name: &str) {
+        self.collections.retain(|c| c != name);
+        for b in self.books.values_mut() {
+            b.collections.retain(|c| c != name);
+        }
+    }
+}
+
 // ---------- Z-Library session (kept from v0.2) ----------
 
 #[derive(Default, Serialize, Deserialize)]
@@ -472,7 +670,9 @@ pub struct SavedSession {
 }
 
 pub fn load_session() -> Option<crate::api::Session> {
-    let s: SavedSession = load_json(&config_dir().join("session.json"));
+    let p = config_dir().join("session.json");
+    restrict_perms(&p);
+    let s: SavedSession = load_json(&p);
     if s.user_id.is_empty() || s.user_key.is_empty() {
         return None;
     }
@@ -481,7 +681,7 @@ pub fn load_session() -> Option<crate::api::Session> {
 
 pub fn save_session(sess: &crate::api::Session) {
     let s = SavedSession { domain: sess.domain.clone(), user_id: sess.user_id.clone(), user_key: sess.user_key.clone(), email: sess.email.clone() };
-    save_json(&config_dir().join("session.json"), &s);
+    save_json_private(&config_dir().join("session.json"), &s);
 }
 
 pub fn clear_session() {

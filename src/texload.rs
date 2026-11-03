@@ -60,12 +60,23 @@ fn decode(src: &Src, max_dim: u32, pdf_cache: &mut Option<(PathBuf, hayro::hayro
         Src::Res(r) => r.load()?,
         Src::File(p) => std::fs::read(p).ok()?,
         Src::Url { url, proxy } => {
-            let client = crate::api::build_client(proxy, Some(std::time::Duration::from_secs(20)));
+            // never falls back to a direct connection when a proxy is set but broken
+            let client = crate::api::client(proxy, Some(std::time::Duration::from_secs(20))).ok()?;
             let r = client.get(url).send().ok()?;
             if !r.status().is_success() {
                 return None;
             }
-            r.bytes().ok()?.to_vec()
+            // cover images: refuse anything implausibly large
+            const CAP: u64 = 32 * 1024 * 1024;
+            if r.content_length().is_some_and(|n| n > CAP) {
+                return None;
+            }
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(r, CAP + 1), &mut buf).ok()?;
+            if buf.len() as u64 > CAP {
+                return None;
+            }
+            buf
         }
         Src::Pdf { path, page, width } => {
             if pdf_cache.as_ref().map(|(p, _)| p != path).unwrap_or(true) {

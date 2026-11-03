@@ -9,6 +9,7 @@ mod fixed;
 mod flow;
 mod panels;
 
+use crate::i18n::tr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -40,7 +41,9 @@ pub enum Msg {
     Search { gen: u64, hits: Vec<Hit>, done: bool },
     PdfTexts(Arc<Vec<String>>),
     PdfAspects(Vec<f32>),
-    Tts(tts::Event),
+    /// Detected content box (l, t, r, b as page fractions) per page.
+    Crops(Vec<Option<[f32; 4]>>),
+    Tts(u64, tts::Event),
     Lookup { gen: u64, res: Result<lookup::Answer, String> },
     SyncPulled(Result<Option<crate::kosync::Progress>, String>),
     SyncPushed(Result<(), String>),
@@ -63,6 +66,18 @@ pub enum Side {
     Notes,
     Bookmarks,
     Search,
+}
+
+/// Per-section char counts, computed once per section instead of recounting every block each frame.
+struct SecChars {
+    section: usize,
+    /// chars from block b to the end of the section (len = blocks + 1)
+    suffix: Vec<usize>,
+    /// sum of max(1, char_len) of blocks before b (len = blocks + 1), as `Flow::fraction` counts
+    prefix1: Vec<usize>,
+    /// chars of all sections before this one
+    before: usize,
+    total: usize,
 }
 
 struct LookupUi {
@@ -112,6 +127,11 @@ pub struct Reader {
 
     // selection & popups
     drag_anchor: Option<Pt>,
+    /// A single click waiting out the double-click interval: (x as fraction of the view, when).
+    pending_tap: Option<(f32, Instant)>,
+    sec_chars: Option<SecChars>,
+    /// TOC entry fractions (flow books), computed once
+    toc_fracs: Vec<f32>,
     sel: Option<(Pt, Pt)>,
     sel_popup: Option<Pos2>,
     hl_popup: Option<(u64, Pos2)>,
@@ -132,6 +152,11 @@ pub struct Reader {
     speaker: Option<tts::Speaker>,
     tts_at: Option<(Loc, usize)>,
     tts_error: String,
+    /// Bumped on every start, so events from an earlier speaker are ignored.
+    tts_gen: u64,
+    /// With a narrated book (EPUB3 media overlays): play its own audio rather
+    /// than a synthetic voice.
+    narration: bool,
 
     // stats
     last_active: Instant,
@@ -157,6 +182,9 @@ pub struct Reader {
     /// Toolbar pinned open (otherwise it slides in on demand).
     tools: bool,
     settings_tab: u8,
+    /// Settings panel is waiting for the next key press to bind to this action.
+    key_capture: Option<crate::keys::KeyAction>,
+    key_conflict: Option<String>,
 }
 
 impl Reader {
@@ -170,6 +198,7 @@ impl Reader {
             fx.page = loc.section.min(f.pages.saturating_sub(1));
             fx.zoom = data.fixed_zoom;
             fx.rtl = data.fixed_rtl;
+            fx.crop = data.fixed_crop;
             fx.aspects = vec![1.414; f.pages];
             if matches!(f.kind, crate::book::FixedKind::Pdf) {
                 let tx2 = tx.clone();
@@ -215,6 +244,9 @@ impl Reader {
             toc_scroll: false,
             font_filter: String::new(),
             drag_anchor: None,
+            pending_tap: None,
+            sec_chars: None,
+            toc_fracs: Vec::new(),
             sel: None,
             sel_popup: None,
             hl_popup: None,
@@ -231,6 +263,8 @@ impl Reader {
             speaker: None,
             tts_at: None,
             tts_error: String::new(),
+            tts_gen: 0,
+            narration: true,
             last_active: Instant::now(),
             last_tick: Instant::now(),
             turn_mark: (Instant::now(), loc),
@@ -250,6 +284,8 @@ impl Reader {
             quick_note: String::new(),
             tools: false,
             settings_tab: 0,
+            key_capture: None,
+            key_conflict: None,
         };
         r.data.last_read = store::now();
         r.clamp_loc();
@@ -282,9 +318,58 @@ impl Reader {
 
     pub fn fraction(&self) -> f32 {
         match &self.book.content {
-            Content::Flow(f) => f.fraction(self.loc),
+            Content::Flow(f) => match &self.sec_chars {
+                Some(c) if c.section == self.loc.section && self.loc.block < c.prefix1.len() - 1 => {
+                    let before = c.before + c.prefix1[self.loc.block] + self.loc.offset;
+                    (before as f32 / c.total.max(1) as f32).clamp(0.0, 1.0)
+                }
+                _ => f.fraction(self.loc),
+            },
             Content::Fixed(f) => (self.fx.page + 1) as f32 / f.pages.max(1) as f32,
         }
+    }
+
+    /// (Re)build the char-count cache for section `si` if it isn't already for that section.
+    pub(super) fn ensure_sec_chars(&mut self, si: usize) {
+        if self.sec_chars.as_ref().is_some_and(|c| c.section == si) {
+            return;
+        }
+        let Some(f) = self.book.flow() else { return };
+        let Some(sec) = f.sections.get(si) else { return };
+        let lens: Vec<usize> = sec.blocks.iter().map(|b| b.char_len()).collect();
+        let mut suffix = vec![0; lens.len() + 1];
+        for i in (0..lens.len()).rev() {
+            suffix[i] = suffix[i + 1] + lens[i];
+        }
+        let mut prefix1 = vec![0; lens.len() + 1];
+        for i in 0..lens.len() {
+            prefix1[i + 1] = prefix1[i] + lens[i].max(1);
+        }
+        let before = f.sections.iter().take(si).map(|s| s.chars).sum();
+        self.sec_chars = Some(SecChars { section: si, suffix, prefix1, before, total: f.total_chars() });
+    }
+
+    /// Characters remaining in the section after `loc` (cached; same as `Flow::section_chars_after`).
+    pub(super) fn chars_after(&self, loc: Loc) -> usize {
+        match &self.sec_chars {
+            Some(c) if c.section == loc.section && loc.block + 1 < c.suffix.len() => {
+                let len = c.suffix[loc.block] - c.suffix[loc.block + 1];
+                c.suffix[loc.block + 1] + len.saturating_sub(loc.offset)
+            }
+            Some(c) if c.section == loc.section => 0,
+            _ => self.book.flow().map(|f| f.section_chars_after(loc)).unwrap_or(0),
+        }
+    }
+
+    /// TOC entry fractions, computed once per book.
+    pub(super) fn toc_fractions(&mut self) -> &[f32] {
+        if self.toc_fracs.len() != self.book.toc.len() {
+            self.toc_fracs = match self.book.flow() {
+                Some(f) => self.book.toc.iter().map(|e| f.fraction(e.loc)).collect(),
+                None => Vec::new(),
+            };
+        }
+        &self.toc_fracs
     }
 
     fn mark_dirty(&mut self) {
@@ -355,13 +440,18 @@ impl Reader {
                         }
                     }
                 }
-                Msg::PdfTexts(t) => self.fx.texts = Some(t),
+                Msg::PdfTexts(t) => {
+                    self.fx.texts = Some(t);
+                    self.fx.texts_loading = false;
+                }
+                Msg::Crops(c) => self.fx.set_crops(c),
                 Msg::PdfAspects(a) => {
                     if !a.is_empty() {
                         self.fx.aspects = a;
                     }
                 }
-                Msg::Tts(ev) => match ev {
+                Msg::Tts(gen, _) if gen != self.tts_gen => {}
+                Msg::Tts(_, ev) => match ev {
                     tts::Event::At(loc, end) => {
                         self.tts_at = Some((loc, end));
                         self.follow_tts(loc);
@@ -390,11 +480,11 @@ impl Reader {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => self.toast = Some((format!("Sync: {e}"), Instant::now())),
+                    Err(e) => self.toast = Some((trf!("Sync: {err}", err = e), Instant::now())),
                 },
                 Msg::SyncPushed(r) => {
                     if let Err(e) = r {
-                        self.toast = Some((format!("Sync: {e}"), Instant::now()));
+                        self.toast = Some((trf!("Sync: {err}", err = e), Instant::now()));
                     }
                 }
             }
@@ -497,7 +587,7 @@ impl Reader {
                     let t = f.sections.get(self.loc.section).and_then(|s| s.blocks.get(self.loc.block)).map(|b| b.text()).unwrap_or_default();
                     (self.loc, t.chars().skip(self.loc.offset).take(120).collect::<String>())
                 }
-                Content::Fixed(_) => (Loc::new(self.fx.page, 0, 0), format!("Page {}", self.fx.page + 1)),
+                Content::Fixed(_) => (Loc::new(self.fx.page, 0, 0), trf!("Page {n}", n = self.fx.page + 1)),
             };
             let chapter = self.chapter_title(loc);
             self.data.bookmarks.push(Bookmark { loc, excerpt, chapter, created: store::now() });
@@ -540,26 +630,34 @@ impl Reader {
         let gen = self.lookup_gen;
         self.lookup = Some(LookupUi { kind, query: text.clone(), gen, res: None });
         let (tx, ctx, lang, to, proxy) = (self.tx.clone(), self.ctx.clone(), self.book.meta.language.clone(), app.translate_to.clone(), app.proxy_opt());
+        let dirs = app.dict_dirs.clone();
         std::thread::spawn(move || {
-            let res = lookup::run(kind, &text, &lang, &to, &proxy);
+            let res = lookup::run(kind, &text, &lang, &to, &proxy, &dirs);
             let _ = tx.send(Msg::Lookup { gen, res });
             ctx.request_repaint();
         });
         self.sel_popup = None;
     }
 
-    pub fn start_tts(&mut self, from: Loc, rate: f32) {
+    pub fn start_tts(&mut self, from: Loc, app: &store::AppSettings) {
         if let Some(s) = self.speaker.take() {
             s.stop();
         }
         self.tts_error.clear();
+        self.tts_gen += 1;
+        let gen = self.tts_gen;
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.speaker = tts::start(self.book.clone(), from, rate, move |ev| {
-            let _ = tx.send(Msg::Tts(ev));
+        let on = move |ev: tts::Event| {
+            let _ = tx.send(Msg::Tts(gen, ev));
             ctx.request_repaint();
-        });
+        };
+        if let Some(ov) = self.book.meta.overlay.clone().filter(|_| self.narration) {
+            self.speaker = Some(crate::overlay::start(ov, from, app.tts_rate, on));
+            return;
+        }
+        self.speaker = tts::start(self.book.clone(), from, app.tts_rate, tts::Engine::pick(app, &self.book.meta.language), on);
         if self.speaker.is_none() {
-            self.tts_error = if cfg!(target_os = "linux") { "No speech engine found. Install speech-dispatcher (spd-say) or espeak-ng.".into() } else { "No speech engine available.".into() };
+            self.tts_error = if cfg!(target_os = "linux") { tr("No speech engine found. Install speech-dispatcher (spd-say) or espeak-ng.").into() } else { tr("No speech engine available.").into() };
         }
     }
 
@@ -685,7 +783,7 @@ impl Reader {
                             .into_iter()
                             .map(|at| {
                                 let (ex, ms) = excerpt(&orig, at, needle.len());
-                                Hit { loc: Loc::new(p, 0, at), len: needle.len(), excerpt: ex, mstart: ms, chapter: format!("Page {}", p + 1) }
+                                Hit { loc: Loc::new(p, 0, at), len: needle.len(), excerpt: ex, mstart: ms, chapter: trf!("Page {n}", n = p + 1) }
                             })
                             .collect();
                         if !hits.is_empty() {
@@ -714,9 +812,9 @@ impl Reader {
         // measure reading speed on forward page turns
         if self.turn_mark.1 != self.loc {
             let secs = now.duration_since(self.turn_mark.0).as_secs_f32();
-            if let Some(f) = self.book.flow() {
+            if self.book.flow().is_some() {
                 if self.turn_mark.1 < self.loc && self.turn_mark.1.section == self.loc.section && (4.0..300.0).contains(&secs) {
-                    let chars = f.section_chars_after(self.turn_mark.1).saturating_sub(f.section_chars_after(self.loc)) as f32;
+                    let chars = self.chars_after(self.turn_mark.1).saturating_sub(self.chars_after(self.loc)) as f32;
                     let cpm = chars / secs * 60.0;
                     if (200.0..6000.0).contains(&cpm) {
                         app.reading_speed_cpm = app.reading_speed_cpm * 0.9 + cpm * 0.1;
@@ -789,6 +887,7 @@ impl Reader {
             self.tts_bar(ctx, &pal, env);
         }
         self.popups(ctx, &pal, env);
+        self.a11y_page(ctx);
         self.motion_hint_bar(ctx, &pal, env);
         self.sync_bar(ctx, &pal);
         if let Some((t, at)) = &self.toast {
@@ -807,8 +906,8 @@ impl Reader {
 
     fn keyboard(&mut self, ctx: &egui::Context, s: &ReaderSettings, env: &mut Env, actions: &mut Vec<Action>) {
         let typing = ctx.wants_keyboard_input();
-        let (mods, keys): (egui::Modifiers, Vec<Key>) = ctx.input(|i| {
-            (i.modifiers, i.events.iter().filter_map(|e| if let egui::Event::Key { key, pressed: true, .. } = e { Some(*key) } else { None }).collect())
+        let presses: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {
+            i.events.iter().filter_map(|e| if let egui::Event::Key { key, pressed: true, modifiers, .. } = e { Some((*key, *modifiers)) } else { None }).collect()
         });
         let copy_requested = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
         if copy_requested && !typing {
@@ -816,8 +915,32 @@ impl Reader {
                 ctx.copy_text(t);
             }
         }
-        for k in keys {
+        let km = crate::keys::Keymap::from_settings(&env.app.keymap);
+        for (k, mods) in presses {
+            if let Some(a) = self.key_capture {
+                // settings panel is waiting for a new chord
+                if k == Key::Escape {
+                    self.key_capture = None;
+                } else {
+                    let chord = crate::keys::Chord::from_event(k, mods);
+                    let mut chords = km.chords(a).to_vec();
+                    if !chords.contains(&chord) {
+                        chords.push(chord);
+                    }
+                    self.key_conflict = km.conflict(chord, a).map(|c| trf!("{key} is also used for “{action}”", key = chord.pretty(), action = c.label()));
+                    crate::keys::set(&mut env.app.keymap, a, chords);
+                    self.key_capture = None;
+                }
+                continue;
+            }
             if k == Key::Escape {
+                if typing {
+                    // Esc in a text field only drops focus; never close the book (and lose a draft).
+                    if let Some(id) = ctx.memory(|m| m.focused()) {
+                        ctx.memory_mut(|m| m.surrender_focus(id));
+                    }
+                    continue;
+                }
                 if self.lookup.is_some() || self.footnote.is_some() || self.sel.is_some() || self.hl_popup.is_some() || self.note_edit.is_some() {
                     self.lookup = None;
                     self.footnote = None;
@@ -825,6 +948,8 @@ impl Reader {
                     self.clear_selection();
                 } else if self.settings_open {
                     self.settings_open = false;
+                } else if self.notebook {
+                    self.notebook = false;
                 } else if self.side.is_some() {
                     self.side = None;
                 } else if self.fullscreen {
@@ -839,63 +964,50 @@ impl Reader {
             if typing {
                 continue;
             }
+            use crate::keys::KeyAction as A;
             let rtl = self.fx.rtl && self.book.fixed().is_some();
-            match k {
-                Key::ArrowRight | Key::PageDown | Key::Space | Key::J if !(k == Key::Space && mods.shift) => {
-                    if k == Key::ArrowRight && rtl {
-                        self.prev_page()
-                    } else {
-                        self.next_page()
-                    }
-                }
-                Key::ArrowLeft | Key::PageUp | Key::K => {
-                    if k == Key::ArrowLeft && rtl {
+            let Some(act) = km.action_for(k, mods) else { continue };
+            let scrolled = s.layout == store::Layout::Scrolled && self.book.flow().is_some();
+            match act {
+                A::NextPage | A::PrevPage => {
+                    // arrows follow the reading direction of right-to-left books
+                    let flip = rtl && matches!(k, Key::ArrowLeft | Key::ArrowRight);
+                    if (act == A::NextPage) != flip {
                         self.next_page()
                     } else {
                         self.prev_page()
                     }
                 }
-                Key::Space => self.prev_page(),
-                Key::ArrowDown => {
-                    if s.layout == store::Layout::Scrolled && self.book.flow().is_some() {
-                        self.scroll_by(60.0)
-                    } else {
-                        self.next_page()
-                    }
-                }
-                Key::ArrowUp => {
-                    if s.layout == store::Layout::Scrolled && self.book.flow().is_some() {
-                        self.scroll_by(-60.0)
-                    } else {
-                        self.prev_page()
-                    }
-                }
-                Key::Home => self.section_edge(false),
-                Key::End => self.section_edge(true),
-                Key::F | Key::K if mods.command => {
-                    self.side = Some(Side::Search);
-                    self.focus_search = true;
-                }
-                Key::B | Key::D => self.toggle_bookmark(),
-                Key::T => self.tools = !self.tools,
-                Key::C => {
+                A::ScrollDown if scrolled => self.scroll_by(60.0),
+                A::ScrollDown => self.next_page(),
+                A::ScrollUp if scrolled => self.scroll_by(-60.0),
+                A::ScrollUp => self.prev_page(),
+                A::ChapterStart => self.section_edge(false),
+                A::ChapterEnd => self.section_edge(true),
+                A::Bookmark => self.toggle_bookmark(),
+                A::Toolbar => self.tools = !self.tools,
+                A::Contents => {
                     self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                     self.toc_scroll = true;
                 }
-                Key::N => self.notebook = !self.notebook,
-                Key::S => self.settings_open = !self.settings_open,
-                Key::F11 | Key::F => self.toggle_fullscreen(ctx),
-                Key::H if self.book.flow().is_some() => {
+                A::Notebook => self.notebook = !self.notebook,
+                A::Settings => self.settings_open = !self.settings_open,
+                A::Fullscreen => self.toggle_fullscreen(ctx),
+                A::Highlighter if self.book.flow().is_some() => {
                     self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };
                 }
-                Key::A => {
+                A::Highlighter => {}
+                A::AutoAdvance => {
                     self.auto = !self.auto;
                     self.auto_last = Instant::now();
                 }
-                Key::Plus | Key::Equals if mods.command => self.bump_font(env, 1.0),
-                Key::Minus if mods.command => self.bump_font(env, -1.0),
-                Key::Backspace if mods.alt || !mods.any() => self.back(),
-                _ => {}
+                A::Search => {
+                    self.side = Some(Side::Search);
+                    self.focus_search = true;
+                }
+                A::BiggerText => self.bump_font(env, 1.0),
+                A::SmallerText => self.bump_font(env, -1.0),
+                A::Back => self.back(),
             }
         }
     }
@@ -919,14 +1031,14 @@ impl Reader {
             egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 8 }).show(ui, |ui| {
                 ui.set_width(w - 32.0);
                 ui.horizontal(|ui| {
-                    if ui::text_button(ui, "← Library", false).on_hover_text("Esc").clicked() {
+                    if ui::text_button(ui, tr("← Library"), false).on_hover_text("Esc").clicked() {
                         actions.push(Action::Close);
                     }
-                    if ui::text_button(ui, "Contents", self.side.is_some()).on_hover_text("C").clicked() {
+                    if ui::text_button(ui, tr("Contents"), self.side.is_some()).on_hover_text("C").clicked() {
                         self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                         self.toc_scroll = true;
                     }
-                    if !self.history.is_empty() && ui::text_button(ui, "← Back", false).on_hover_text("Backspace").clicked() {
+                    if !self.history.is_empty() && ui::text_button(ui, tr("← Back"), false).on_hover_text("Backspace").clicked() {
                         self.back();
                     }
                     let rest = ui.available_width() - 330.0;
@@ -941,17 +1053,17 @@ impl Reader {
                         });
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui::text_button(ui, "Full", self.fullscreen).on_hover_text("F").clicked() {
+                        if ui::text_button(ui, tr("Full"), self.fullscreen).on_hover_text("F").clicked() {
                             self.fullscreen = !self.fullscreen;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                         }
                         if self.book.flow().is_some() {
                             let playing = self.speaker.is_some();
-                            if ui::text_button(ui, "Listen", playing).clicked() {
+                            if ui::text_button(ui, tr("Listen"), playing).clicked() {
                                 if playing {
                                     self.stop_tts();
                                 } else {
-                                    self.start_tts(self.loc, env.app.tts_rate);
+                                    self.start_tts(self.loc, env.app);
                                 }
                             }
                         }
@@ -959,10 +1071,10 @@ impl Reader {
                             self.settings_open = !self.settings_open;
                         }
                         let bm = self.bookmark_here().is_some();
-                        if ui::text_button(ui, "Mark", bm).on_hover_text("B").clicked() {
+                        if ui::text_button(ui, tr("Mark"), bm).on_hover_text("B").clicked() {
                             self.toggle_bookmark();
                         }
-                        if ui::text_button(ui, "Find", self.side == Some(Side::Search)).on_hover_text("Ctrl+K").clicked() {
+                        if ui::text_button(ui, tr("Find"), self.side == Some(Side::Search)).on_hover_text("Ctrl+K").clicked() {
                             self.side = if self.side == Some(Side::Search) { None } else { Some(Side::Search) };
                             self.focus_search = true;
                         }
@@ -987,7 +1099,7 @@ impl Reader {
                 ui.set_width(w - 32.0);
                 ui.set_height(34.0);
                 ui.horizontal_centered(|ui| {
-                    if ui::text_button(ui, "← Ch", false).on_hover_text("Previous chapter").clicked() {
+                    if ui::text_button(ui, tr("← Ch"), false).on_hover_text(tr("Previous chapter")).clicked() {
                         self.chapter_step(-1);
                     }
                     let info_w = 300.0 + 80.0;
@@ -1004,7 +1116,7 @@ impl Reader {
                     if r.dragged() {
                         r.on_hover_text(format!("{f:.0}%"));
                     }
-                    if ui::text_button(ui, "Ch →", false).on_hover_text("Next chapter").clicked() {
+                    if ui::text_button(ui, tr("Ch →"), false).on_hover_text(tr("Next chapter")).clicked() {
                         self.chapter_step(1);
                     }
                     self.goto_field(ui);
@@ -1016,21 +1128,21 @@ impl Reader {
 
     fn position_text(&self, cpm: f32) -> String {
         match &self.book.content {
-            Content::Flow(f) => {
-                let pct = (f.fraction(self.loc) * 100.0).round();
+            Content::Flow(_) => {
+                let pct = (self.fraction() * 100.0).round();
                 let mut s = String::new();
                 if let Some(l) = &self.layout {
                     let step = self.step.max(1);
                     let n = l.pages.len().div_ceil(step);
                     s.push_str(&format!("{} of {} in chapter", self.page / step + 1, n));
                 }
-                let left = f.section_chars_after(self.loc) as f32 / cpm.max(100.0);
+                let left = self.chars_after(self.loc) as f32 / cpm.max(100.0);
                 if left >= 1.0 {
-                    s.push_str(&format!(" · {} min left", left.round()));
+                    s.push_str(&format!(" · {}", trf!("{n} min left", n = left.round())));
                 }
                 format!("{s} · {pct}%")
             }
-            Content::Fixed(fx) => format!("Page {} of {} · {}%", self.fx.page + 1, fx.pages, ((self.fx.page + 1) * 100 / fx.pages.max(1))),
+            Content::Fixed(fx) => trf!("Page {n} of {total} · {pct}%", n = self.fx.page + 1, total = fx.pages, pct = ((self.fx.page + 1) * 100 / fx.pages.max(1))),
         }
     }
 
@@ -1078,13 +1190,29 @@ impl Reader {
                 ui.horizontal(|ui| {
                     if !self.tts_error.is_empty() {
                         ui.colored_label(Color32::from_rgb(220, 80, 60), &self.tts_error);
-                        if icon_button(ui, Icon::Close, "Dismiss").clicked() {
+                        if icon_button(ui, Icon::Close, tr("Dismiss")).clicked() {
                             self.tts_error.clear();
                         }
                         return;
                     }
-                    ui.label(RichText::new("Reading aloud").color(pal.muted));
-                    if icon_button(ui, Icon::Stop, "Stop").clicked() {
+                    if self.book.meta.overlay.is_some() {
+                        // narrated book: its own audio, or a synthetic voice
+                        let mut switch = None;
+                        if ui::text_button(ui, tr("Book narration"), self.narration).on_hover_text(tr("Play the narration recorded with the book")).clicked() && !self.narration {
+                            switch = Some(true);
+                        }
+                        if ui::text_button(ui, tr("Voice"), !self.narration).on_hover_text(tr("Read with a synthetic voice")).clicked() && self.narration {
+                            switch = Some(false);
+                        }
+                        if let Some(n) = switch {
+                            self.narration = n;
+                            let from = self.tts_at.map(|t| t.0).unwrap_or(self.loc);
+                            self.start_tts(from, env.app);
+                        }
+                    } else {
+                        ui.label(RichText::new(tr("Reading aloud")).color(pal.muted));
+                    }
+                    if icon_button(ui, Icon::Stop, tr("Stop")).clicked() {
                         self.stop_tts();
                     }
                     let mut rate = env.app.tts_rate;
@@ -1093,7 +1221,7 @@ impl Reader {
                     if r.drag_stopped() || (r.changed() && !r.dragged()) {
                         env.app.tts_rate = rate;
                         if let Some((loc, _)) = self.tts_at {
-                            self.start_tts(loc, rate);
+                            self.start_tts(loc, env.app);
                         }
                     } else if r.changed() {
                         env.app.tts_rate = rate;
@@ -1119,11 +1247,11 @@ impl Reader {
         egui::Area::new("motion-hint".into()).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -28.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::new().fill(pal.bg).stroke(egui::Stroke::new(1.0, pal.border)).corner_radius(22).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Page motion").font(ui::ui_m(13.5)));
-                    if let Some(i) = ui::segmented(ui, "motion-hint", &["Full", "Simple", "Off"], cur) {
+                    ui.label(RichText::new(tr("Page motion")).font(ui::ui_m(13.5)));
+                    if let Some(i) = ui::segmented(ui, "motion-hint", &[tr("Full"), tr("Simple"), tr("Off")], cur) {
                         pick = Some(i as u8);
                     }
-                    if ui::text_button(ui, "Keep it", false).clicked() {
+                    if ui::text_button(ui, tr("Keep it"), false).clicked() {
                         done = true;
                     }
                 });
@@ -1142,12 +1270,12 @@ impl Reader {
         egui::Area::new("sync".into()).anchor(Align2::CENTER_TOP, vec2(0.0, 60.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).fill(pal.panel).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} is at {:.0}% (you're at {:.0}%).", if p.device.is_empty() { "Another device" } else { &p.device }, p.percentage * 100.0, self.fraction() * 100.0));
-                    if ui::primary_button(ui, "Jump there").clicked() {
+                    ui.label(format!("{} is at {:.0}% (you're at {:.0}%).", if p.device.is_empty() { tr("Another device") } else { &p.device }, p.percentage * 100.0, self.fraction() * 100.0));
+                    if ui::primary_button(ui, tr("Jump there")).clicked() {
                         self.apply_remote(&p);
                         self.sync_prompt = None;
                     }
-                    if ui.button("Keep mine").clicked() {
+                    if ui.button(tr("Keep mine")).clicked() {
                         self.sync_prompt = None;
                     }
                 });
@@ -1168,15 +1296,16 @@ impl Reader {
                         for c in store::HL_COLORS {
                             let [r, g, b] = c.rgb();
                             let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 26.0), egui::Sense::click());
+                            ui::name(&resp, &trf!("Highlight in {colour}", colour = format!("{:?}", c)), None);
                             let t = ui.ctx().animate_bool_with_time(ui.id().with(("sw", *c as u8)), resp.hovered(), 0.12);
                             let sq = egui::Rect::from_center_size(rect.center() - vec2(0.0, 3.0 * t), vec2(12.0 + 2.0 * t, 12.0 + 2.0 * t));
                             ui.painter().rect_filled(sq, egui::CornerRadius::ZERO, Color32::from_rgb(r, g, b));
-                            if resp.on_hover_text("Highlight").clicked() {
+                            if resp.on_hover_text(tr("Highlight")).clicked() {
                                 color = Some(*c);
                             }
                         }
                         ui.add_space(6.0);
-                        for (k, label) in [("note", "Note"), ("copy", "Copy"), ("dict", "Define"), ("wiki", "Wiki"), ("translate", "Translate"), ("speak", "Listen"), ("search", "Find")] {
+                        for (k, label) in [("note", tr("Note")), ("copy", tr("Copy")), ("dict", tr("Define")), ("wiki", tr("Wiki")), ("translate", tr("Translate")), ("speak", tr("Listen")), ("search", tr("Find"))] {
                             if ui::text_button(ui, label, false).clicked() {
                                 act = Some(k);
                             }
@@ -1209,7 +1338,7 @@ impl Reader {
                     if let Some(((b, c), _)) = self.sel {
                         let l = Loc::new(self.loc.section, b, c);
                         self.clear_selection();
-                        self.start_tts(l, env.app.tts_rate);
+                        self.start_tts(l, env.app);
                     }
                 }
                 Some("search") => {
@@ -1238,6 +1367,7 @@ impl Reader {
                             let [r, g, b] = c.rgb();
                             let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), egui::Sense::click());
                             let sel = self.data.annotations[idx].color == *c;
+                            ui::name(&resp, &format!("{:?} highlight colour", c), Some(sel));
                             ui.painter().circle_filled(rect.center(), if sel || resp.hovered() { 10.0 } else { 8.0 }, Color32::from_rgb(r, g, b));
                             if resp.clicked() {
                                 self.data.annotations[idx].color = *c;
@@ -1246,19 +1376,19 @@ impl Reader {
                         }
                         ui.separator();
                         let ul = self.data.annotations[idx].style == HlStyle::Underline;
-                        if icon_toggle(ui, Icon::Pen, "Underline style", ul).clicked() {
+                        if icon_toggle(ui, Icon::Pen, tr("Underline style"), ul).clicked() {
                             self.data.annotations[idx].style = if ul { HlStyle::Highlight } else { HlStyle::Underline };
                             self.dirty = true;
                         }
-                        if icon_button(ui, Icon::Note, "Edit note").clicked() {
+                        if icon_button(ui, Icon::Note, tr("Edit note")).clicked() {
                             self.note_edit = Some((id, self.data.annotations[idx].note.clone()));
                             close = true;
                         }
-                        if icon_button(ui, Icon::Copy, "Copy text").clicked() {
+                        if icon_button(ui, Icon::Copy, tr("Copy text")).clicked() {
                             ctx.copy_text(self.data.annotations[idx].text.clone());
                             close = true;
                         }
-                        if icon_button(ui, Icon::Trash, "Delete highlight").clicked() {
+                        if icon_button(ui, Icon::Trash, tr("Delete highlight")).clicked() {
                             self.data.annotations.remove(idx);
                             self.dirty = true;
                             close = true;
@@ -1275,21 +1405,21 @@ impl Reader {
         if let Some((id, mut text)) = self.note_edit.take() {
             let mut keep = true;
             let quote = self.data.annotations.iter().find(|a| a.id == id).map(|a| a.text.clone()).unwrap_or_default();
-            egui::Window::new("Note").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            egui::Window::new(tr("Note")).id(egui::Id::new("win-note")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
                 ui.set_width(420.0);
                 ui.label(RichText::new(format!("“{}”", quote.chars().take(240).collect::<String>())).italics().color(pal.muted));
                 ui.add_space(6.0);
-                let r = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(f32::INFINITY).hint_text("Write a note…"));
+                let r = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(f32::INFINITY).hint_text(tr("Write a note…")));
                 r.request_focus();
                 ui.horizontal(|ui| {
-                    if ui::primary_button(ui, "Save").clicked() || (ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command)) {
+                    if ui::primary_button(ui, tr("Save")).clicked() || (ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command)) {
                         if let Some(a) = self.data.annotations.iter_mut().find(|a| a.id == id) {
                             a.note = text.trim().to_string();
                         }
                         self.dirty = true;
                         keep = false;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr("Cancel")).clicked() {
                         keep = false;
                     }
                 });
@@ -1309,11 +1439,11 @@ impl Reader {
                         ui.label(RichText::new(text).size(14.5));
                     });
                     ui.horizontal(|ui| {
-                        if ui.button("Go to note").clicked() {
+                        if ui.button(tr("Go to note")).clicked() {
                             self.jump(loc, true);
                             close = true;
                         }
-                        if ui.button("Close").clicked() {
+                        if ui.button(tr("Close")).clicked() {
                             close = true;
                         }
                     });
@@ -1336,12 +1466,12 @@ impl Reader {
                     None => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!("Looking up “{}”…", l.query.chars().take(40).collect::<String>()));
+                            ui.label(trf!("Looking up “{word}”…", word = l.query.chars().take(40).collect::<String>()));
                         });
                     }
                     Some(Err(e)) => {
                         ui.label(e);
-                        if ui.button("Retry").clicked() {
+                        if ui.button(tr("Retry")).clicked() {
                             retry = true;
                         }
                     }
@@ -1353,11 +1483,11 @@ impl Reader {
                         });
                         ui.horizontal(|ui| {
                             if let Some(u) = &a.url {
-                                if ui.link("Open in browser").clicked() {
+                                if ui.link(tr("Open in browser")).clicked() {
                                     crate::platform::open_url(u);
                                 }
                             }
-                            if ui.small_button("Copy").clicked() {
+                            if ui.small_button(tr("Copy")).clicked() {
                                 ui.ctx().copy_text(format!("{}\n{}", a.heading, a.body));
                             }
                         });
@@ -1366,7 +1496,7 @@ impl Reader {
                 if l.kind == lookup::Kind::Translate {
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label("Target language:");
+                        ui.label(tr("Target language:"));
                         let mut t = env.app.translate_to.clone();
                         egui::ComboBox::from_id_salt("tl").selected_text(&t).width(90.0).show_ui(ui, |ui| {
                             for code in ["en", "es", "fr", "de", "it", "pt", "ru", "zh-CN", "ja", "ko", "ar", "hi", "tr", "nl", "pl", "uk", "vi", "id"] {

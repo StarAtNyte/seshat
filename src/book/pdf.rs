@@ -217,8 +217,13 @@ impl<'a> Device<'a> for TextDevice {
             let p = t.translation();
             if let Some((lx, ly)) = self.last {
                 let size = t.as_coeffs()[3].abs().max(1.0);
-                if (p.y - ly).abs() > size * 0.6 {
+                let dy = (p.y - ly).abs();
+                if dy > size * 0.6 {
                     self.out.push('\n');
+                    // a clearly larger gap marks a paragraph break (used by the reflow view)
+                    if dy > size * 1.9 {
+                        self.out.push('\n');
+                    }
                 } else if p.x - lx > size * 0.25 && !self.out.ends_with(' ') {
                     self.out.push(' ');
                 }

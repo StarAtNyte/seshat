@@ -11,22 +11,32 @@ pub fn read_zip_entry(path: &Path, entry: &str) -> Result<Vec<u8>, String> {
     zip_read(&mut zip, entry)
 }
 
+/// Largest zip entry we will inflate (guards against zip bombs).
+pub const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read a zip entry fully, refusing entries larger than [`MAX_ENTRY_BYTES`].
+pub fn read_entry_capped<R: Read>(f: &mut zip::read::ZipFile<R>) -> Result<Vec<u8>, String> {
+    if f.size() > MAX_ENTRY_BYTES {
+        return Err(format!("{} is too large ({} bytes)", f.name(), f.size()));
+    }
+    let mut buf = Vec::with_capacity((f.size() as usize).min(64 << 20));
+    f.by_ref().take(MAX_ENTRY_BYTES + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_ENTRY_BYTES {
+        return Err(format!("{} is too large", f.name()));
+    }
+    Ok(buf)
+}
+
 pub fn zip_read<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    match zip.by_name(name) {
-        Ok(mut f) => {
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            return Ok(buf);
-        }
-        Err(_) => {}
+    if let Ok(mut f) = zip.by_name(name) {
+        return read_entry_capped(&mut f);
     }
     // Case-insensitive / percent-decoded fallback (sloppy EPUBs).
     let want = percent_decode(name).to_lowercase();
     let found = zip.file_names().find(|n| percent_decode(n).to_lowercase() == want).map(|s| s.to_string());
     if let Some(n) = found {
         let mut f = zip.by_name(&n).map_err(|e| e.to_string())?;
-        f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        return Ok(buf);
+        return read_entry_capped(&mut f);
     }
     Err(format!("missing {name}"))
 }
@@ -98,7 +108,37 @@ pub fn decode_cp1252(b: &[u8]) -> String {
         .collect()
 }
 
-/// Decode text of unknown encoding: BOM-sniffed UTF-16/UTF-8, else UTF-8, else CP1252.
+/// Charset declared in the first bytes: `<?xml encoding=…?>`, `<meta charset=…>` or
+/// `<meta http-equiv content="…charset=…">`.
+pub fn declared_charset(b: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let head: String = b[..b.len().min(4096)].iter().map(|&c| c.to_ascii_lowercase() as char).collect();
+    let grab = |key: &str, from: usize| -> Option<String> {
+        let i = head[from..].find(key)? + from + key.len();
+        let rest = head[i..].trim_start_matches(|c: char| c == '=' || c == '"' || c == '\'' || c.is_whitespace());
+        let v: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')).collect();
+        (!v.is_empty()).then_some(v)
+    };
+    let mut cands = Vec::new();
+    if let Some(x) = head.find("<?xml") {
+        let end = head[x..].find("?>").map(|e| e + x).unwrap_or(head.len());
+        if head[x..end].contains("encoding") {
+            cands.extend(grab("encoding", x));
+        }
+    }
+    let mut from = 0;
+    while let Some(m) = head[from..].find("<meta") {
+        let m = m + from;
+        let end = head[m..].find('>').map(|e| e + m).unwrap_or(head.len());
+        if head[m..end].contains("charset") {
+            cands.extend(grab("charset", m));
+        }
+        from = end.max(m + 5);
+    }
+    cands.into_iter().find_map(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+}
+
+/// Decode text of unknown encoding: BOM-sniffed UTF-16/UTF-8, else UTF-8, else a
+/// declared charset, else statistical detection (Cyrillic, CJK, Windows-125x …).
 pub fn decode_text(b: &[u8]) -> String {
     if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(&b[3..]).into_owned();
@@ -111,17 +151,24 @@ pub fn decode_text(b: &[u8]) -> String {
             .collect();
         return String::from_utf16_lossy(&units);
     }
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            // Mostly-valid UTF-8 with a few bad bytes → lossy; otherwise legacy encoding.
-            if e.valid_up_to() > b.len() / 2 {
-                String::from_utf8_lossy(b).into_owned()
-            } else {
-                decode_cp1252(b)
-            }
-        }
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
     }
+    // Mostly-valid UTF-8 with a few stray bytes → lossy. Judged by the fraction of
+    // invalid sequences, not by where the first one happens to be.
+    let invalid = b.utf8_chunks().filter(|c| !c.invalid().is_empty()).count();
+    if invalid * 1000 < b.len() {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let enc = match declared_charset(b) {
+        Some(e) if e != encoding_rs::UTF_8 => e,
+        _ => {
+            let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+            det.feed(b, true);
+            det.guess(None, chardetng::Utf8Detection::Allow)
+        }
+    };
+    enc.decode_without_bom_handling(b).0.into_owned()
 }
 
 pub fn base64_decode(s: &str) -> Vec<u8> {
@@ -322,4 +369,29 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 pub fn is_image_name(name: &str) -> bool {
     let l = name.to_lowercase();
     [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"].iter().any(|e| l.ends_with(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lossy_utf8_decided_by_fraction() {
+        // One bad byte very early in a long, otherwise valid UTF-8 text.
+        let mut v = vec![b'a', 0xFF];
+        v.extend("é".repeat(5000).as_bytes());
+        let s = decode_text(&v);
+        assert!(s.starts_with("a\u{FFFD}é"));
+        assert_eq!(s.chars().filter(|&c| c == 'é').count(), 5000);
+    }
+
+    #[test]
+    fn legacy_encodings() {
+        let (b, _, _) = encoding_rs::WINDOWS_1251.encode("Привет, мир! Это длинный русский текст для проверки.");
+        assert!(decode_text(&b).starts_with("Привет, мир!"));
+        let html = b"<html><head><meta charset=\"windows-1251\"></head>\xcf\xf0\xe8\xe2\xe5\xf2";
+        assert!(decode_text(html).ends_with("Привет"));
+        let (b, _, _) = encoding_rs::SHIFT_JIS.encode("<?xml version=\"1.0\" encoding=\"Shift_JIS\"?>こんにちは世界");
+        assert!(decode_text(&b).ends_with("こんにちは世界"));
+    }
 }

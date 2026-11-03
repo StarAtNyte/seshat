@@ -11,6 +11,8 @@ pub mod fb2;
 pub mod html;
 pub mod mobi;
 pub mod pdf;
+pub mod script;
+pub mod svg;
 pub mod txt;
 pub mod util;
 
@@ -47,7 +49,7 @@ impl Style {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub text: String,
     pub style: Style,
@@ -76,6 +78,26 @@ pub enum BlockKind {
     /// Resource key into `Flow::resources`.
     Image(String),
     Rule,
+    /// A table. Its cells' text lives in the block's spans, laid end to end in
+    /// row-major order: each cell's text is followed by `\t`, each row ends with
+    /// `\n` instead. `Block::text()` is therefore "a\tb\nc\td\n", and every
+    /// cell records its char range in that text, so offsets stay block-relative.
+    Table(Box<Table>),
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Table {
+    pub rows: Vec<Vec<Cell>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cell {
+    /// Char range of the cell's own text (separator excluded) in `Block::text()`.
+    pub start: usize,
+    pub end: usize,
+    pub colspan: u16,
+    pub header: bool,
+    pub align: Option<Align>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,11 +109,14 @@ pub struct Block {
     pub indent: f32,
     /// Block is a footnote/endnote body (aside epub:type="footnote" ...).
     pub note: bool,
+    /// Explicit base direction from `dir=` / CSS `direction` (Some(true) = rtl);
+    /// None = decide from the first strong character.
+    pub rtl: Option<bool>,
 }
 
 impl Block {
     pub fn new(kind: BlockKind) -> Self {
-        Block { kind, spans: Vec::new(), align: None, indent: 0.0, note: false }
+        Block { kind, spans: Vec::new(), align: None, indent: 0.0, note: false, rtl: None }
     }
     pub fn text(&self) -> String {
         let mut s = String::new();
@@ -102,6 +127,24 @@ impl Block {
     }
     pub fn char_len(&self) -> usize {
         self.spans.iter().map(|s| s.text.chars().count()).sum()
+    }
+    /// The spans covering chars [c0, c1) (split at the edges).
+    pub fn slice_spans(&self, c0: usize, c1: usize) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for sp in &self.spans {
+            let n = sp.text.chars().count();
+            let (s, e) = (c0.max(pos), c1.min(pos + n));
+            if s < e {
+                let text: String = sp.text.chars().skip(s - pos).take(e - s).collect();
+                out.push(Span { text, ..sp.clone() });
+            }
+            pos += n;
+            if pos >= c1 {
+                break;
+            }
+        }
+        out
     }
     /// Link index at a char offset, if that char is inside a link span.
     pub fn link_at(&self, offset: usize) -> Option<u32> {
@@ -171,8 +214,8 @@ pub enum ResRef {
 impl ResRef {
     pub fn load(&self) -> Option<Vec<u8>> {
         match self {
-            ResRef::Bytes(b) => Some(b.as_ref().clone()),
-            ResRef::Zip { path, entry } => util::read_zip_entry(path, entry).ok(),
+            ResRef::Bytes(b) => Some(svg::rasterize_if_svg(b.as_ref().clone())),
+            ResRef::Zip { path, entry } => util::read_zip_entry(path, entry).ok().map(svg::rasterize_if_svg),
         }
     }
 }
@@ -272,6 +315,16 @@ pub struct Meta {
     pub subjects: Vec<String>,
     #[serde(skip)]
     pub cover: Option<Vec<u8>>,
+    /// Pages turn right-to-left (Arabic/Hebrew/... books, or an EPUB spine with
+    /// page-progression-direction="rtl" on right-to-left text).
+    #[serde(skip)]
+    pub rtl: bool,
+    /// The book asks for vertical CJK (`writing-mode: vertical-rl`).
+    #[serde(skip)]
+    pub vertical: bool,
+    /// EPUB3 media overlays: the book's own narration, if it has one.
+    #[serde(skip)]
+    pub overlay: Option<Arc<crate::overlay::Overlay>>,
 }
 
 #[derive(Debug)]
@@ -342,6 +395,10 @@ pub fn open(path: &Path) -> Result<Book, String> {
             return Err("book has no readable text (it may be DRM-protected or image-only)".into());
         }
     }
+    if let Content::Flow(f) = &mut book.content {
+        svg::adopt_inline(f);
+    }
+    script::detect_direction(path, &mut book);
     if book.toc.is_empty() {
         if let Content::Flow(f) = &book.content {
             book.toc = util::toc_from_headings(f);

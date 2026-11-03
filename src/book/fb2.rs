@@ -1,7 +1,6 @@
 //! FictionBook 2 (.fb2 and .fb2.zip).
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,30 +15,25 @@ fn load(path: &Path) -> Result<String, String> {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
         let name = zip.file_names().find(|n| n.to_lowercase().ends_with(".fb2")).map(|s| s.to_string()).ok_or("no .fb2 inside zip")?;
         let mut f = zip.by_name(&name).map_err(|e| e.to_string())?;
-        let mut v = Vec::new();
-        f.read_to_end(&mut v).map_err(|e| e.to_string())?;
-        v
+        super::util::read_entry_capped(&mut f)?
     } else {
         bytes
     };
-    // honour the XML declaration's encoding for legacy files
-    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_lowercase();
-    if head.contains("windows-1251") {
-        return Ok(decode_cp1251(&bytes));
+    // Honour the XML declaration's encoding (any label encoding_rs knows).
+    if !bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && !bytes.starts_with(&[0xFF, 0xFE]) && !bytes.starts_with(&[0xFE, 0xFF]) {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_lowercase();
+        let label = head.split_once("encoding").and_then(|(_, r)| {
+            let r = r.trim_start_matches(|c: char| c == '=' || c == '"' || c == '\'' || c.is_whitespace());
+            let l: String = r.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')).collect();
+            (!l.is_empty()).then_some(l)
+        });
+        if let Some(enc) = label.and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes())) {
+            if enc != encoding_rs::UTF_8 {
+                return Ok(enc.decode_without_bom_handling(&bytes).0.into_owned());
+            }
+        }
     }
     Ok(decode_text(&bytes))
-}
-
-fn decode_cp1251(b: &[u8]) -> String {
-    const HI: &str = "ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—\u{98}™љ›њќћџ\u{a0}ЎўЈ¤Ґ¦§Ё©Є«¬\u{ad}®Ї°±Ііґµ¶·ё№є»јЅѕї";
-    let hi: Vec<char> = HI.chars().collect();
-    b.iter()
-        .map(|&c| match c {
-            0..=0x7F => c as char,
-            0x80..=0xBF => hi.get((c - 0x80) as usize).copied().unwrap_or('?'),
-            _ => char::from_u32(0x410 + (c as u32 - 0xC0)).unwrap_or('?'),
-        })
-        .collect()
 }
 
 struct Parsed {

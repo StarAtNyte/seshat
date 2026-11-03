@@ -10,7 +10,8 @@
 //! staggered reveal — all via egui's animation cache, repainting only while
 //! something is actually moving.
 
-use std::collections::BTreeMap;
+use crate::i18n::tr;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -24,15 +25,23 @@ use crate::fonts::{self, FontDb, Installed};
 use crate::library::{self, Entry, Index};
 use crate::online::Online;
 use crate::reader::{Action, Env, Reader};
-use crate::store::{self, Annotation, AppSettings, BookData, Bookmark, LibView, SortKey, Theme, UiTheme};
+use crate::store::{self, Annotation, AppSettings, BookData, Bookmark, LibView, SortKey, Theme, UiTheme, UserLib};
 use crate::texload::{Src, TexLoader};
+use crate::widgets;
 use crate::ui::{self, display, mono, mono_m, tag, text_button, ui_b, ui_m, Icon, Palette, ACCENT, INK, PAPER};
 
 enum Msg {
     Scanned(Index),
+    /// Per-book stats loaded off the UI thread: (generation, stats by id).
+    Stats(u64, Vec<(String, BookStats)>),
     Opened(Result<(String, PathBuf, Arc<Book>), String>),
     Fonts(FontDb),
     Kosync(Result<String, String>),
+    /// Fingerprint of the library folders' directory mtimes.
+    Stamp(u64),
+    Clippings(crate::clippings::Outcome),
+    Sync(crate::sync::Outcome),
+    SyncPushed(Result<usize, String>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -44,6 +53,32 @@ enum View {
     Notes,
     Bookmarks,
     Source,
+    Stats,
+    Duplicates,
+}
+
+/// The Details window's metadata editor.
+struct MetaForm {
+    id: String,
+    title: String,
+    author: String,
+    series: String,
+    index: String,
+    genre: String,
+}
+
+/// The parts of a book's BookData that feed the library overview.
+struct BookStats {
+    annotations: Vec<Annotation>,
+    bookmarks: Vec<Bookmark>,
+    daily: BTreeMap<String, f64>,
+    seconds: f64,
+}
+
+impl BookStats {
+    fn of(d: &BookData) -> Self {
+        BookStats { annotations: d.annotations.clone(), bookmarks: d.bookmarks.clone(), daily: d.daily.clone(), seconds: d.seconds }
+    }
 }
 
 #[derive(Default)]
@@ -68,6 +103,12 @@ pub struct App {
     last_settings_check: Instant,
     index: Index,
     overview: Overview,
+    /// Cached per-book stats behind `overview`, stamped with the generation
+    /// they were loaded at (a newer stamp wins over a slower full reload).
+    stats: HashMap<String, (u64, BookStats)>,
+    stats_gen: u64,
+    /// Ids in the index when the running scan started (to spot removals made meanwhile).
+    scan_ids: HashSet<String>,
     scanning: bool,
     scan_done: Arc<AtomicUsize>,
     scan_total: Arc<AtomicUsize>,
@@ -84,29 +125,190 @@ pub struct App {
     fontdb: Option<FontDb>,
     families: Vec<String>,
     installed: Installed,
-    font_req: (String, bool),
+    font_req: (String, bool, &'static str, bool),
+    /// (library size when checked, whether any title/author needs a CJK face)
+    lib_cjk: (usize, bool),
     want_cjk: bool,
     online: Online,
     details: Option<String>,
+    /// BookData for the Details window, loaded once per opened book.
+    details_data: Option<(String, BookData)>,
     settings_open: bool,
     confirm_delete: Option<String>,
     style_key: Option<(Color32, Color32, bool)>,
     kosync_password: String,
     kosync_status: String,
+    sync_status: String,
+    sync_busy: bool,
+    sync_pending_full: bool,
+    sync_pending_ids: Vec<String>,
+    sync_last: Option<Instant>,
+    sync_was_focused: bool,
     pending_open: Option<PathBuf>,
     shelf_open: Option<String>,
     shelf_jump: Option<String>,
     debug_start: Option<Instant>,
     debug_keys_sent: usize,
     debug_shot_requested: bool,
+    /// Natural-voice download in progress (or just finished / failed).
+    voice_install: Option<crate::voice::Install>,
+    voice_msg: String,
+    userlib: UserLib,
+    dups: Vec<library::DupGroup>,
+    last_watch: Instant,
+    watch_inflight: bool,
+    watch_stamp: Option<u64>,
+    meta_edit: Option<MetaForm>,
+    new_coll: String,
+    clip_status: String,
+    clip_busy: bool,
 }
 
 impl App {
+    /// Read-aloud settings: system voice or the downloadable natural voices
+    /// (Kokoro for English, Piper voices for other languages).
+    fn voice_settings(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        use crate::voice::{self, Stage};
+        let kokoro = voice::installed();
+        let pipers = voice::installed_piper();
+        let any_natural = kokoro || (!pipers.is_empty() && voice::helper().is_some());
+        let system = crate::tts::available();
+        ui.horizontal(|ui| {
+            ui.label(tag(tr("Voice")).color(pal.muted));
+            ui.radio_value(&mut self.settings.tts_natural, false, tr("System"));
+            ui.add_enabled_ui(any_natural, |ui| {
+                ui.radio_value(&mut self.settings.tts_natural, true, tr("Natural"))
+                    .on_hover_text(tr("Kokoro for English books, and your downloaded voices for other languages. Books in other languages use the system voice."))
+                    .on_disabled_hover_text(tr("Download a natural voice below first."));
+            });
+        });
+        if !self.settings.tts_natural || !any_natural {
+            ui.label(tag(match system {
+                Some(e) => trf!("System engine: {name}", name = e),
+                None if cfg!(target_os = "linux") => tr("No system speech engine found. Install speech-dispatcher or espeak-ng, or use the natural voice.").into(),
+                None => tr("No system speech engine found.").into(),
+            }).color(pal.muted));
+        }
+        ui.horizontal(|ui| {
+            ui.label(tag(tr("Speed")).color(pal.muted));
+            ui.add(egui::Slider::new(&mut self.settings.tts_rate, 0.5..=2.5).step_by(0.1).suffix("×"));
+        });
+
+        let progress = self.voice_install.as_ref().map(|i| i.progress());
+        match progress {
+            Some(p) if matches!(p.stage, Stage::Helper | Stage::Model) => {
+                let what = if p.stage == Stage::Helper { tr("Downloading the voice engine") } else { tr("Downloading the voice") };
+                let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
+                ui.label(RichText::new(format!("{what}… {:.0} of {:.0} MB", p.done as f64 / 1e6, p.total as f64 / 1e6)).size(12.5));
+                ui.add(egui::ProgressBar::new(frac).desired_width(320.0));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Some(p) => {
+                self.voice_install = None;
+                match p.stage {
+                    Stage::Done => {
+                        self.settings.tts_natural = true;
+                        self.voice_msg = tr("Voice installed.").into();
+                    }
+                    Stage::Failed(e) => self.voice_msg = e,
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+        let start = |app: &mut Self, ui: &egui::Ui, spec: String| {
+            app.voice_msg.clear();
+            app.voice_install = Some(voice::Install::start(ui.ctx().clone(), spec));
+        };
+
+        // English: Kokoro
+        if kokoro {
+            ui.horizontal(|ui| {
+                ui.label(tag(tr("English")).color(pal.muted));
+                let mut v = self.settings.tts_voice;
+                egui::ComboBox::from_id_salt("kokoro-voice").selected_text(voice::voice_label(v)).width(190.0).show_ui(ui, |ui| {
+                    for (id, _, _) in voice::VOICES {
+                        ui.selectable_value(&mut v, *id, voice::voice_label(*id));
+                    }
+                });
+                if v != self.settings.tts_voice {
+                    self.settings.tts_voice = v;
+                    let _ = crate::tts::preview(v, None, self.settings.tts_rate);
+                }
+                if text_button(ui, tr("Preview"), false).clicked() {
+                    if let Err(e) = crate::tts::preview(self.settings.tts_voice, None, self.settings.tts_rate) {
+                        self.voice_msg = e;
+                    }
+                }
+                if text_button(ui, tr("Remove"), false).on_hover_text(trf!("Deletes the English natural voice (about {mb} MB) from this computer.", mb = voice::DISK_MB)).clicked() {
+                    voice::remove();
+                    self.voice_msg = tr("English natural voice removed.").into();
+                }
+            });
+        } else if voice::needs_update() {
+            ui.label(RichText::new(tr("The natural voices need a small update for this version of Seshat (about 30 MB).")).size(12.5).color(pal.muted));
+            if text_button(ui, tr("Update natural voices"), false).clicked() {
+                let spec = if voice::kokoro_on_disk() { "kokoro".to_string() } else { format!("piper:{}", pipers[0].2) };
+                start(self, ui, spec);
+            }
+            return;
+        } else {
+            ui.label(RichText::new(trf!("Natural voice: a lifelike English voice (Kokoro) that runs offline on your computer. It is an optional download of about {mb} MB.",
+                mb = voice::DOWNLOAD_MB
+            )).size(12.5).color(pal.muted));
+            if text_button(ui, &trf!("Download English natural voice ({mb} MB)", mb = voice::DOWNLOAD_MB), false).clicked() {
+                start(self, ui, "kokoro".into());
+            }
+        }
+
+        // Other languages: Piper, one small voice per language
+        ui.add_space(4.0);
+        for (_, name, pack) in &pipers {
+            ui.horizontal(|ui| {
+                ui.label(tag(*name).color(pal.muted));
+                ui.label(RichText::new(*pack).size(12.0).color(pal.muted));
+                if text_button(ui, tr("Preview"), false).clicked() {
+                    if let Err(e) = crate::tts::preview(0, Some(pack), self.settings.tts_rate) {
+                        self.voice_msg = e;
+                    }
+                }
+                if text_button(ui, tr("Remove"), false).clicked() {
+                    voice::remove_piper(pack);
+                    self.voice_msg = trf!("{name} voice removed.", name = name);
+                }
+            });
+        }
+        let id = egui::Id::new("piper-pick");
+        let mut pick: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_default();
+        let missing: Vec<_> = voice::PIPER_VOICES.iter().filter(|v| !pipers.iter().any(|p| p.2 == v.2)).collect();
+        if !missing.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(tag(tr("Other languages")).color(pal.muted));
+                let label = missing.iter().find(|v| v.2 == pick).map(|v| v.1.to_string()).unwrap_or_else(|| tr("Choose a language…").into());
+                egui::ComboBox::from_id_salt("piper-lang").selected_text(label).width(190.0).show_ui(ui, |ui| {
+                    for v in &missing {
+                        ui.selectable_value(&mut pick, v.2.to_string(), format!("{} · {} MB", v.1, v.3 / 1_000_000));
+                    }
+                });
+                if missing.iter().any(|v| v.2 == pick) && text_button(ui, &trf!("Download ({mb} MB)", mb = voice::piper_size_mb(&pick)), false).clicked() {
+                    start(self, ui, format!("piper:{pick}"));
+                    pick.clear();
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(id, pick));
+        }
+        if !self.voice_msg.is_empty() {
+            ui.label(RichText::new(&self.voice_msg).size(12.5).color(pal.muted));
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let settings = AppSettings::load();
-        let installed = fonts::install(&ctx, None, "", false);
+        crate::i18n::apply(&settings.language);
+        let installed = fonts::install(&ctx, None, "", false, crate::i18n::current(), false);
         {
             let (tx, ctx) = (tx.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -125,6 +327,9 @@ impl App {
             last_settings_check: Instant::now(),
             index: Index::load(),
             overview: Overview::default(),
+            stats: HashMap::new(),
+            stats_gen: 0,
+            scan_ids: HashSet::new(),
             scanning: false,
             scan_done: Arc::new(AtomicUsize::new(0)),
             scan_total: Arc::new(AtomicUsize::new(0)),
@@ -136,20 +341,39 @@ impl App {
             covers: TexLoader::new(&ctx, 2),
             readers: Vec::new(),
             opening: None,
+            voice_install: None,
+            voice_msg: String::new(),
+            userlib: UserLib::load(),
+            dups: Vec::new(),
+            last_watch: Instant::now(),
+            watch_inflight: false,
+            watch_stamp: None,
+            meta_edit: None,
+            new_coll: String::new(),
+            clip_status: String::new(),
+            clip_busy: false,
             pending_jump: None,
             error: None,
             fontdb: None,
             families: Vec::new(),
             installed,
-            font_req: (String::from("\u{0}"), false),
+            font_req: (String::from("\u{0}"), false, "en", false),
+            lib_cjk: (usize::MAX, false),
             want_cjk: false,
             online: Online::new(&ctx),
             details: None,
+            details_data: None,
             settings_open: false,
             confirm_delete: None,
             style_key: None,
             kosync_password: String::new(),
             kosync_status: String::new(),
+            sync_status: String::new(),
+            sync_busy: false,
+            sync_pending_full: false,
+            sync_pending_ids: Vec::new(),
+            sync_last: None,
+            sync_was_focused: true,
             pending_open: open,
             shelf_open: None,
             shelf_jump: None,
@@ -157,6 +381,8 @@ impl App {
             debug_keys_sent: 0,
             debug_shot_requested: false,
         };
+        app.apply_user_all();
+        app.refresh_dups();
         app.refresh_overview();
         app.rescan();
         if let Some(p) = app.pending_open.take() {
@@ -172,27 +398,185 @@ impl App {
         }
     }
 
+    /// Reload every book's stats on a worker thread; the overview is rebuilt
+    /// from the cache now and again when the load arrives (Msg::Stats).
     fn refresh_overview(&mut self) {
+        self.stats_gen += 1;
+        let gen = self.stats_gen;
+        let ids: Vec<String> = self.index.entries.iter().map(|e| e.id.clone()).collect();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let v = ids
+                .into_iter()
+                .filter(|id| BookData::path_for(id).exists())
+                .map(|id| {
+                    let d = BookData::load(&id);
+                    (id, BookStats::of(&d))
+                })
+                .collect();
+            let _ = tx.send(Msg::Stats(gen, v));
+            ctx.request_repaint();
+        });
+        self.rebuild_overview();
+    }
+
+    /// Update one book's stats (e.g. on reader close) without touching disk.
+    fn update_overview_book(&mut self, id: &str, d: &BookData) {
+        self.stats_gen += 1;
+        self.stats.insert(id.to_string(), (self.stats_gen, BookStats::of(d)));
+        self.rebuild_overview();
+    }
+
+    fn rebuild_overview(&mut self) {
         let mut o = Overview::default();
         for e in &self.index.entries {
-            if !BookData::path_for(&e.id).exists() {
-                continue;
+            let Some((_, d)) = self.stats.get(&e.id) else { continue };
+            for a in &d.annotations {
+                o.notes.push((e.id.clone(), e.title.clone(), a.clone()));
             }
-            let d = BookData::load(&e.id);
-            for a in d.annotations {
-                o.notes.push((e.id.clone(), e.title.clone(), a));
+            for b in &d.bookmarks {
+                o.bookmarks.push((e.id.clone(), e.title.clone(), b.clone()));
             }
-            for b in d.bookmarks {
-                o.bookmarks.push((e.id.clone(), e.title.clone(), b));
-            }
-            for (day, s) in d.daily {
-                *o.daily.entry(day).or_insert(0.0) += s;
+            for (day, s) in &d.daily {
+                *o.daily.entry(day.clone()).or_insert(0.0) += s;
             }
             o.total_secs += d.seconds;
         }
         o.notes.sort_by(|a, b| b.2.created.cmp(&a.2.created));
         o.bookmarks.sort_by(|a, b| b.2.created.cmp(&a.2.created));
         self.overview = o;
+    }
+
+    fn apply_user_all(&mut self) {
+        for e in &mut self.index.entries {
+            library::apply_user(e, self.userlib.book(&e.id));
+        }
+    }
+
+    fn refresh_dups(&mut self) {
+        self.dups = library::find_duplicates(&self.index.entries);
+    }
+
+    /// Re-apply one book's user data to its entry and persist everything.
+    fn user_changed(&mut self, id: &str) {
+        if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {
+            library::apply_user(e, self.userlib.book(id));
+        }
+        self.userlib.save();
+        self.index.save();
+        self.refresh_dups();
+    }
+
+    fn set_rating(&mut self, id: &str, r: u8) {
+        self.userlib.book_mut(id).rating = r;
+        self.user_changed(id);
+    }
+
+    fn toggle_collection(&mut self, id: &str, name: &str) {
+        let b = self.userlib.book_mut(id);
+        match b.collections.iter().position(|c| c == name) {
+            Some(i) => {
+                b.collections.remove(i);
+            }
+            None => b.collections.push(name.to_string()),
+        }
+        self.user_changed(id);
+    }
+
+    fn new_collection_for(&mut self, id: &str, name: &str) {
+        let n = name.trim().to_string();
+        if n.is_empty() {
+            return;
+        }
+        self.userlib.add_collection(&n);
+        let n = self.userlib.collections.iter().find(|c| c.eq_ignore_ascii_case(&n)).cloned().unwrap_or(n);
+        if !self.userlib.book(id).is_some_and(|b| b.collections.contains(&n)) {
+            self.userlib.book_mut(id).collections.push(n);
+        }
+        self.user_changed(id);
+    }
+
+    /// Hide a file from the library (the file itself is untouched).
+    fn remove_path(&mut self, path: &str) {
+        if !self.settings.hidden_paths.iter().any(|h| h == path) {
+            self.settings.hidden_paths.push(path.to_string());
+        }
+        self.settings.extra_files.retain(|f| f != path);
+        self.index.entries.retain(|e| e.path != path);
+        for e in &mut self.index.entries {
+            e.dup_paths.retain(|p| p != path);
+        }
+        self.index.save();
+        self.refresh_dups();
+        self.rescan();
+    }
+
+    /// Add imported annotations to a book (to the open reader's copy if it is open).
+    fn merge_annotations(&mut self, id: &str, anns: Vec<Annotation>) -> usize {
+        let key = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let path = self.index.entries.iter().find(|e| e.id == id).map(|e| e.path.clone()).unwrap_or_default();
+        let mut added = 0;
+        if let Some(r) = self.readers.iter_mut().find(|r| r.id == id) {
+            for a in anns {
+                if !r.data.annotations.iter().any(|x| key(&x.text) == key(&a.text)) {
+                    r.data.annotations.push(a);
+                    added += 1;
+                }
+            }
+            r.data.annotations.sort_by_key(|a| a.start);
+            r.save();
+        } else {
+            let mut d = BookData::load(id);
+            for a in anns {
+                if !d.annotations.iter().any(|x| key(&x.text) == key(&a.text)) {
+                    d.annotations.push(a);
+                    added += 1;
+                }
+            }
+            d.annotations.sort_by_key(|a| a.start);
+            if d.path.is_empty() {
+                d.path = path;
+            }
+            d.save(id);
+        }
+        added
+    }
+
+    fn import_clippings(&mut self) {
+        let Some(f) = rfd::FileDialog::new().add_filter("Kindle clippings", &["txt"]).pick_file() else { return };
+        let Ok(bytes) = std::fs::read(&f) else {
+            self.clip_status = tr("Couldn't read that file.").into();
+            return;
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let targets: Vec<crate::clippings::Target> = self.index.entries.iter().map(|e| crate::clippings::Target { id: e.id.clone(), path: e.path.clone(), title: e.title.clone(), author: e.author.clone() }).collect();
+        self.clip_busy = true;
+        self.clip_status = tr("Importing…").into();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let o = crate::clippings::import(&text, &targets, &ctx);
+            let _ = tx.send(Msg::Clippings(o));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Poll the library folders' directory mtimes (cheap, off the UI thread).
+    fn watch_folders(&mut self, ctx: &egui::Context) {
+        if !self.settings.watch_folders {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs(30));
+        if self.scanning || self.watch_inflight || self.last_watch.elapsed() < Duration::from_secs(30) || !ctx.input(|i| i.focused) {
+            return;
+        }
+        self.last_watch = Instant::now();
+        self.watch_inflight = true;
+        let dirs = self.settings.all_dirs();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Stamp(library::dir_stamp(&dirs)));
+            ctx.request_repaint();
+        });
     }
 
     fn rescan(&mut self) {
@@ -207,6 +591,7 @@ impl App {
         let extra = self.settings.extra_files.clone();
         let hidden = self.settings.hidden_paths.clone();
         let old = Index { entries: self.index.entries.clone() };
+        self.scan_ids = old.entries.iter().map(|e| e.id.clone()).collect();
         let (tx, ctx, done, total) = (self.tx.clone(), self.ctx.clone(), self.scan_done.clone(), self.scan_total.clone());
         std::thread::spawn(move || {
             let ctx2 = ctx.clone();
@@ -266,11 +651,38 @@ impl App {
     fn drain(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Scanned(idx) => {
+                Msg::Scanned(mut idx) => {
                     self.scanning = false;
+                    // The scan worked from a snapshot; keep what changed since it started.
+                    let live: HashMap<&str, &Entry> = self.index.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+                    let scan_ids = std::mem::take(&mut self.scan_ids);
+                    let hidden = &self.settings.hidden_paths;
+                    idx.entries.retain(|e| {
+                        // removed from the library (or its file deleted) during the scan
+                        let gone = scan_ids.contains(&e.id) && !live.contains_key(e.id.as_str());
+                        !gone && !hidden.iter().any(|h| Path::new(h) == Path::new(&e.path))
+                    });
+                    for e in &mut idx.entries {
+                        if let Some(l) = live.get(e.id.as_str()) {
+                            e.fraction = l.fraction;
+                            e.last_read = l.last_read;
+                            e.finished = l.finished;
+                            if l.has_cover {
+                                e.has_cover = true;
+                                e.cover_aspect = l.cover_aspect;
+                            }
+                            if l.genre_checked && !e.genre_checked {
+                                e.genre = l.genre.clone();
+                                e.genre_checked = true;
+                            }
+                        }
+                    }
                     self.index = idx;
+                    self.apply_user_all();
+                    self.refresh_dups();
                     self.index.save();
                     self.refresh_overview();
+                    library::prune_covers(self.index.entries.iter().map(|e| e.id.clone()).collect());
                     if std::mem::take(&mut self.rescan_after) {
                         self.rescan();
                     }
@@ -299,10 +711,42 @@ impl App {
                         Err(e) => self.error = Some(e),
                     }
                 }
+                Msg::Stats(gen, v) => {
+                    for (id, st) in v {
+                        if self.stats.get(&id).is_some_and(|(g, _)| *g > gen) {
+                            continue; // updated after this load began
+                        }
+                        self.stats.insert(id, (gen, st));
+                    }
+                    self.rebuild_overview();
+                }
                 Msg::Fonts(db) => {
                     self.families = db.families.clone();
                     self.fontdb = Some(db);
-                    self.font_req = ("\u{0}".into(), false);
+                    self.font_req = ("\u{0}".into(), false, "en", false);
+                }
+                Msg::Stamp(h) => {
+                    self.watch_inflight = false;
+                    if self.watch_stamp.is_some_and(|o| o != h) {
+                        self.rescan();
+                    }
+                    self.watch_stamp = Some(h);
+                }
+                Msg::Clippings(o) => {
+                    self.clip_busy = false;
+                    let (books, unmatched, unlocated) = (o.books, o.unmatched, o.unlocated);
+                    let mut added = 0;
+                    for (id, anns) in o.per_book {
+                        added += self.merge_annotations(&id, anns);
+                    }
+                    self.clip_status = trf!("Added {added} highlights to {books} books. {unmatched} not in your library, {unlocated} not found in the book text.", added = added, books = books, unmatched = unmatched, unlocated = unlocated);
+                    self.refresh_overview();
+                }
+                Msg::Sync(o) => self.finish_sync(o),
+                Msg::SyncPushed(r) => {
+                    if let Err(e) = r {
+                        self.sync_status = trf!("Sync upload failed: {err}", err = e);
+                    }
                 }
                 Msg::Kosync(r) => {
                     self.kosync_status = match r {
@@ -311,6 +755,116 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Sync highlights/notes/bookmarks (and the library file for a full run)
+    /// off the UI thread. `only` limits it to the given books.
+    fn start_sync(&mut self, only: Option<Vec<String>>) {
+        if self.settings.sync.backend == store::SyncBackend::Off {
+            return;
+        }
+        if self.sync_busy {
+            match only {
+                None => self.sync_pending_full = true,
+                Some(v) => self.sync_pending_ids.extend(v),
+            }
+            return;
+        }
+        self.sync_busy = true;
+        self.sync_last = Some(Instant::now());
+        self.sync_status = tr("Syncing…").into();
+        let job = crate::sync::Job {
+            cfg: self.settings.sync.clone(),
+            proxy: self.settings.proxy_opt(),
+            device: self.settings.kosync.device_id.clone(),
+            only,
+            known: self.index.entries.iter().map(|e| (e.id.clone(), e.path.clone())).collect(),
+            open: self.readers.iter().map(|r| r.id.clone()).collect(),
+        };
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Sync(crate::sync::run(job)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn finish_sync(&mut self, o: crate::sync::Outcome) {
+        self.sync_busy = false;
+        let cfg = self.settings.sync.clone();
+        let device = self.settings.kosync.device_id.clone();
+        let fp = crate::sync::fingerprint(&cfg);
+        let mut pushes = Vec::new();
+        // open readers: merge into their in-memory data so they don't overwrite it on close
+        let mut touched = o.changed.clone();
+        for (id, remotes) in &o.open {
+            if let Some(r) = self.readers.iter_mut().find(|r| &r.id == id) {
+                let before = (r.data.annotations.len(), r.data.bookmarks.len());
+                if let Some(p) = crate::sync::merge_open(&mut r.data, id, &cfg, &device, remotes, &fp) {
+                    pushes.push(p);
+                }
+                if before != (r.data.annotations.len(), r.data.bookmarks.len()) {
+                    touched.push(id.clone());
+                }
+            }
+        }
+        if o.full {
+            let (changed, p) = crate::sync::merge_library(&mut self.userlib, &cfg, &device, &o.libs, &fp);
+            pushes.extend(p);
+            if changed {
+                self.rescan_userlib_views();
+            }
+        }
+        if !pushes.is_empty() {
+            let (proxy, tx, ctx) = (self.settings.proxy_opt(), self.tx.clone(), self.ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(Msg::SyncPushed(crate::sync::push(&cfg, &proxy, pushes)));
+                ctx.request_repaint();
+            });
+        }
+        self.sync_status = match o.result {
+            Some(Ok(s)) => trf!("Synced {time} — {detail}", time = chrono_hm(), detail = s),
+            Some(Err(e)) => trf!("Sync problem {time} — {detail}", time = chrono_hm(), detail = e),
+            None => String::new(),
+        };
+        if !touched.is_empty() {
+            self.refresh_overview();
+            if let Some(id) = self.details_data.as_ref().map(|(i, _)| i.clone()) {
+                self.details_data = Some((id.clone(), BookData::load(&id)));
+            }
+        }
+        if std::mem::take(&mut self.sync_pending_full) {
+            self.sync_pending_ids.clear();
+            self.start_sync(None);
+        } else if !self.sync_pending_ids.is_empty() {
+            let mut ids = std::mem::take(&mut self.sync_pending_ids);
+            ids.sort();
+            ids.dedup();
+            self.start_sync(Some(ids));
+        }
+    }
+
+    /// Re-apply collections/ratings/overrides to the library entries.
+    fn rescan_userlib_views(&mut self) {
+        for e in self.index.entries.iter_mut() {
+            library::apply_user(e, self.userlib.book(&e.id));
+        }
+    }
+
+    /// Full sync on start and when the window regains focus (debounced).
+    fn sync_triggers(&mut self, ctx: &egui::Context) {
+        if self.settings.sync.backend == store::SyncBackend::Off {
+            return;
+        }
+        let focused = ctx.input(|i| i.focused);
+        let regained = focused && !self.sync_was_focused;
+        self.sync_was_focused = focused;
+        let due = match self.sync_last {
+            None => !self.scanning && !self.index.entries.is_empty(),
+            Some(t) => regained && t.elapsed() > Duration::from_secs(120),
+        };
+        if due {
+            self.start_sync(None);
         }
     }
 
@@ -324,8 +878,13 @@ impl App {
                 e.finished = r.data.finished;
             }
             self.index.save();
-            self.refresh_overview();
+            let (id, data) = (r.id.clone(), r.data.clone());
+            self.update_overview_book(&id, &data);
+            if self.details_data.as_ref().is_some_and(|(d, _)| d == &id) {
+                self.details_data = Some((id, data));
+            }
             self.view_changed = Instant::now();
+            self.start_sync(Some(vec![r.id.clone()]));
         }
     }
 
@@ -351,10 +910,14 @@ impl App {
             Some(r) => r.effective(&self.settings.reader).font,
             None => self.settings.reader.font.clone(),
         };
-        let req = (family, self.want_cjk);
+        if self.lib_cjk.0 != self.index.entries.len() {
+            let any = self.index.entries.iter().any(|e| e.title.chars().chain(e.author.chars()).any(crate::book::script::is_cjk));
+            self.lib_cjk = (self.index.entries.len(), any);
+        }
+        let req = (family, self.want_cjk, crate::i18n::current(), self.lib_cjk.1);
         if req != self.font_req {
             self.font_req = req.clone();
-            self.installed = fonts::install(ctx, self.fontdb.as_mut(), &req.0, req.1);
+            self.installed = fonts::install(ctx, self.fontdb.as_mut(), &req.0, req.1, req.2, req.3);
         }
     }
 
@@ -375,8 +938,8 @@ impl App {
             let r = ctx.screen_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "drop".into()));
             painter.rect_filled(r, CornerRadius::ZERO, ACCENT);
-            painter.text(r.left_center() + vec2(60.0, -30.0), egui::Align2::LEFT_CENTER, "DROP", ui_b(140.0), INK);
-            painter.text(r.left_center() + vec2(66.0, 60.0), egui::Align2::LEFT_CENTER, "BOOKS OR FOLDERS INTO THE LIBRARY", mono_m(14.0), INK);
+            painter.text(r.left_center() + vec2(60.0, -30.0), egui::Align2::LEFT_CENTER, tr("DROP"), ui_b(140.0), INK);
+            painter.text(r.left_center() + vec2(66.0, 60.0), egui::Align2::LEFT_CENTER, tr("BOOKS OR FOLDERS INTO THE LIBRARY"), mono_m(14.0), INK);
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if dropped.is_empty() {
@@ -495,20 +1058,23 @@ impl eframe::App for App {
         while !self.readers.is_empty() {
             self.close_reader(0);
         }
+        crate::tts::shutdown_helper();
         self.settings.save();
         self.index.save();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if crate::i18n::apply(&self.settings.language).1 {
+            ctx.request_repaint();
+        }
         self.debug_screenshot(ctx);
         self.drain();
+        self.watch_folders(ctx);
+        self.sync_triggers(ctx);
 
         self.covers.poll();
         for _ in std::mem::take(&mut self.online.downloaded) {
             self.rescan();
-        }
-        if let Some(p) = self.online.read_now.take() {
-            self.open_path_with(&p, false);
         }
         for id in std::mem::take(&mut self.online.covers_updated) {
             if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {
@@ -549,7 +1115,12 @@ impl eframe::App for App {
             let s = r.effective(&self.settings.reader);
             ui::style(ctx, &ui::palette(&s));
             let mut env = Env { app: &mut self.settings, families: &self.families, installed: &self.installed };
-            let _ = r.ui(ctx, &mut env);
+            // honour font requests here too, so captures show what a reader window shows
+            for a in r.ui(ctx, &mut env) {
+                if let Action::InstallFont { cjk: true, .. } = a {
+                    self.want_cjk = true;
+                }
+            }
             return;
         }
         let pal = self.library_palette(ctx);
@@ -588,6 +1159,8 @@ impl eframe::App for App {
                     match self.view {
                         View::Notes => self.notes_view(ui, &pal),
                         View::Bookmarks => self.bookmarks_view(ui, &pal),
+                        View::Stats => self.stats_view(ui, &pal),
+                        View::Duplicates => self.duplicates_view(ui, &pal),
                         _ => self.library_view(ui, &pal),
                     }
                 });
@@ -700,11 +1273,11 @@ impl App {
                 let week: f64 = (0..7).map(|d| self.overview.daily.get(&store::date_string(store::now() - d * 86400)).copied().unwrap_or(0.0)).sum();
                 let open = self.readers.len();
                 let line = if open > 0 {
-                    format!("{open} book{} open", if open == 1 { "" } else { "s" })
+                    if open == 1 { trf!("{n} book open", n = open) } else { trf!("{n} books open", n = open) }
                 } else if week >= 60.0 {
-                    format!("{} min read this week", (week / 60.0).round())
+                    trf!("{n} min read this week", n = (week / 60.0).round())
                 } else {
-                    "Pick something good".into()
+                    tr("Pick something good").into()
                 };
                 ui.label(RichText::new(line).font(ui_m(13.0)).color(pal.muted));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -737,6 +1310,8 @@ impl App {
                 }
                 let fg = if active { ACCENT } else { pal.fg.linear_multiply(0.82 + 0.18 * t) };
                 ui::paint_icon(ui.painter(), Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(16.0, 16.0)), icon, if active { ACCENT } else { pal.muted.lerp_to_gamma(pal.fg, t) });
+                let max_w = rect.width() - 36.0 - if count.is_some() { 40.0 } else { 8.0 };
+                let label = ui::fit(ui, label, ui_m(14.0), max_w);
                 ui.painter().text(pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, ui_m(14.0), fg);
                 if let Some(n) = count {
                     ui.painter().text(pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, n.to_string(), ui_m(12.0), if active { ACCENT } else { pal.muted });
@@ -749,29 +1324,53 @@ impl App {
             let heading = |ui: &mut egui::Ui, text: &str| {
                 ui.add_space(14.0);
                 let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+                let text = ui::fit(ui, text, ui_m(11.5), r.width() - 8.0);
                 ui.painter().text(pos2(r.left() + 8.0, r.center().y), egui::Align2::LEFT_CENTER, text, ui_m(11.5), pal.muted);
                 ui.add_space(2.0);
             };
             // the active pill is painted first (behind rows) at its animated position
             let pill_layer = ui.painter().add(egui::Shape::Noop);
-            heading(ui, "Library");
-            for (v, l, ic) in [(View::All, "All books", Icon::Library), (View::Reading, "Reading", Icon::Book), (View::Unread, "Unread", Icon::Bookmark), (View::Finished, "Finished", Icon::BookmarkOn)] {
+            heading(ui, tr("Library"));
+            for (v, l, ic) in [(View::All, tr("All books"), Icon::Library), (View::Reading, tr("Reading"), Icon::Book), (View::Unread, tr("Unread"), Icon::Bookmark), (View::Finished, tr("Finished"), Icon::BookmarkOn)] {
                 let n = self.count(v);
                 if row(ui, self, ic, l, Some(n), Some(v), &mut marker) {
                     self.set_view(v);
                     self.shelf_open = None;
                 }
             }
-            heading(ui, "Marginalia");
+            heading(ui, tr("Marginalia"));
             let (nn, nb) = (self.overview.notes.len(), self.overview.bookmarks.len());
-            if row(ui, self, Icon::Note, "Notes", Some(nn), Some(View::Notes), &mut marker) {
+            if row(ui, self, Icon::Note, tr("Notes"), Some(nn), Some(View::Notes), &mut marker) {
                 self.set_view(View::Notes);
             }
-            if row(ui, self, Icon::Bookmark, "Bookmarks", Some(nb), Some(View::Bookmarks), &mut marker) {
+            if row(ui, self, Icon::Bookmark, tr("Bookmarks"), Some(nb), Some(View::Bookmarks), &mut marker) {
                 self.set_view(View::Bookmarks);
             }
+            heading(ui, tr("Insights"));
+            if row(ui, self, Icon::Info, tr("Statistics"), None, Some(View::Stats), &mut marker) {
+                self.set_view(View::Stats);
+            }
+            if !self.dups.is_empty() {
+                let n = self.dups.len();
+                if row(ui, self, Icon::Copy, tr("Duplicates"), Some(n), Some(View::Duplicates), &mut marker) {
+                    self.set_view(View::Duplicates);
+                }
+            }
+            if !self.userlib.collections.is_empty() {
+                heading(ui, tr("Collections"));
+                let mut m2 = None;
+                for c in self.userlib.collections.clone().into_iter().take(8) {
+                    let n = self.index.entries.iter().filter(|e| e.collections.contains(&c)).count();
+                    if row(ui, self, Icon::Folder, &c, Some(n), None, &mut m2) {
+                        self.settings.lib_group = 6;
+                        self.shelf_open = Some(c);
+                        self.set_view(View::All);
+                        self.view_changed = Instant::now();
+                    }
+                }
+            }
             if self.settings.zlib_enabled {
-                heading(ui, "Sources");
+                heading(ui, tr("Sources"));
                 let r0 = ui.cursor().top();
                 if row(ui, self, Icon::Globe, "Z-Library", None, Some(View::Source), &mut marker) {
                     self.set_view(View::Source);
@@ -791,13 +1390,13 @@ impl App {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 if self.scanning {
                     let (d, t) = (self.scan_done.load(Ordering::Relaxed), self.scan_total.load(Ordering::Relaxed));
-                    ui.label(tag(if t > 0 { format!("Indexing {d} of {t}") } else { "Indexing…".into() }).color(ACCENT));
+                    ui.label(tag(if t > 0 { trf!("Indexing {done} of {total}", done = d, total = t) } else { tr("Indexing…").into() }).color(ACCENT));
                 }
                 let mut m2 = None;
-                if row(ui, self, Icon::Gear, "Settings", None, None, &mut m2) {
+                if row(ui, self, Icon::Gear, tr("Settings"), None, None, &mut m2) {
                     self.settings_open = !self.settings_open;
                 }
-                if row(ui, self, Icon::Folder, "Add folder", None, None, &mut m2) {
+                if row(ui, self, Icon::Folder, tr("Add folder"), None, None, &mut m2) {
                     if let Some(d) = rfd::FileDialog::new().pick_folder() {
                         let s = d.to_string_lossy().into_owned();
                         if !self.settings.library_dirs.contains(&s) {
@@ -806,7 +1405,7 @@ impl App {
                         self.rescan();
                     }
                 }
-                if row(ui, self, Icon::Plus, "Import books", None, None, &mut m2) {
+                if row(ui, self, Icon::Plus, tr("Import books"), None, None, &mut m2) {
                     self.import_dialog();
                 }
             });
@@ -819,7 +1418,7 @@ impl App {
         egui::SidePanel::right("right").exact_width(264.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 24, right: 24, top: 24, bottom: 16 }).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let current = self.index.entries.iter().filter(|e| e.fraction > 0.0 && !e.finished).max_by_key(|e| e.last_read).cloned();
-                ui.label(tag("Progress").color(pal.muted));
+                ui.label(tag(tr("Progress")).color(pal.muted));
                 ui::rule(ui);
                 if let Some(e) = &current {
                     let shown = ui.ctx().animate_value_with_time(egui::Id::new("pct"), e.fraction, 0.8);
@@ -827,18 +1426,18 @@ impl App {
                         ui.ctx().request_repaint();
                     }
                     ui.label(RichText::new(format!("{:.0}%", shown * 100.0)).font(ui_b(52.0)).color(ACCENT));
-                    ui.add(egui::Label::new(RichText::new(&e.title).font(ui_m(14.0))).truncate());
+                    ui.add(egui::Label::new(RichText::new(crate::book::script::visual(&e.title)).font(ui_m(14.0))).truncate());
                     let r = ui.available_rect_before_wrap();
                     let bar = Rect::from_min_size(r.min + vec2(0.0, 6.0), vec2(r.width(), 2.0));
                     ui.painter().rect_filled(bar, CornerRadius::ZERO, pal.border);
                     ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * shown, 2.0)), CornerRadius::ZERO, pal.fg);
                     ui.add_space(14.0);
                 } else {
-                    ui.label(RichText::new("Nothing in progress.").color(pal.muted));
+                    ui.label(RichText::new(tr("Nothing in progress.")).color(pal.muted));
                 }
 
                 ui.add_space(18.0);
-                ui.label(tag("This week").color(pal.muted));
+                ui.label(tag(tr("This week")).color(pal.muted));
                 ui::rule(ui);
                 ui.add_space(6.0);
                 let today = store::now();
@@ -862,14 +1461,14 @@ impl App {
                     ui.painter().text(pos2(x + bw / 2.0 - 1.0, r.top() + 78.0), egui::Align2::CENTER_CENTER, k.get(8..10).unwrap_or(""), mono(9.5), pal.muted);
                 }
                 let week: f64 = days.iter().map(|d| d.1).sum();
-                ui.label(tag(format!("{} min this week · {} h total", (week / 60.0).round(), (self.overview.total_secs / 3600.0 * 10.0).round() / 10.0)).color(pal.muted));
+                ui.label(tag(trf!("{min} min this week · {h} h total", min = (week / 60.0).round(), h = (self.overview.total_secs / 3600.0 * 10.0).round() / 10.0)).color(pal.muted));
 
                 ui.add_space(18.0);
-                ui.label(tag("Recent notes").color(pal.muted));
+                ui.label(tag(tr("Recent notes")).color(pal.muted));
                 ui::rule(ui);
                 ui.add_space(6.0);
                 if self.overview.notes.is_empty() {
-                    ui.label(RichText::new("Highlights you make while reading collect here.").size(12.5).color(pal.muted));
+                    ui.label(RichText::new(tr("Highlights you make while reading collect here.")).size(12.5).color(pal.muted));
                 }
                 let mut open = None;
                 for (id, title, a) in self.overview.notes.iter().take(5) {
@@ -910,6 +1509,7 @@ impl App {
                 SortKey::Author => y.author.to_lowercase().cmp(&x.author.to_lowercase()),
                 SortKey::Progress => x.fraction.partial_cmp(&y.fraction).unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Size => x.size.cmp(&y.size),
+                SortKey::Rating => x.rating.cmp(&y.rating).then(x.last_read.cmp(&y.last_read)),
             };
             if self.settings.sort_desc {
                 o.reverse()
@@ -944,7 +1544,7 @@ impl App {
             }
             None => {
                 let p = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-                ui::paint_placeholder_cover(&p, rect, &e.title, &e.author);
+                ui::paint_placeholder_cover(&p, rect, &crate::book::script::visual(&e.title), &crate::book::script::visual(&e.author));
             }
         }
     }
@@ -952,10 +1552,10 @@ impl App {
     fn library_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let items = self.visible_entries();
         let title = match self.view {
-            View::Reading => "Currently Reading",
-            View::Unread => "Unread",
-            View::Finished => "Finished",
-            _ => "The Library",
+            View::Reading => tr("Currently Reading"),
+            View::Unread => tr("Unread"),
+            View::Finished => tr("Finished"),
+            _ => tr("The Library"),
         };
         self.header(ui, pal, title);
 
@@ -971,10 +1571,10 @@ impl App {
             }
             if items.is_empty() {
                 ui.add_space(10.0);
-                ui.label(RichText::new(if self.query.is_empty() { "Nothing here yet." } else { "Not on your shelves." }).font(ui_b(28.0)).color(pal.muted));
+                ui.label(RichText::new(if self.query.is_empty() { tr("Nothing here yet.") } else { tr("Not on your shelves.") }).font(ui_b(28.0)).color(pal.muted));
             } else if self.settings.lib_group == 0 {
                 ui.horizontal(|ui| {
-                    ui.label(tag(format!("Index / {:03}", items.len())).color(pal.muted));
+                    ui.label(tag(trf!("Index / {n}", n = format!("{:03}", items.len()))).color(pal.muted));
                     self.format_filter(ui);
                 });
                 ui::rule(ui);
@@ -998,19 +1598,19 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let grid = self.settings.lib_view == LibView::Grid;
-                if ui::icon_toggle(ui, Icon::List, "List", !grid).clicked() {
+                if ui::icon_toggle(ui, Icon::List, tr("List"), !grid).clicked() {
                     self.settings.lib_view = LibView::List;
                     self.view_changed = Instant::now();
                 }
-                if ui::icon_toggle(ui, Icon::Grid, "Covers", grid).clicked() {
+                if ui::icon_toggle(ui, Icon::Grid, tr("Covers"), grid).clicked() {
                     self.settings.lib_view = LibView::Grid;
                     self.view_changed = Instant::now();
                 }
                 ui.add_space(6.0);
-                let shelves = [(0u8, "None"), (5, "Genre"), (1, "Author"), (2, "Status"), (3, "Format"), (4, "Folder")];
-                let cur = shelves.iter().find(|s| s.0 == self.settings.lib_group).map(|s| s.1).unwrap_or("None");
+                let shelves = [(0u8, tr("None")), (5, tr("Genre")), (1, tr("Author")), (2, tr("Status")), (3, tr("Format")), (4, tr("Folder")), (6, tr("Collection")), (7, tr("Series"))];
+                let cur = shelves.iter().find(|s| s.0 == self.settings.lib_group).map(|s| s.1).unwrap_or(tr("None"));
                 let mut pick_group = None;
-                dropdown(ui, "shelf-dd", &format!("Shelves · {cur}"), self.settings.lib_group != 0, |ui| {
+                dropdown(ui, "shelf-dd", &trf!("Shelves · {name}", name = cur), self.settings.lib_group != 0, |ui| {
                     for (g, l) in shelves {
                         if ui.selectable_label(self.settings.lib_group == g, l).clicked() {
                             pick_group = Some(g);
@@ -1022,10 +1622,10 @@ impl App {
                     self.shelf_open = None;
                     self.view_changed = Instant::now();
                 }
-                let sorts = [(SortKey::Recent, "Recent"), (SortKey::Title, "Title"), (SortKey::Author, "Author"), (SortKey::Added, "Added"), (SortKey::Progress, "Progress"), (SortKey::Size, "Size")];
-                let cur = sorts.iter().find(|s| s.0 == self.settings.sort).map(|s| s.1).unwrap_or("Recent");
+                let sorts = [(SortKey::Recent, tr("Recent")), (SortKey::Title, tr("Title")), (SortKey::Author, tr("Author")), (SortKey::Added, tr("Added")), (SortKey::Progress, tr("Progress")), (SortKey::Size, tr("Size")), (SortKey::Rating, tr("Rating"))];
+                let cur = sorts.iter().find(|s| s.0 == self.settings.sort).map(|s| s.1).unwrap_or(tr("Recent"));
                 let mut pick_sort = None;
-                dropdown(ui, "sort-dd", &format!("Sort · {cur} {}", if self.settings.sort_desc { "↓" } else { "↑" }), false, |ui| {
+                dropdown(ui, "sort-dd", &trf!("Sort · {name} {dir}", name = cur, dir = if self.settings.sort_desc { "↓" } else { "↑" }), false, |ui| {
                     for (k, l) in sorts {
                         if ui.selectable_label(self.settings.sort == k, l).clicked() {
                             pick_sort = Some(k);
@@ -1065,7 +1665,7 @@ impl App {
         formats.dedup();
         if formats.len() > 1 {
             ui.add_space(10.0);
-            if text_button(ui, "All", self.format.is_empty()).clicked() {
+            if text_button(ui, tr("All"), self.format.is_empty()).clicked() {
                 self.format.clear();
             }
             for f in formats {
@@ -1087,12 +1687,21 @@ impl App {
         match self.settings.lib_group {
             1 => {
                 let a = e.author.split([',', ';', '&']).next().unwrap_or("").trim().to_string();
-                if a.is_empty() { "Unknown author".into() } else { a }
+                if a.is_empty() { tr("Unknown author").into() } else { a }
             }
-            2 => (if e.finished { "Finished" } else if e.fraction > 0.0 { "Reading" } else { "Unread" }).into(),
+            2 => (if e.finished { tr("Finished") } else if e.fraction > 0.0 { tr("Reading") } else { tr("Unread") }).into(),
             3 => e.format.clone(),
-            5 => if e.genre.is_empty() { "Uncategorised".into() } else { e.genre.clone() },
+            5 => if e.genre.is_empty() { tr("Uncategorised").into() } else { e.genre.clone() },
             _ => Path::new(&e.path).parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        }
+    }
+
+    fn group_keys(&self, e: &Entry) -> Vec<String> {
+        match self.settings.lib_group {
+            6 if e.collections.is_empty() => vec![tr("Uncollected").into()],
+            6 => e.collections.clone(),
+            7 => vec![if e.series.is_empty() { tr("Standalone").into() } else { e.series.clone() }],
+            _ => vec![self.group_key(e)],
         }
     }
 
@@ -1101,26 +1710,33 @@ impl App {
     fn grouped(&mut self, ui: &mut egui::Ui, pal: &Palette, items: &[usize]) {
         let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
         for &i in items {
-            let k = self.group_key(&self.index.entries[i]);
-            match groups.iter_mut().find(|g| g.0 == k) {
-                Some(g) => g.1.push(i),
-                None => groups.push((k, vec![i])),
+            for k in self.group_keys(&self.index.entries[i]) {
+                match groups.iter_mut().find(|g| g.0 == k) {
+                    Some(g) => g.1.push(i),
+                    None => groups.push((k, vec![i])),
+                }
             }
         }
         match self.settings.lib_group {
             1 => groups.sort_by(|a, b| a.0.split_whitespace().last().cmp(&b.0.split_whitespace().last())),
-            2 => groups.sort_by_key(|g| match g.0.as_str() {
-                "Reading" => 0,
-                "Unread" => 1,
-                _ => 2,
+            2 => groups.sort_by_key(|g| if g.0 == tr("Reading") { 0 } else if g.0 == tr("Unread") { 1 } else { 2 }),
+            6 | 7 => groups.sort_by(|a, b| {
+                let last = |k: &str| k == tr("Uncollected") || k == tr("Standalone");
+                last(&a.0).cmp(&last(&b.0)).then(a.0.to_lowercase().cmp(&b.0.to_lowercase()))
             }),
             _ => groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0))),
+        }
+        if self.settings.lib_group == 7 {
+            let es = &self.index.entries;
+            for g in groups.iter_mut().filter(|g| g.0 != tr("Standalone")) {
+                g.1.sort_by(|&a, &b| es[a].series_index.partial_cmp(&es[b].series_index).unwrap_or(std::cmp::Ordering::Equal).then(es[a].title.cmp(&es[b].title)));
+            }
         }
         // drilled into one shelf
         if let Some(open) = self.shelf_open.clone() {
             if let Some((k, idx)) = groups.iter().find(|g| g.0 == open) {
                 ui.horizontal(|ui| {
-                    if text_button(ui, "← All shelves", false).clicked() {
+                    if text_button(ui, tr("← All shelves"), false).clicked() {
                         self.shelf_open = None;
                         self.view_changed = Instant::now();
                     }
@@ -1161,7 +1777,7 @@ impl App {
                 ui.label(RichText::new(k).font(ui_b(22.0)));
                 ui.label(RichText::new(idx.len().to_string()).font(ui_m(13.0)).color(pal.muted));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if text_button(ui, "See all →", false).clicked() {
+                    if text_button(ui, tr("See all →"), false).clicked() {
                         self.shelf_open = Some(k.clone());
                         self.view_changed = Instant::now();
                     }
@@ -1212,11 +1828,11 @@ impl App {
                 if e.fraction > 0.0 {
                     painter.rect_filled(Rect::from_min_size(pos2(cover.left(), cover.bottom() - 3.0), vec2(cw * e.fraction, 3.0)), CornerRadius::ZERO, if e.finished { pal.fg } else { ACCENT });
                 }
-                let mut job = egui::text::LayoutJob::simple(e.title.clone(), ui_m(13.0), pal.fg, cw);
+                let mut job = egui::text::LayoutJob::simple(crate::book::script::visual(&e.title).into_owned(), ui_m(13.0), pal.fg, cw);
                 job.wrap.max_rows = 1;
                 job.wrap.overflow_character = Some('…');
                 painter.galley(pos2(x, row.top() + h + 14.0), painter.layout_job(job), pal.fg);
-                let mut job = egui::text::LayoutJob::simple(e.author.clone(), egui::FontId::proportional(12.0), pal.muted, cw);
+                let mut job = egui::text::LayoutJob::simple(crate::book::script::visual(&e.author).into_owned(), egui::FontId::proportional(12.0), pal.muted, cw);
                 job.wrap.max_rows = 1;
                 job.wrap.overflow_character = Some('…');
                 painter.galley(pos2(x, row.top() + h + 32.0), painter.layout_job(job), pal.muted);
@@ -1257,7 +1873,7 @@ impl App {
         reading.sort_by(|a, b| b.last_read.cmp(&a.last_read));
         let Some(cur) = reading.iter().find(|e| !e.finished && e.fraction > 0.0).cloned().or_else(|| reading.first().cloned()) else { return };
         let n_reading = self.count(View::Reading);
-        ui.label(tag(format!("Currently reading / {:03}", n_reading.max(1))).color(pal.muted));
+        ui.label(tag(trf!("Currently reading / {n}", n = format!("{:03}", n_reading.max(1)))).color(pal.muted));
         ui.add_space(10.0);
         let w = ui.available_width();
         let ch = 310.0f32.min(w * 0.45);
@@ -1271,14 +1887,14 @@ impl App {
         self.paint_cover(&painter, cover, &cur);
         let x = cover.right() + 40.0;
         let tw = (row.right() - x).max(120.0);
-        let mut job = egui::text::LayoutJob::single_section(cur.title.clone(), egui::TextFormat { font_id: ui_b(40.0), color: pal.fg, line_height: Some(42.0), extra_letter_spacing: -0.6, ..Default::default() });
+        let mut job = egui::text::LayoutJob::single_section(crate::book::script::visual(&cur.title).into_owned(), egui::TextFormat { font_id: ui_b(40.0), color: pal.fg, line_height: Some(42.0), extra_letter_spacing: -0.6, ..Default::default() });
         job.wrap = egui::text::TextWrapping { max_width: tw, max_rows: 3, overflow_character: Some('…'), ..Default::default() };
         let g = ui.painter().layout_job(job);
         let th = g.size().y;
         ui.painter().galley(pos2(x, row.top() - 8.0), g, pal.fg);
         ui.painter().text(pos2(x, row.top() + th + 4.0), egui::Align2::LEFT_TOP, &cur.author, ui_m(20.0), pal.muted);
         let by = row.bottom() - 80.0;
-        ui.painter().text(pos2(x, by), egui::Align2::LEFT_TOP, format!("{:.0}% COMPLETE  ·  LAST OPENED {}", cur.fraction * 100.0, store::relative_time(cur.last_read).to_uppercase()), mono(11.0), pal.fg);
+        ui.painter().text(pos2(x, by), egui::Align2::LEFT_TOP, trf!("{pct}% COMPLETE  ·  LAST OPENED {when}", pct = format!("{:.0}", cur.fraction * 100.0), when = store::relative_time(cur.last_read).to_uppercase()), mono(11.0), pal.fg);
         let fill = ui.ctx().animate_value_with_time(egui::Id::new(("feat-fill", &cur.id)), cur.fraction.clamp(0.0, 1.0), 0.9);
         let bar = Rect::from_min_size(pos2(x, by + 22.0), vec2(tw, 2.0));
         ui.painter().rect_filled(bar, CornerRadius::ZERO, pal.border);
@@ -1286,7 +1902,7 @@ impl App {
         let btn = Rect::from_min_size(pos2(x, row.bottom() - 36.0), vec2(160.0 + 20.0 * hov, 36.0));
         let bresp = ui.interact(btn, ui.id().with("resume"), Sense::click());
         ui.painter().rect_filled(btn, CornerRadius::ZERO, if bresp.hovered() || resp.hovered() { ACCENT } else { pal.fg });
-        ui.painter().text(btn.left_center() + vec2(16.0, 0.0), egui::Align2::LEFT_CENTER, if cur.fraction > 0.0 { "RESUME" } else { "OPEN" }, mono_m(12.0), pal.bg);
+        ui.painter().text(btn.left_center() + vec2(16.0, 0.0), egui::Align2::LEFT_CENTER, if cur.fraction > 0.0 { tr("RESUME") } else { tr("OPEN") }, mono_m(12.0), pal.bg);
         ui.painter().text(btn.right_center() - vec2(16.0, 0.0), egui::Align2::RIGHT_CENTER, "→", mono_m(14.0), pal.bg);
         if resp.clicked() || bresp.clicked() {
             self.open_path(Path::new(&cur.path));
@@ -1294,7 +1910,7 @@ impl App {
         let recent: Vec<Entry> = reading.into_iter().filter(|e| e.id != cur.id).take(10).collect();
         if !recent.is_empty() {
             ui.add_space(32.0);
-            ui.label(tag(format!("Recently opened / {:03}", recent.len())).color(pal.muted));
+            ui.label(tag(trf!("Recently opened / {n}", n = format!("{:03}", recent.len()))).color(pal.muted));
             ui::rule(ui);
             ui.add_space(14.0);
             let h = 136.0;
@@ -1385,22 +2001,26 @@ impl App {
                 let sh = 28.0 * t;
                 let strip = Rect::from_min_max(pos2(cover.left(), cover.bottom() - sh), cover.max);
                 painter.rect_filled(strip, CornerRadius::ZERO, INK);
-                let info = format!("{}  ·  {}  ·  {}", if e.finished { "DONE".into() } else { format!("{:.0}%", e.fraction * 100.0) }, e.format, library::fmt_size(e.size));
+                let info = format!("{}  ·  {}  ·  {}", if e.finished { tr("DONE").into() } else { format!("{:.0}%", e.fraction * 100.0) }, e.format, library::fmt_size(e.size));
                 painter.with_clip_rect(strip).text(strip.left_center() + vec2(9.0, 0.0), egui::Align2::LEFT_CENTER, info, mono(10.0), PAPER);
             } else if e.fraction > 0.0 && !e.finished {
                 painter.rect_filled(Rect::from_min_size(pos2(cover.left(), cover.bottom() - 3.0), vec2(cover.width() * e.fraction, 3.0)), CornerRadius::ZERO, ACCENT);
             }
             let y = cover.bottom() + 10.0 + 6.0 * t;
-            let (st, sc) = if e.finished { ("FINISHED", pal.muted) } else if e.fraction > 0.0 { ("READING", ACCENT) } else { ("UNREAD", pal.muted) };
+            let (st, sc) = if e.finished { (tr("FINISHED"), pal.muted) } else if e.fraction > 0.0 { (tr("READING"), ACCENT) } else { (tr("UNREAD"), pal.muted) };
             painter.text(pos2(r.left(), y), egui::Align2::LEFT_TOP, format!("{:02} —", n + offset + 1), mono(10.0), if t > 0.5 { ACCENT } else { pal.muted });
             painter.text(pos2(r.right(), y), egui::Align2::RIGHT_TOP, st, mono(9.5), sc);
+            if e.rating > 0 {
+                widgets::paint_star(&painter, pos2(r.left() + 40.0, y + 6.0), 4.5, true, ACCENT);
+                painter.text(pos2(r.left() + 48.0, y), egui::Align2::LEFT_TOP, e.rating.to_string(), mono(9.5), pal.muted);
+            }
             let big = r.width() > cw + 1.0;
-            let mut job = egui::text::LayoutJob::single_section(e.title.clone(), egui::TextFormat { font_id: if big { ui_b(21.0) } else { ui_m(14.0) }, color: pal.fg, line_height: Some(if big { 22.0 } else { 17.0 }), ..Default::default() });
+            let mut job = egui::text::LayoutJob::single_section(crate::book::script::visual(&e.title).into_owned(), egui::TextFormat { font_id: if big { ui_b(21.0) } else { ui_m(14.0) }, color: pal.fg, line_height: Some(if big { 22.0 } else { 17.0 }), ..Default::default() });
             job.wrap = egui::text::TextWrapping { max_width: r.width(), max_rows: 2, overflow_character: Some('…'), ..Default::default() };
             let g = painter.layout_job(job);
             let th = g.size().y;
             painter.galley(pos2(r.left(), y + 16.0), g, pal.fg);
-            let mut job = egui::text::LayoutJob::simple(e.author.to_uppercase(), mono(9.5), pal.muted, r.width());
+            let mut job = egui::text::LayoutJob::simple(crate::book::script::visual(&e.author.to_uppercase()).into_owned(), mono(9.5), pal.muted, r.width());
             job.wrap.max_rows = 1;
             job.wrap.overflow_character = Some('…');
             painter.galley(pos2(r.left(), y + 20.0 + th), painter.layout_job(job), pal.muted);
@@ -1418,7 +2038,7 @@ impl App {
         let w = ui.available_width();
         let cols = [0.0, 54.0, w * 0.5, w * 0.74, w * 0.84, w * 0.92];
         let (hr, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
-        for (x, h) in cols.iter().zip(["NO.", "TITLE", "AUTHOR", "FORMAT", "READ", "OPENED"]) {
+        for (x, h) in cols.iter().zip([tr("NO."), tr("TITLE"), tr("AUTHOR"), tr("FORMAT"), tr("READ"), tr("OPENED")]) {
             ui.painter().text(pos2(hr.left() + x, hr.center().y), egui::Align2::LEFT_CENTER, h, mono(9.5), pal.muted);
         }
         let mut open = None;
@@ -1436,10 +2056,14 @@ impl App {
             let ink = if t > 0.5 { ACCENT } else { pal.fg };
             ui.painter().text(pos2(r.left() + cols[0] + 8.0 * t, y), egui::Align2::LEFT_CENTER, format!("{:03}", n + offset + 1), mono(11.0), pal.muted);
             let clip = |x0: f32, x1: f32| ui.painter().with_clip_rect(Rect::from_min_max(pos2(r.left() + x0, r.top()), pos2(r.left() + x1 - 12.0, r.bottom())));
-            clip(cols[1], cols[2]).text(pos2(r.left() + cols[1] + 8.0 * t, y), egui::Align2::LEFT_CENTER, &e.title, ui_m(15.0), ink);
-            clip(cols[2], cols[3]).text(pos2(r.left() + cols[2], y), egui::Align2::LEFT_CENTER, &e.author, egui::FontId::proportional(13.0), pal.muted);
+            clip(cols[1], cols[2]).text(pos2(r.left() + cols[1] + 8.0 * t, y), egui::Align2::LEFT_CENTER, crate::book::script::visual(&e.title), ui_m(15.0), ink);
+            clip(cols[2], cols[3]).text(pos2(r.left() + cols[2], y), egui::Align2::LEFT_CENTER, crate::book::script::visual(&e.author), egui::FontId::proportional(13.0), pal.muted);
             ui.painter().text(pos2(r.left() + cols[3], y), egui::Align2::LEFT_CENTER, &e.format, mono(11.0), pal.muted);
-            let pr = if e.finished { "DONE".to_string() } else { format!("{:.0}%", e.fraction * 100.0) };
+            if e.rating > 0 {
+                widgets::paint_star(ui.painter(), pos2(r.left() + cols[3] + 52.0, y), 4.5, true, ACCENT);
+                ui.painter().text(pos2(r.left() + cols[3] + 60.0, y), egui::Align2::LEFT_CENTER, e.rating.to_string(), mono(10.5), pal.muted);
+            }
+            let pr = if e.finished { tr("DONE").to_string() } else { format!("{:.0}%", e.fraction * 100.0) };
             ui.painter().text(pos2(r.left() + cols[4], y), egui::Align2::LEFT_CENTER, pr, mono(11.0), if e.fraction > 0.0 && !e.finished { ACCENT } else { pal.muted });
             ui.painter().text(pos2(r.left() + cols[5], y), egui::Align2::LEFT_CENTER, if e.last_read > 0 { store::relative_time(e.last_read) } else { "—".into() }, mono(10.5), pal.muted);
             if resp.clicked() {
@@ -1454,77 +2078,111 @@ impl App {
 
     fn empty_state(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.add_space(60.0);
-        ui.label(display("Empty shelves.", 48.0));
+        ui.label(display(tr("Empty shelves."), 48.0));
         ui.add_space(6.0);
-        ui.label(RichText::new("EPUB · MOBI · AZW3 · FB2 · PDF · CBZ · TXT").font(mono(12.0)).color(pal.muted));
+        ui.label(RichText::new(tr("EPUB · MOBI · AZW3 · FB2 · PDF · CBZ · TXT")).font(mono(12.0)).color(pal.muted));
         ui.add_space(24.0);
         ui.horizontal(|ui| {
-            if ui::primary_button(ui, "Import books").clicked() {
+            if ui::primary_button(ui, tr("Import books")).clicked() {
                 self.import_dialog();
             }
-            if text_button(ui, "Add a folder", false).clicked() {
+            if text_button(ui, tr("Add a folder"), false).clicked() {
                 if let Some(d) = rfd::FileDialog::new().pick_folder() {
                     self.settings.library_dirs.push(d.to_string_lossy().into_owned());
                     self.rescan();
                 }
             }
-            if self.settings.zlib_enabled && text_button(ui, "Find books on Z-Library →", false).clicked() {
+            if self.settings.zlib_enabled && text_button(ui, tr("Find books on Z-Library →"), false).clicked() {
                 self.set_view(View::Source);
             }
         });
         ui.add_space(14.0);
-        ui.label(tag("Or drop files and folders anywhere on this window.").color(pal.muted));
+        ui.label(tag(tr("Or drop files and folders anywhere on this window.")).color(pal.muted));
     }
 
     fn book_menu(&mut self, ui: &mut egui::Ui, e: &Entry) {
-        if ui.button("Read").clicked() {
+        if ui.button(tr("Read")).clicked() {
             self.open_path(Path::new(&e.path));
             ui.close_menu();
         }
-        if ui.button("Details").clicked() {
+        if ui.button(tr("Details")).clicked() {
             self.details = Some(e.id.clone());
             ui.close_menu();
         }
-        if ui.button(if e.finished { "Mark as unread" } else { "Mark as finished" }).clicked() {
+        if ui.button(if e.finished { tr("Mark as unread") } else { tr("Mark as finished") }).clicked() {
             let fin = !e.finished;
-            let mut d = BookData::load(&e.id);
-            d.finished = fin;
-            if !fin {
-                d.fraction = 0.0;
-                d.loc = None;
-            }
-            d.save(&e.id);
+            // An open reader holds its own BookData and saves it back later:
+            // change that copy, or the reader would undo this on close.
+            let fraction = if let Some(r) = self.readers.iter_mut().find(|r| r.id == e.id) {
+                r.data.finished = fin;
+                r.save();
+                r.data.fraction
+            } else {
+                let mut d = BookData::load(&e.id);
+                d.finished = fin;
+                if !fin {
+                    d.fraction = 0.0;
+                    d.loc = None;
+                }
+                d.save(&e.id);
+                d.fraction
+            };
             if let Some(x) = self.index.entries.iter_mut().find(|x| x.id == e.id) {
                 x.finished = fin;
-                if !fin {
-                    x.fraction = 0.0;
-                }
+                x.fraction = fraction;
             }
             self.index.save();
             ui.close_menu();
         }
-        if self.settings.zlib_enabled && ui.button("Fetch cover from Z-Library").clicked() {
+        let cur = self.userlib.book(&e.id).cloned().unwrap_or_default();
+        ui.menu_button(tr("Rating"), |ui| {
+            for r in 0..=5u8 {
+                let l = if r == 0 { tr("None").to_string() } else { format!("{r} star{}", if r == 1 { "" } else { "s" }) };
+                if ui.selectable_label(cur.rating == r, l).clicked() {
+                    self.set_rating(&e.id, r);
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.menu_button(tr("Collections"), |ui| {
+            for c in self.userlib.collections.clone() {
+                let mut on = cur.collections.contains(&c);
+                if ui.checkbox(&mut on, &c).changed() {
+                    self.toggle_collection(&e.id, &c);
+                }
+            }
+            if !self.userlib.collections.is_empty() {
+                ui.separator();
+            }
+            let r = ui.add(egui::TextEdit::singleline(&mut self.new_coll).hint_text(tr("New collection…")).desired_width(150.0));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let n = std::mem::take(&mut self.new_coll);
+                self.new_collection_for(&e.id, &n);
+                ui.close_menu();
+            }
+        });
+        if self.settings.zlib_enabled && ui.button(tr("Fetch cover from Z-Library")).clicked() {
             self.online.fetch_cover_for(e.id.clone(), PathBuf::from(&e.path), e.title.clone(), e.author.clone(), &self.settings);
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("Show in folder").clicked() {
+        if ui.button(tr("Show in folder")).clicked() {
             crate::platform::reveal(Path::new(&e.path));
             ui.close_menu();
         }
-        if ui.button("Open with system app").clicked() {
+        if ui.button(tr("Open with system app")).clicked() {
             crate::platform::open_path(Path::new(&e.path));
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("Remove from library").clicked() {
+        if ui.button(tr("Remove from library")).clicked() {
             self.settings.hidden_paths.push(e.path.clone());
             self.settings.extra_files.retain(|f| f != &e.path);
             self.index.entries.retain(|x| x.id != e.id);
             self.index.save();
             ui.close_menu();
         }
-        if ui.button(RichText::new("Delete file…").color(ACCENT)).clicked() {
+        if ui.button(RichText::new(tr("Delete file…")).color(ACCENT)).clicked() {
             self.confirm_delete = Some(e.id.clone());
             ui.close_menu();
         }
@@ -1539,13 +2197,13 @@ impl App {
             b.dedup();
             b.len()
         };
-        ui.label(display("Notes", 34.0));
-        ui.label(tag(format!("{:03} highlights across {:03} books", self.overview.notes.len(), books)).color(pal.muted));
+        ui.label(display(tr("Notes"), 34.0));
+        ui.label(tag(trf!("{n} highlights across {books} books", n = format!("{:03}", self.overview.notes.len()), books = format!("{:03}", books))).color(pal.muted));
         ui.add_space(8.0);
         ui::rule(ui);
         if self.overview.notes.is_empty() {
             ui.add_space(20.0);
-            ui.label(RichText::new("Select text while reading to highlight it or write in the margin.").font(ui_m(17.0)).color(pal.muted));
+            ui.label(RichText::new(tr("Select text while reading to highlight it or write in the margin.")).font(ui_m(17.0)).color(pal.muted));
             return;
         }
         let mut open = None;
@@ -1598,13 +2256,13 @@ impl App {
     }
 
     fn bookmarks_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.label(display("Bookmarks", 34.0));
-        ui.label(tag(format!("{:03} marked pages", self.overview.bookmarks.len())).color(pal.muted));
+        ui.label(display(tr("Bookmarks"), 34.0));
+        ui.label(tag(trf!("{n} marked pages", n = format!("{:03}", self.overview.bookmarks.len()))).color(pal.muted));
         ui.add_space(8.0);
         ui::rule(ui);
         if self.overview.bookmarks.is_empty() {
             ui.add_space(20.0);
-            ui.label(RichText::new("Press B while reading to mark a page.").font(ui_m(17.0)).color(pal.muted));
+            ui.label(RichText::new(tr("Press B while reading to mark a page.")).font(ui_m(17.0)).color(pal.muted));
             return;
         }
         let mut open = None;
@@ -1634,12 +2292,18 @@ impl App {
     // ---------- windows ----------
 
     fn details_window(&mut self, ctx: &egui::Context, pal: &Palette) {
-        let Some(id) = self.details.clone() else { return };
+        let Some(id) = self.details.clone() else {
+            self.details_data = None;
+            return;
+        };
         let Some(e) = self.index.entries.iter().find(|e| e.id == id).cloned() else {
             self.details = None;
             return;
         };
-        let data = BookData::load(&id);
+        if self.details_data.as_ref().is_none_or(|(d, _)| d != &id) {
+            self.details_data = Some((id.clone(), BookData::load(&id)));
+        }
+        let (secs, days, highlights) = self.details_data.as_ref().map(|(_, d)| (d.seconds, d.daily.len(), d.annotations.len())).unwrap_or_default();
         egui::Window::new("details").title_bar(false).collapsible(false).resizable(false).default_width(640.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
             ui.horizontal_top(|ui| {
                 let h = 280.0;
@@ -1652,13 +2316,13 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(tag(format!("{} · {}", e.format, library::fmt_size(e.size))).color(pal.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if text_button(ui, "Close", false).clicked() {
+                            if text_button(ui, tr("Close"), false).clicked() {
                                 self.details = None;
                             }
                         });
                     });
-                    ui.label(display(&e.title, 32.0));
-                    ui.label(RichText::new(&e.author).font(ui_m(16.0)).color(pal.muted));
+                    ui.label(display(crate::book::script::visual(&e.title).as_ref(), 32.0));
+                    ui.label(RichText::new(crate::book::script::visual(&e.author)).font(ui_m(16.0)).color(pal.muted));
                     ui.add_space(12.0);
                     egui::Grid::new("meta").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
                         let mut row = |k: &str, v: String| {
@@ -1668,26 +2332,94 @@ impl App {
                                 ui.end_row();
                             }
                         };
-                        row("Series", e.series.clone());
-                        row("Publisher", e.publisher.clone());
-                        row("Language", e.language.clone());
-                        row("Progress", if e.finished { "Finished".into() } else { format!("{:.0}%", e.fraction * 100.0) });
-                        let mins = (data.seconds / 60.0).round() as i64;
-                        row("Time read", if mins >= 60 { format!("{} h {} min", mins / 60, mins % 60) } else { format!("{mins} min") });
-                        row("Days read", if data.daily.is_empty() { String::new() } else { data.daily.len().to_string() });
-                        row("Last opened", if e.last_read > 0 { store::relative_time(e.last_read) } else { "never".into() });
-                        row("Highlights", if data.annotations.is_empty() { String::new() } else { data.annotations.len().to_string() });
+                        row(tr("Series"), e.series.clone());
+                        row(tr("Publisher"), e.publisher.clone());
+                        row(tr("Language"), e.language.clone());
+                        row(tr("Progress"), if e.finished { tr("Finished").into() } else { format!("{:.0}%", e.fraction * 100.0) });
+                        let mins = (secs / 60.0).round() as i64;
+                        row(tr("Time read"), if mins >= 60 { format!("{} h {} min", mins / 60, mins % 60) } else { format!("{mins} min") });
+                        row(tr("Days read"), if days == 0 { String::new() } else { days.to_string() });
+                        row(tr("Last opened"), if e.last_read > 0 { store::relative_time(e.last_read) } else { "never".into() });
+                        row(tr("Highlights"), if highlights == 0 { String::new() } else { highlights.to_string() });
                     });
-                    ui.add_space(14.0);
+                    ui.add_space(8.0);
+                    let ub = self.userlib.book(&e.id).cloned().unwrap_or_default();
                     ui.horizontal(|ui| {
-                        if ui::primary_button(ui, if e.fraction > 0.0 { "Continue" } else { "Start reading" }).clicked() {
+                        ui.label(tag(tr("Rating")).color(pal.muted));
+                        if let Some(r) = widgets::star_row(ui, e.rating, 16.0, ACCENT, pal.muted) {
+                            self.set_rating(&e.id, r);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(tag(tr("Collections")).color(pal.muted));
+                        for c in self.userlib.collections.clone() {
+                            if text_button(ui, &c, ub.collections.contains(&c)).clicked() {
+                                self.toggle_collection(&e.id, &c);
+                            }
+                        }
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.new_coll).hint_text("+ New").desired_width(80.0));
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let n = std::mem::take(&mut self.new_coll);
+                            self.new_collection_for(&e.id, &n);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui::primary_button(ui, if e.fraction > 0.0 { tr("Continue") } else { tr("Start reading") }).clicked() {
                             self.open_path(Path::new(&e.path));
                             self.details = None;
                         }
-                        if text_button(ui, "Show in folder", false).clicked() {
+                        if text_button(ui, tr("Show in folder"), false).clicked() {
                             crate::platform::reveal(Path::new(&e.path));
                         }
+                        if text_button(ui, tr("Edit details"), false).clicked() {
+                            self.meta_edit = Some(MetaForm { id: e.id.clone(), title: e.title.clone(), author: e.author.clone(), series: e.series.clone(), index: if e.series_index > 0.0 { e.series_index.to_string() } else { String::new() }, genre: e.genre.clone() });
+                        }
                     });
+                    if let Some(mut f) = self.meta_edit.take() {
+                        if f.id == e.id {
+                            let mut keep = true;
+                            ui.add_space(8.0);
+                            egui::Grid::new("meta-edit").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                                for (k, v) in [(tr("Title"), &mut f.title), (tr("Author"), &mut f.author), (tr("Series"), &mut f.series), (tr("Number"), &mut f.index), (tr("Genre / tag"), &mut f.genre)] {
+                                    ui.label(tag(k).color(pal.muted));
+                                    ui.add(egui::TextEdit::singleline(v).desired_width(250.0));
+                                    ui.end_row();
+                                }
+                            });
+                            ui.label(tag(tr("Stored in Seshat only; the book file is never changed.")).color(pal.muted));
+                            ui.horizontal(|ui| {
+                                if ui::primary_button(ui, tr("Save")).clicked() {
+                                    let orig = e.raw.clone().unwrap_or(library::Raw { title: e.title.clone(), author: e.author.clone(), series: e.series.clone(), series_index: e.series_index, genre: e.genre.clone() });
+                                    let ov = |new: &str, o: &str| if new.trim() == o { String::new() } else { new.trim().to_string() };
+                                    let ub = self.userlib.book_mut(&e.id);
+                                    ub.title = ov(&f.title, &orig.title);
+                                    ub.author = ov(&f.author, &orig.author);
+                                    ub.series = ov(&f.series, &orig.series);
+                                    ub.genre = ov(&f.genre, &orig.genre);
+                                    ub.series_index = f.index.trim().parse::<f32>().ok().filter(|i| (*i - orig.series_index).abs() > 1e-6);
+                                    self.user_changed(&e.id);
+                                    keep = false;
+                                }
+                                if text_button(ui, tr("Reset to file"), false).clicked() {
+                                    let ub = self.userlib.book_mut(&e.id);
+                                    ub.title.clear();
+                                    ub.author.clear();
+                                    ub.series.clear();
+                                    ub.genre.clear();
+                                    ub.series_index = None;
+                                    self.user_changed(&e.id);
+                                    keep = false;
+                                }
+                                if text_button(ui, tr("Cancel"), false).clicked() {
+                                    keep = false;
+                                }
+                            });
+                            if keep {
+                                self.meta_edit = Some(f);
+                            }
+                        }
+                    }
                 });
             });
             if !e.description.is_empty() {
@@ -1713,7 +2445,7 @@ impl App {
             bar(ctx, "opening", &mut |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(format!("OPENING  {}", trunc(&name, 50).to_uppercase())).font(mono(11.0)));
+                    ui.label(RichText::new(trf!("OPENING  {name}", name = trunc(&name, 50).to_uppercase())).font(mono(11.0)));
                 });
             });
         }
@@ -1721,7 +2453,7 @@ impl App {
             let mut dismiss = false;
             bar(ctx, "err", &mut |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("COULDN'T OPEN").font(mono_m(11.0)).color(ACCENT));
+                    ui.label(RichText::new(tr("COULDN'T OPEN")).font(mono_m(11.0)).color(ACCENT));
                     ui.label(&err);
                     if ui.small_button("×").clicked() {
                         dismiss = true;
@@ -1735,13 +2467,13 @@ impl App {
         if let Some(id) = self.confirm_delete.clone() {
             let e = self.index.entries.iter().find(|e| e.id == id).cloned();
             let mut keep = true;
-            egui::Window::new("Delete file?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            egui::Window::new(tr("Delete file?")).id(egui::Id::new("win-delete")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
                 if let Some(e) = &e {
-                    ui.label(format!("“{}” will be permanently deleted from disk:", e.title));
+                    ui.label(trf!("“{title}” will be permanently deleted from disk:", title = e.title));
                     ui.label(RichText::new(&e.path).font(mono(10.5)).color(pal.muted));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new("DELETE").font(mono_m(11.5)).color(PAPER)).fill(ACCENT)).clicked() {
+                        if ui.add(egui::Button::new(RichText::new(tr("DELETE")).font(mono_m(11.5)).color(PAPER)).fill(ACCENT)).clicked() {
                             let _ = std::fs::remove_file(&e.path);
                             let _ = std::fs::remove_file(library::cover_path(&e.id));
                             self.index.entries.retain(|x| x.id != e.id);
@@ -1749,7 +2481,7 @@ impl App {
                             self.index.save();
                             keep = false;
                         }
-                        if text_button(ui, "Cancel", false).clicked() {
+                        if text_button(ui, tr("Cancel"), false).clicked() {
                             keep = false;
                         }
                     });
@@ -1769,29 +2501,41 @@ impl App {
         }
         let mut open = true;
         let mut rescan = false;
-        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(540.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+        egui::Window::new(tr("Settings")).id(egui::Id::new("win-settings")).open(&mut open).collapsible(false).resizable(false).default_width(540.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() - 160.0).show(ui, |ui| {
                 ui.set_width(520.0);
-                ui::section_label(ui, "Appearance");
+                ui::section_label(ui, tr("Appearance"));
                 ui.horizontal(|ui| {
-                    for (t, l) in [(UiTheme::System, "System"), (UiTheme::Light, "Paper"), (UiTheme::Dark, "Ink")] {
+                    for (t, l) in [(UiTheme::System, tr("System")), (UiTheme::Light, tr("Paper")), (UiTheme::Dark, tr("Ink"))] {
                         if text_button(ui, l, self.settings.ui_theme == t).clicked() {
                             self.settings.ui_theme = t;
                         }
                     }
                     ui.separator();
-                    ui.checkbox(&mut self.settings.right_panel, "Progress column");
+                    ui.checkbox(&mut self.settings.right_panel, tr("Progress column"));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(tag("Cover size").color(pal.muted));
+                    ui.label(tag(tr("Cover size")).color(pal.muted));
                     ui.add(egui::Slider::new(&mut self.settings.cover_size, 110.0..=260.0).show_value(false));
                 });
-
-                ui::section_label(ui, "Library folders");
                 ui.horizontal(|ui| {
-                    ui.label(tag("Downloads").color(pal.muted));
+                    ui.label(tag(tr("Interface language")).color(pal.muted));
+                    let native = |code: &str| crate::i18n::LANGS.iter().find(|l| l.0 == code).map(|l| l.1).unwrap_or("English");
+                    let auto = trf!("Auto ({name})", name = native(crate::i18n::detect()));
+                    let shown = if self.settings.language.is_empty() { auto.clone() } else { native(&self.settings.language).to_string() };
+                    egui::ComboBox::from_id_salt("ui-lang").selected_text(shown).width(190.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.settings.language, String::new(), auto);
+                        for (code, name, _) in crate::i18n::LANGS {
+                            ui.selectable_value(&mut self.settings.language, code.to_string(), *name);
+                        }
+                    });
+                });
+
+                ui::section_label(ui, tr("Library folders"));
+                ui.horizontal(|ui| {
+                    ui.label(tag(tr("Downloads")).color(pal.muted));
                     ui.add(egui::Label::new(RichText::new(&self.settings.download_dir).font(mono(11.5))).truncate());
-                    if text_button(ui, "Change", false).clicked() {
+                    if text_button(ui, tr("Change"), false).clicked() {
                         if let Some(d) = rfd::FileDialog::new().set_directory(&self.settings.download_dir).pick_folder() {
                             self.settings.download_dir = d.to_string_lossy().into_owned();
                             rescan = true;
@@ -1803,7 +2547,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(tag(format!("{:02}", i + 1)).color(ACCENT));
                         ui.add(egui::Label::new(RichText::new(d).font(mono(11.5))).truncate());
-                        if text_button(ui, "Remove", false).clicked() {
+                        if text_button(ui, tr("Remove"), false).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -1813,7 +2557,7 @@ impl App {
                     rescan = true;
                 }
                 ui.horizontal(|ui| {
-                    if text_button(ui, "+ Add folder", false).clicked() {
+                    if text_button(ui, tr("+ Add folder"), false).clicked() {
                         if let Some(d) = rfd::FileDialog::new().pick_folder() {
                             let s = d.to_string_lossy().into_owned();
                             if !self.settings.library_dirs.contains(&s) {
@@ -1822,48 +2566,77 @@ impl App {
                             rescan = true;
                         }
                     }
-                    if !self.settings.hidden_paths.is_empty() && text_button(ui, &format!("Restore {} removed", self.settings.hidden_paths.len()), false).clicked() {
+                    if !self.settings.hidden_paths.is_empty() && text_button(ui, &trf!("Restore {n} removed", n = self.settings.hidden_paths.len()), false).clicked() {
                         self.settings.hidden_paths.clear();
                         rescan = true;
                     }
                 });
 
-                ui::section_label(ui, "Sources / plugins");
-                ui.checkbox(&mut self.settings.zlib_enabled, "Z-Library — blend results into library search");
+                ui.checkbox(&mut self.settings.watch_folders, tr("Watch library folders for new books (checks every 30 s)"));
+                if !self.userlib.collections.is_empty() {
+                    ui::section_label(ui, tr("Collections"));
+                    let mut del = None;
+                    for c in &self.userlib.collections {
+                        ui.horizontal(|ui| {
+                            ui.label(c);
+                            if text_button(ui, tr("Delete"), false).clicked() {
+                                del = Some(c.clone());
+                            }
+                        });
+                    }
+                    if let Some(c) = del {
+                        self.userlib.remove_collection(&c);
+                        self.userlib.save();
+                        self.apply_user_all();
+                        self.index.save();
+                        if self.shelf_open.as_deref() == Some(c.as_str()) {
+                            self.shelf_open = None;
+                        }
+                    }
+                }
+
+                ui::section_label(ui, tr("Import"));
                 ui.horizontal(|ui| {
-                    ui.label(tag("Proxy").color(pal.muted));
+                    ui.add_enabled_ui(!self.clip_busy, |ui| {
+                        if text_button(ui, tr("Kindle My Clippings.txt…"), false).clicked() {
+                            self.import_clippings();
+                        }
+                    });
+                    if !self.clip_status.is_empty() {
+                        ui.add(egui::Label::new(tag(&self.clip_status).color(pal.muted)).wrap());
+                    }
+                });
+
+                ui::section_label(ui, tr("Sources / plugins"));
+                ui.checkbox(&mut self.settings.zlib_enabled, tr("Z-Library — blend results into library search"));
+                ui.horizontal(|ui| {
+                    ui.label(tag(tr("Proxy")).color(pal.muted));
                     ui.add(egui::TextEdit::singleline(&mut self.settings.proxy).hint_text("socks5://127.0.0.1:9050").desired_width(260.0));
                 });
 
-                ui::section_label(ui, "Read aloud");
-                ui.horizontal(|ui| {
-                    ui.add(egui::Slider::new(&mut self.settings.tts_rate, 0.5..=2.5).step_by(0.1).suffix("×"));
-                    ui.label(tag(match crate::tts::available() {
-                        Some(e) => format!("engine: {e}"),
-                        None => "no speech engine found".into(),
-                    }).color(pal.muted));
-                });
+                ui::section_label(ui, tr("Read aloud"));
+                self.voice_settings(ui, pal);
 
-                ui::section_label(ui, "Lookup & reading");
+                ui::section_label(ui, tr("Lookup & reading"));
                 ui.horizontal(|ui| {
-                    ui.label(tag("Translate to").color(pal.muted));
+                    ui.label(tag(tr("Translate to")).color(pal.muted));
                     ui.add(egui::TextEdit::singleline(&mut self.settings.translate_to).desired_width(70.0));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(tag("Reading speed").color(pal.muted));
+                    ui.label(tag(tr("Reading speed")).color(pal.muted));
                     ui.add(egui::Slider::new(&mut self.settings.reading_speed_cpm, 300.0..=4000.0).suffix(" chars/min"));
                 });
 
-                ui::section_label(ui, "Progress sync — KOReader compatible");
-                ui.checkbox(&mut self.settings.kosync.enabled, "Sync reading progress");
+                ui::section_label(ui, tr("Progress sync — KOReader compatible"));
+                ui.checkbox(&mut self.settings.kosync.enabled, tr("Sync reading progress"));
                 egui::Grid::new("ks").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                    ui.label(tag("Server").color(pal.muted));
+                    ui.label(tag(tr("Server")).color(pal.muted));
                     ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.server).desired_width(300.0));
                     ui.end_row();
-                    ui.label(tag("Username").color(pal.muted));
+                    ui.label(tag(tr("Username")).color(pal.muted));
                     ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.username).desired_width(200.0));
                     ui.end_row();
-                    ui.label(tag("Password").color(pal.muted));
+                    ui.label(tag(tr("Password")).color(pal.muted));
                     ui.add(egui::TextEdit::singleline(&mut self.kosync_password).password(true).desired_width(200.0).hint_text(if self.settings.kosync.userkey.is_empty() { "" } else { "(saved)" }));
                     ui.end_row();
                 });
@@ -1875,26 +2648,74 @@ impl App {
                         }
                         (s.settings.kosync.clone(), s.settings.proxy_opt(), s.tx.clone(), s.ctx.clone())
                     };
-                    if text_button(ui, "Log in", false).clicked() {
+                    if text_button(ui, tr("Log in"), false).clicked() {
                         let (cfg, proxy, tx, ctx) = mk(self);
-                        self.kosync_status = "Checking…".into();
+                        self.kosync_status = tr("Checking…").into();
                         std::thread::spawn(move || {
-                            let _ = tx.send(Msg::Kosync(crate::kosync::auth(&cfg, &proxy).map(|_| "Logged in".to_string())));
+                            let _ = tx.send(Msg::Kosync(crate::kosync::auth(&cfg, &proxy).map(|_| tr("Logged in").to_string())));
                             ctx.request_repaint();
                         });
                     }
-                    if text_button(ui, "Register", false).clicked() {
+                    if text_button(ui, tr("Register"), false).clicked() {
                         let (cfg, proxy, tx, ctx) = mk(self);
-                        self.kosync_status = "Registering…".into();
+                        self.kosync_status = tr("Registering…").into();
                         std::thread::spawn(move || {
-                            let _ = tx.send(Msg::Kosync(crate::kosync::register(&cfg, &proxy).map(|_| "Account created".to_string())));
+                            let _ = tx.send(Msg::Kosync(crate::kosync::register(&cfg, &proxy).map(|_| tr("Account created").to_string())));
                             ctx.request_repaint();
                         });
                     }
                     ui.label(tag(&self.kosync_status).color(ACCENT));
                 });
 
-                ui::section_label(ui, "About");
+                ui::section_label(ui, tr("Notes, highlights & library sync"));
+                ui.label(tag(tr("Syncs highlights, notes, bookmarks, collections, ratings and edited details between machines.")).color(pal.muted));
+                ui.horizontal(|ui| {
+                    for (b, l) in [(store::SyncBackend::Off, tr("Off")), (store::SyncBackend::Folder, tr("Sync folder")), (store::SyncBackend::WebDav, "WebDAV")] {
+                        if ui.selectable_label(self.settings.sync.backend == b, l).clicked() {
+                            self.settings.sync.backend = b;
+                        }
+                    }
+                });
+                match self.settings.sync.backend {
+                    store::SyncBackend::Off => {}
+                    store::SyncBackend::Folder => {
+                        ui.horizontal(|ui| {
+                            ui.label(tag(tr("Folder")).color(pal.muted));
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.folder).desired_width(300.0));
+                            if text_button(ui, tr("Browse…"), false).clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    self.settings.sync.folder = d.to_string_lossy().into_owned();
+                                }
+                            }
+                        });
+                        ui.label(tag(tr("Use a folder your sync tool (Syncthing, Dropbox, Nextcloud…) keeps in step.")).color(pal.muted));
+                    }
+                    store::SyncBackend::WebDav => {
+                        egui::Grid::new("dav").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                            ui.label(tag("URL").color(pal.muted));
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_url).desired_width(300.0).hint_text("https://cloud.example.com/remote.php/dav/files/me"));
+                            ui.end_row();
+                            ui.label(tag(tr("Username")).color(pal.muted));
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_user).desired_width(200.0));
+                            ui.end_row();
+                            ui.label(tag(tr("Password")).color(pal.muted));
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_pass).password(true).desired_width(200.0));
+                            ui.end_row();
+                        });
+                    }
+                }
+                if self.settings.sync.backend != store::SyncBackend::Off {
+                    ui.checkbox(&mut self.settings.sync.reading_time, tr("Also sync reading time"));
+                    ui.horizontal(|ui| {
+                        if text_button(ui, tr("Sync now"), false).clicked() && !self.sync_busy {
+                            self.settings.save();
+                            self.start_sync(None);
+                        }
+                        ui.label(tag(&self.sync_status).color(ACCENT));
+                    });
+                }
+
+                ui::section_label(ui, tr("About"));
                 ui.label(tag(format!("{} {} · {}", crate::APP_NAME, env!("CARGO_PKG_VERSION"), store::config_dir().display())).color(pal.muted));
                 ui.label(RichText::new("← → page · T toolbar · C contents · B bookmark · Ctrl+K search · F fullscreen · Ctrl ± size · Backspace back · Esc close").font(mono(10.5)).color(pal.muted));
             });
@@ -1941,4 +2762,219 @@ fn dropdown(ui: &mut egui::Ui, id: &str, label: &str, active: bool, body: impl F
         ui.set_min_width(150.0);
         body(ui);
     });
+}
+
+// ---------- statistics and duplicates ----------
+
+fn day_number(date: &str) -> Option<i64> {
+    let mut it = date.split('-').filter_map(|x| x.parse::<i64>().ok());
+    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+fn fmt_dur(secs: f64) -> String {
+    let m = (secs / 60.0).round() as i64;
+    if m >= 60 {
+        trf!("{h} h {m} min", h = m / 60, m = format!("{:02}", m % 60))
+    } else {
+        trf!("{n} min", n = m)
+    }
+}
+
+impl App {
+    fn stats_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.label(display(tr("Statistics"), 34.0));
+        let daily = &self.overview.daily;
+        let today = store::now().div_euclid(86400);
+        let active: Vec<i64> = daily.iter().filter(|(_, s)| **s > 0.0).filter_map(|(d, _)| day_number(d)).collect();
+        let mut sorted = active.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let (mut longest, mut run, mut prev) = (0, 0, i64::MIN);
+        for &d in &sorted {
+            run = if d == prev + 1 { run + 1 } else { 1 };
+            longest = longest.max(run);
+            prev = d;
+        }
+        let mut current = 0;
+        let mut d = if sorted.contains(&today) { today } else { today - 1 };
+        while sorted.contains(&d) {
+            current += 1;
+            d -= 1;
+        }
+        let finished = self.index.entries.iter().filter(|e| e.finished).count();
+        let started = self.index.entries.iter().filter(|e| e.fraction > 0.0 || e.finished).count();
+        let (mut psecs, mut pfrac) = (0.0f64, 0.0f64);
+        let mut per_book: Vec<(String, String, f64)> = Vec::new();
+        for e in &self.index.entries {
+            let Some((_, st)) = self.stats.get(&e.id) else { continue };
+            if st.seconds > 0.0 {
+                per_book.push((e.id.clone(), e.title.clone(), st.seconds));
+            }
+            let f = if e.finished { 1.0 } else { e.fraction as f64 };
+            if st.seconds >= 300.0 && f >= 0.05 {
+                psecs += st.seconds;
+                pfrac += f;
+            }
+        }
+        per_book.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let total = self.overview.total_secs;
+        ui.label(tag(trf!("{n} days of reading", n = sorted.len())).color(pal.muted));
+        ui.add_space(8.0);
+        ui::rule(ui);
+        let mut open = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.add_space(18.0);
+            let tiles = [
+                (tr("Time read"), fmt_dur(total)),
+                (tr("Current streak"), if current == 1 { trf!("{n} day", n = current) } else { trf!("{n} days", n = current) }),
+                (tr("Longest streak"), if longest == 1 { trf!("{n} day", n = longest) } else { trf!("{n} days", n = longest) }),
+                (tr("Books finished"), trf!("{done} of {started} started", done = finished, started = started)),
+                (tr("Average per day read"), if sorted.is_empty() { "-".into() } else { fmt_dur(total / sorted.len() as f64) }),
+                (tr("Pace per book"), if pfrac > 0.0 { trf!("about {time} per book", time = fmt_dur(psecs / pfrac)) } else { "-".into() }),
+                (tr("Highlights"), self.overview.notes.len().to_string()),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(36.0, 18.0);
+                for (k, v) in &tiles {
+                    ui.vertical(|ui| {
+                        ui.label(tag(*k).color(pal.muted));
+                        ui.label(RichText::new(v).font(ui_b(24.0)));
+                    });
+                }
+            });
+
+            // calendar heatmap: the last 26 weeks, one column per week, Monday on top
+            ui.add_space(30.0);
+            ui.label(tag(tr("Last six months")).color(pal.muted));
+            ui::rule(ui);
+            ui.add_space(8.0);
+            let (cell, gap, weeks) = (13.0f32, 3.0f32, 27usize);
+            let wd = (today + 3).rem_euclid(7);
+            let start = today - wd - (weeks as i64 - 1) * 7;
+            let (area, resp) = ui.allocate_exact_size(vec2(weeks as f32 * (cell + gap), 18.0 + 7.0 * (cell + gap)), Sense::hover());
+            let month = [tr("Jan"), tr("Feb"), tr("Mar"), tr("Apr"), tr("May"), tr("Jun"), tr("Jul"), tr("Aug"), tr("Sep"), tr("Oct"), tr("Nov"), tr("Dec")];
+            let origin = area.min + vec2(0.0, 18.0);
+            let mut last_month = 99usize;
+            for c in 0..weeks {
+                let date = store::date_string((start + c as i64 * 7) * 86400);
+                let m = date.get(5..7).and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
+                if m != last_month {
+                    last_month = m;
+                    ui.painter().text(pos2(origin.x + c as f32 * (cell + gap), area.top() + 6.0), egui::Align2::LEFT_CENTER, month[(m - 1).min(11)], mono(9.5), pal.muted);
+                }
+                for r in 0..7 {
+                    let day = start + c as i64 * 7 + r;
+                    if day > today {
+                        continue;
+                    }
+                    let secs = self.overview.daily.get(&store::date_string(day * 86400)).copied().unwrap_or(0.0);
+                    let col = if secs <= 0.0 {
+                        pal.hover
+                    } else {
+                        let a = match secs / 60.0 {
+                            m if m < 15.0 => 0.3,
+                            m if m < 30.0 => 0.55,
+                            m if m < 60.0 => 0.8,
+                            _ => 1.0,
+                        };
+                        ACCENT.linear_multiply(a)
+                    };
+                    let rect = Rect::from_min_size(origin + vec2(c as f32 * (cell + gap), r as f32 * (cell + gap)), vec2(cell, cell));
+                    ui.painter().rect_filled(rect, CornerRadius::same(2), col);
+                }
+            }
+            if let Some(p) = resp.hover_pos() {
+                let (x, y) = (p.x - origin.x, p.y - origin.y);
+                if x >= 0.0 && y >= 0.0 {
+                    let (c, r) = ((x / (cell + gap)) as i64, (y / (cell + gap)) as i64);
+                    let day = start + c * 7 + r;
+                    if c < weeks as i64 && r < 7 && day <= today {
+                        let date = store::date_string(day * 86400);
+                        let secs = self.overview.daily.get(&date).copied().unwrap_or(0.0);
+                        resp.on_hover_ui_at_pointer(|ui| {
+                            ui.label(format!("{date}: {}", if secs > 0.0 { fmt_dur(secs) } else { "no reading".into() }));
+                        });
+                    }
+                }
+            }
+
+            ui.add_space(30.0);
+            ui.label(tag(tr("Time per book")).color(pal.muted));
+            ui::rule(ui);
+            ui.add_space(8.0);
+            if per_book.is_empty() {
+                ui.label(RichText::new(tr("Reading time is recorded while you read.")).color(pal.muted));
+            }
+            let max = per_book.first().map(|b| b.2).unwrap_or(1.0).max(1.0);
+            for (id, title, secs) in per_book.iter().take(15) {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width().min(760.0), 26.0), Sense::click());
+                let frac = (*secs / max) as f32;
+                ui.painter().rect_filled(Rect::from_min_size(r.min + vec2(0.0, 22.0), vec2(r.width() * frac, 2.0)), CornerRadius::ZERO, if resp.hovered() { ACCENT } else { pal.fg });
+                ui.painter().with_clip_rect(Rect::from_min_max(r.min, pos2(r.right() - 90.0, r.bottom()))).text(pos2(r.left(), r.top() + 10.0), egui::Align2::LEFT_CENTER, title, ui_m(14.0), pal.fg);
+                ui.painter().text(pos2(r.right(), r.top() + 10.0), egui::Align2::RIGHT_CENTER, fmt_dur(*secs), mono(11.0), pal.muted);
+                if resp.clicked() {
+                    open = Some(id.clone());
+                }
+            }
+            ui.add_space(40.0);
+        });
+        if let Some(id) = open {
+            self.details = Some(id);
+        }
+    }
+
+    fn duplicates_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.label(display(tr("Duplicates"), 34.0));
+        ui.label(tag(trf!("{n} sets of repeated books", n = format!("{:03}", self.dups.len()))).color(pal.muted));
+        ui.add_space(8.0);
+        ui::rule(ui);
+        if self.dups.is_empty() {
+            ui.add_space(20.0);
+            ui.label(RichText::new(tr("No duplicates found.")).font(ui_m(17.0)).color(pal.muted));
+            return;
+        }
+        let mut remove: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (gi, g) in self.dups.iter().enumerate() {
+                ui.add_space(22.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{:02}", gi + 1)).font(ui_b(22.0)).color(ACCENT));
+                    ui.label(RichText::new(&g.items[0].title).font(ui_b(20.0)));
+                    ui.label(tag(tr(g.reason)).color(pal.muted));
+                });
+                for it in &g.items {
+                    ui.horizontal(|ui| {
+                        ui.add_space(34.0);
+                        ui.vertical(|ui| {
+                            ui.label(tag(format!("{} · {} · {}", it.format, library::fmt_size(it.size), it.author)).color(pal.muted));
+                            ui.add(egui::Label::new(RichText::new(&it.path).font(mono(10.5))).truncate());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if text_button(ui, tr("Remove from library"), false).clicked() {
+                                remove = Some(it.path.clone());
+                            }
+                            if text_button(ui, tr("Open folder"), false).clicked() {
+                                crate::platform::reveal(Path::new(&it.path));
+                            }
+                        });
+                    });
+                }
+            }
+            ui.add_space(40.0);
+        });
+        if let Some(p) = remove {
+            self.remove_path(&p);
+        }
+    }
+}
+
+fn chrono_hm() -> String {
+    let t = store::now() % 86400;
+    format!("{:02}:{:02} UTC", t / 3600, t % 3600 / 60)
 }
