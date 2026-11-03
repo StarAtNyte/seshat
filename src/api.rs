@@ -231,6 +231,21 @@ pub fn login_with_cookies(
     Ok(sess)
 }
 
+/// Daily download quota: (used today, daily limit).
+pub fn quota(sess: &Session, proxy: &Option<String>) -> Result<(u32, u32), String> {
+    let client = build_client(proxy, Some(Duration::from_secs(15)));
+    let num = |v: &Value| v.as_u64().or_else(|| vstr(v).parse().ok()).map(|n| n as u32);
+    for url in [format!("{}/eapi/user/profile", sess.domain), format!("{}/eapi/desktop-app/user-info/{}/{}", sess.domain, sess.user_id, sess.user_key)] {
+        let Ok(resp) = client.get(&url).header("Cookie", auth_header(sess)).send() else { continue };
+        let Ok(json) = resp.json::<Value>() else { continue };
+        let user = if json.get("user").is_some() { get(&json, "user") } else { &json };
+        if let (Some(used), Some(limit)) = (num(get(user, "downloads_today")), num(get(user, "downloads_limit"))) {
+            return Ok((used, limit));
+        }
+    }
+    Err("quota unavailable".into())
+}
+
 /// Create a new account. Triggers a confirmation code email.
 pub fn register(
     domain: &str,

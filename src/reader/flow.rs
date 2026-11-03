@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use super::layout::{Deco, DecoKind, SectionLayout, Typo};
+#[allow(unused_imports)]
+use super::layout::Item;
 use super::{deco_color, Env, Reader};
 use crate::book::{BlockKind, Loc};
 use crate::store::{HlStyle, Layout, ReaderSettings};
@@ -168,6 +170,12 @@ impl Reader {
             self.page -= self.page % self.step;
             if self.layout.as_ref().map(|l| l.section) != Some(si) || s.layout == Layout::Paginated {
                 self.scroll_y = (lay.y_of(self.loc.block, self.loc.offset) - 4.0).max(0.0);
+            }
+        }
+        // keep the previous chapter alive so a page can flip across the boundary
+        if let Some(old) = self.layout.take() {
+            if old.section != si {
+                self.prev_layout = Some(old);
             }
         }
         self.layout = Some(lay);
@@ -476,7 +484,9 @@ impl Reader {
         // opening: the cover swings away toward the spine
         let now = std::time::Instant::now();
         let open_t = if self.motion == 0 { self.opened_at.map(|t| (now - t).as_secs_f32() / 0.95).unwrap_or(0.0) } else { 1.0 };
-        let turn = self.turn.filter(|t| paginated && t.section == l.section && t.from != self.page);
+        let prev_ok = |t: &super::Turn| self.prev_layout.as_ref().is_some_and(|p| p.section == t.section);
+        let turn = self.turn.filter(|t| paginated && ((t.section == l.section && t.from != self.page) || (t.section != l.section && prev_ok(t))));
+        let cross = turn.is_some_and(|t| t.section != l.section);
         let dur = if self.motion == 0 { 0.55 } else { 0.22 };
         let turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
         let flip3d = self.motion == 0 && turn_t < 1.0;
@@ -494,20 +504,23 @@ impl Reader {
         let dim = s.dim_images && pal.dark;
         if paginated {
             // during a 3D flip, the side the leaf starts from still shows the old spread
-            let base: Vec<usize> = match (flip3d, turn) {
+            // (possibly from the previous chapter's layout)
+            let base: Vec<(bool, usize)> = match (flip3d, turn) {
                 (true, Some(t)) if g.cols == 2 => {
                     if t.dir > 0 {
-                        vec![t.from, self.page + 1]
+                        vec![(cross, t.from), (false, self.page + 1)]
                     } else {
-                        vec![self.page, t.from + 1]
+                        vec![(false, self.page), (cross, t.from + 1)]
                     }
                 }
-                (true, Some(t)) if t.dir < 0 => vec![t.from],
-                _ => (0..g.cols).map(|c| self.page + c).collect(),
+                (true, Some(t)) if t.dir < 0 => vec![(cross, t.from)],
+                _ => (0..g.cols).map(|c| (false, self.page + c)).collect(),
             };
-            for (col, pi) in base.into_iter().enumerate() {
-                if let Some(pg) = l.pages.get(pi) {
-                    l.paint(&text_painter, g.origin(col), pg.top, pg.bottom, &texfn, &decos, pal.fg, dim);
+            for (col, (old, pi)) in base.into_iter().enumerate() {
+                let lay = if old { self.prev_layout.as_ref().unwrap_or(l) } else { l };
+                let no_decos: Vec<Deco> = Vec::new();
+                if let Some(pg) = lay.pages.get(pi) {
+                    lay.paint(&text_painter, g.origin(col), pg.top, pg.bottom, &texfn, if old { &no_decos } else { &decos }, pal.fg, dim);
                 }
             }
         } else {
@@ -568,7 +581,7 @@ impl Reader {
 
         if flip3d {
             if let Some(t) = turn {
-                self.paint_flip(ui.ctx(), &painter, &g, pal, t, turn_t, dim);
+                self.paint_flip(ui.ctx(), &painter, &g, pal, t, turn_t, dim, cross);
             }
         }
         // simple motion: a sheet sweeping into the spine with a shadowed edge
@@ -643,8 +656,9 @@ impl Reader {
     }
 
     /// Tessellate one laid-out page into meshes (text + images) so it can be bent.
-    fn page_meshes(&self, ctx: &egui::Context, page: usize, origin: Pos2, fg: Color32, dim: bool) -> Vec<egui::Mesh> {
-        let Some(l) = &self.layout else { return Vec::new() };
+    fn page_meshes(&self, ctx: &egui::Context, from_prev: bool, page: usize, origin: Pos2, fg: Color32, dim: bool) -> Vec<egui::Mesh> {
+        let l = if from_prev { self.prev_layout.as_ref().or(self.layout.as_ref()) } else { self.layout.as_ref() };
+        let Some(l) = l else { return Vec::new() };
         let Some(pg) = l.pages.get(page) else { return Vec::new() };
         let (top, bottom) = (pg.top, pg.bottom);
         let clip = Rect::from_min_max(pos2(origin.x - 40.0, origin.y - 1.0), pos2(origin.x + l.width + 40.0, origin.y + (bottom - top) + 1.0));
@@ -688,7 +702,7 @@ impl Reader {
     /// A real page flip: the leaf rotates about the spine with perspective,
     /// carrying the old page's text on its front and the new page's on its back.
     #[allow(clippy::too_many_arguments)]
-    fn paint_flip(&self, ctx: &egui::Context, painter: &egui::Painter, g: &Geo, pal: &Palette, t: super::Turn, turn_t: f32, dim: bool) {
+    fn paint_flip(&self, ctx: &egui::Context, painter: &egui::Painter, g: &Geo, pal: &Palette, t: super::Turn, turn_t: f32, dim: bool, cross: bool) {
         let k = turn_t.clamp(0.0, 1.0);
         let k = k * k * (3.0 - 2.0 * k);
         let pi = std::f32::consts::PI;
@@ -733,6 +747,8 @@ impl Reader {
         let mid = local(0.5);
         let show_front = mid < pi / 2.0;
         let (page, origin, sheet) = if show_front { front } else { back.unwrap_or(front) };
+        // the front of the leaf is the old page (maybe last chapter); its back is new
+        let from_prev = show_front && cross && (two || t.dir > 0);
         // shadow the leaf throws onto the spread
         let edge_x = hinge + s0 * along(w);
         let (sx0, sx1) = if edge_x > hinge { (hinge, edge_x + 26.0 * theta.sin()) } else { (edge_x - 26.0 * theta.sin(), hinge) };
@@ -757,7 +773,7 @@ impl Reader {
         }
         painter.add(egui::Shape::mesh(paper));
         // the page's own text, bent with the paper
-        for mut m in self.page_meshes(ctx, page, origin, pal.fg, dim) {
+        for mut m in self.page_meshes(ctx, from_prev, page, origin, pal.fg, dim) {
             for v in &mut m.vertices {
                 let (p, th) = warp(v.pos);
                 v.pos = p;

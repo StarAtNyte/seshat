@@ -221,10 +221,17 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
+        self.open_path_with(path, true);
+    }
+
+    /// `shelve = false` opens a book (e.g. read online) without adding it to the library.
+    fn open_path_with(&mut self, path: &Path, shelve: bool) {
         if self.opening.is_some() {
             return;
         }
-        let in_lib = self.index.entries.iter().any(|e| Path::new(&e.path) == path);
+        let in_lib = !shelve || self.index.entries.iter().any(|e| Path::new(&e.path) == path);
+        let _ = in_lib;
+        let in_lib = !shelve || self.index.entries.iter().any(|e| Path::new(&e.path) == path);
         if !in_lib {
             let s = path.to_string_lossy().into_owned();
             if !self.settings.extra_files.contains(&s) && !self.settings.all_dirs().iter().any(|d| path.starts_with(d)) {
@@ -486,6 +493,9 @@ impl eframe::App for App {
         self.covers.poll();
         for _ in std::mem::take(&mut self.online.downloaded) {
             self.rescan();
+        }
+        if let Some(p) = self.online.read_now.take() {
+            self.open_path_with(&p, false);
         }
         for id in std::mem::take(&mut self.online.covers_updated) {
             if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {

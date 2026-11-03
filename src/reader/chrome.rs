@@ -1,13 +1,16 @@
-//! Reader window chrome: a custom title bar whose bottom edge is the book's
-//! progress, and a toolbar exposing every everyday control (layout, size,
-//! theme, highlighter, bookmark, listen, auto-advance, go-to, fullscreen).
+//! Reader window chrome. One row does everything: the window's identity on the
+//! left, reading controls in the middle, progress + window controls on the
+//! right. Its bottom edge doubles as the progress bar. Nothing floats over the
+//! page except in fullscreen, where the same row slides in on demand.
 
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Sense, Stroke};
 
 use super::{Action, Env, Reader, Side};
 use crate::book::{Content, Loc};
-use crate::store::{self, Columns, HlColor, Layout, ReaderSettings, Theme};
+use crate::store::{self, Columns, HlColor, Layout, ReaderSettings, THEMES};
 use crate::ui::{self, text_button, ui_b, ui_m, Icon, Palette, ACCENT};
+
+pub(super) const BAR_H: f32 = 52.0;
 
 impl Reader {
     pub fn viewport_id(&self) -> egui::ViewportId {
@@ -18,8 +21,8 @@ impl Reader {
         egui::ViewportBuilder::default()
             .with_title(format!("{} — {}", self.book.meta.title, crate::APP_NAME))
             .with_app_id("seshat")
-            .with_inner_size([1240.0, 860.0])
-            .with_min_inner_size([520.0, 420.0])
+            .with_inner_size([1280.0, 860.0])
+            .with_min_inner_size([560.0, 420.0])
             .with_decorations(false)
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(crate::logo::icon_data(128)))
@@ -35,48 +38,6 @@ impl Reader {
         }
     }
 
-    pub(super) fn title_bar(&mut self, ctx: &egui::Context, pal: &Palette, actions: &mut Vec<Action>) {
-        let desk = ui::desk(pal);
-        egui::TopBottomPanel::top("r-title").exact_height(48.0).show_separator_line(false).frame(egui::Frame::new().fill(desk).inner_margin(egui::Margin { left: 14, right: 10, top: 0, bottom: 0 })).show(ctx, |ui| {
-            let rect = ui.max_rect();
-            let drag = ui.interact(rect, ui.id().with("drag"), Sense::click_and_drag());
-            ui::titlebar_behaviour(ctx, &drag);
-            ui.horizontal_centered(|ui| {
-                if ui::icon_button(ui, Icon::Back, "Library (Esc)").clicked() {
-                    actions.push(Action::Close);
-                }
-                // tiny cover as the window's identity
-                let (cr, _) = ui.allocate_exact_size(vec2(22.0, 32.0), Sense::hover());
-                match self.cover_tex() {
-                    Some(id) => {
-                        ui.painter().image(id, cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    None => ui::paint_placeholder_cover(ui.painter(), cr, &self.book.meta.title, ""),
-                }
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(&self.book.meta.title).font(ui_b(15.0))).truncate());
-                    let chapter = self.chapter_title(self.cur());
-                    let sub = if chapter.is_empty() || chapter == self.book.meta.title { self.book.meta.author.clone() } else { chapter };
-                    ui.add(egui::Label::new(RichText::new(sub).font(ui_m(12.0)).color(pal.muted)).truncate());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui::window_controls(ui, pal.fg) {
-                        actions.push(Action::Close);
-                    }
-                    ui.add_space(10.0);
-                    let pct = (self.fraction() * 100.0).round();
-                    ui.label(RichText::new(format!("{pct}%")).font(ui_b(15.0)).color(ACCENT));
-                });
-            });
-            // the title bar's bottom edge is the progress bar
-            let f = ctx.animate_value_with_time(ui.id().with("prog"), self.fraction(), 0.35);
-            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, pal.border));
-            ui.painter().line_segment([pos2(rect.left(), rect.bottom() - 1.0), pos2(rect.left() + rect.width() * f, rect.bottom() - 1.0)], Stroke::new(3.0, ACCENT));
-        });
-    }
-
     pub(super) fn cur(&self) -> Loc {
         match &self.book.content {
             Content::Flow(_) => self.loc,
@@ -90,163 +51,243 @@ impl Reader {
         self.tex.get("__cover").map(|t| t.tex.id())
     }
 
-    pub(super) fn toolbar_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
+    pub(super) fn title_bar(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env, actions: &mut Vec<Action>) {
+        let desk = ui::desk(pal);
+        egui::TopBottomPanel::top("r-title").exact_height(BAR_H).show_separator_line(false).frame(egui::Frame::new().fill(desk).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 0 })).show(ctx, |ui| {
+            let rect = ui.max_rect();
+            let drag = ui.interact(rect, ui.id().with("drag"), Sense::click_and_drag());
+            ui::titlebar_behaviour(ctx, &drag);
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if ui::icon_button(ui, Icon::Back, "Library (Esc)").clicked() {
+                    actions.push(Action::Close);
+                }
+                let (cr, _) = ui.allocate_exact_size(vec2(22.0, 32.0), Sense::hover());
+                match self.cover_tex() {
+                    Some(id) => {
+                        ui.painter().image(id, cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    None => ui::paint_placeholder_cover(ui.painter(), cr, &self.book.meta.title, ""),
+                }
+                ui.add_space(6.0);
+                let title_w = (ui.available_width() - 840.0).clamp(90.0, 260.0);
+                ui.allocate_ui(vec2(title_w, BAR_H), |ui| {
+                    ui.set_width(title_w);
+                    ui.vertical(|ui| {
+                        ui.add_space(9.0);
+                        ui.add(egui::Label::new(RichText::new(&self.book.meta.title).font(ui_b(14.5))).truncate());
+                        let chapter = self.chapter_title(self.cur());
+                        let sub = if chapter.is_empty() || chapter == self.book.meta.title { self.book.meta.author.clone() } else { chapter };
+                        ui.add(egui::Label::new(RichText::new(sub).font(ui_m(11.5)).color(pal.muted)).truncate());
+                    });
+                });
+                sep(ui, pal);
+                self.tools_left(ui, ctx, s, pal, env);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if ui::window_controls(ui, pal.fg) {
+                        actions.push(Action::Close);
+                    }
+                    ui.add_space(6.0);
+                    let pct = (self.fraction() * 100.0).round();
+                    ui.label(RichText::new(format!("{pct}%")).font(ui_b(14.0)).color(ACCENT));
+                    sep(ui, pal);
+                    if ui::icon_toggle(ui, Icon::Fullscreen, "Fullscreen (F)", self.fullscreen).clicked() {
+                        self.toggle_fullscreen(ctx);
+                    }
+                    self.tools_right(ui, s, pal, env);
+                });
+            });
+            let f = ctx.animate_value_with_time(ui.id().with("prog"), self.fraction(), 0.35);
+            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, pal.border));
+            ui.painter().line_segment([pos2(rect.left(), rect.bottom() - 1.0), pos2(rect.left() + rect.width() * f, rect.bottom() - 1.0)], Stroke::new(3.0, ACCENT));
+        });
+    }
+
+    /// Navigation, layout, type size, theme.
+    fn tools_left(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
         let flow = self.book.flow().is_some();
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui::icon_toggle(ui, Icon::Menu, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
-                self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
-                self.toc_scroll = true;
-            }
-            if ui::icon_toggle(ui, Icon::Note, "Notebook (N)", self.notebook).clicked() {
-                self.notebook = !self.notebook;
-            }
-            if ui::icon_toggle(ui, Icon::Search, "Find in book (Ctrl+K)", self.side == Some(Side::Search)).clicked() {
-                self.side = Some(Side::Search);
-                self.focus_search = true;
-            }
-            if !self.history.is_empty() && ui::icon_button(ui, Icon::Undo, "Back to where you were (Backspace)").clicked() {
-                self.back();
+        if ui::icon_toggle(ui, Icon::Menu, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
+            self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
+            self.toc_scroll = true;
+        }
+        if ui::icon_toggle(ui, Icon::Search, "Find in book (Ctrl+K)", self.side == Some(Side::Search)).clicked() {
+            self.side = Some(Side::Search);
+            self.focus_search = true;
+        }
+        if ui::icon_toggle(ui, Icon::Note, "Notebook (N)", self.notebook).clicked() {
+            self.notebook = !self.notebook;
+            self.settings_open = false;
+        }
+        if !self.history.is_empty() && ui::icon_button(ui, Icon::Undo, "Back to where you were (Backspace)").clicked() {
+            self.back();
+        }
+        sep(ui, pal);
+        if flow {
+            let sel = match (s.layout, s.columns) {
+                (Layout::Scrolled, _) => 2,
+                (_, Columns::One) => 0,
+                _ => 1,
+            };
+            if let Some(i) = ui::segmented(ui, "layout", &["Page", "Spread", "Scroll"], sel) {
+                self.set(env, |s| match i {
+                    0 => {
+                        s.layout = Layout::Paginated;
+                        s.columns = Columns::One;
+                    }
+                    1 => {
+                        s.layout = Layout::Paginated;
+                        s.columns = Columns::Two;
+                    }
+                    _ => s.layout = Layout::Scrolled,
+                });
             }
             sep(ui, pal);
-            if flow {
-                let sel = match (s.layout, s.columns) {
-                    (Layout::Scrolled, _) => 2,
-                    (_, Columns::Two) => 1,
-                    (_, Columns::Auto) => 1,
-                    _ => 0,
-                };
-                if let Some(i) = ui::segmented(ui, "layout", &["Page", "Spread", "Scroll"], sel) {
-                    self.set(env, |s| match i {
-                        0 => {
-                            s.layout = Layout::Paginated;
-                            s.columns = Columns::One;
-                        }
-                        1 => {
-                            s.layout = Layout::Paginated;
-                            s.columns = Columns::Two;
-                        }
-                        _ => s.layout = Layout::Scrolled,
-                    });
-                }
-                sep(ui, pal);
-                if text_button(ui, "A−", false).on_hover_text("Smaller text (Ctrl −)").clicked() {
-                    self.set(env, |s| s.font_size = (s.font_size - 1.0).max(10.0));
-                }
-                ui.label(RichText::new(format!("{:.0}", s.font_size)).font(ui_m(13.0)).color(pal.muted));
-                if text_button(ui, "A+", false).on_hover_text("Larger text (Ctrl +)").clicked() {
-                    self.set(env, |s| s.font_size = (s.font_size + 1.0).min(48.0));
-                }
-                sep(ui, pal);
-            } else {
-                let z = self.fx.zoom as usize;
-                if let Some(i) = ui::segmented(ui, "zoom", &["Fit page", "Fit width"], z) {
-                    self.fx.zoom = i as u8;
-                    self.fx.scale = 1.0;
-                }
-                if ui::icon_button(ui, Icon::ZoomOut, "Zoom out").clicked() {
-                    self.fx.scale = (self.fx.scale / 1.15).max(0.3);
-                }
-                if ui::icon_button(ui, Icon::ZoomIn, "Zoom in").clicked() {
-                    self.fx.scale = (self.fx.scale * 1.15).min(5.0);
-                }
-                if text_button(ui, "RTL", self.fx.rtl).on_hover_text("Right-to-left page order (manga)").clicked() {
-                    self.fx.rtl = !self.fx.rtl;
-                }
-                sep(ui, pal);
+            if text_button(ui, "A−", false).on_hover_text("Smaller text (Ctrl −)").clicked() {
+                self.set(env, |s| s.font_size = (s.font_size - 1.0).max(10.0));
             }
-            for t in [Theme::Paper, Theme::Light, Theme::Sepia, Theme::Dark, Theme::Black] {
-                let p = ui::palette_for(t, s.custom_bg, s.custom_fg);
-                let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                let on = s.theme == t;
-                let k = ctx.animate_bool_with_time(resp.id, resp.hovered() || on, 0.12);
-                ui.painter().circle_filled(r.center(), 7.5 + 1.5 * k, p.bg);
-                ui.painter().circle_stroke(r.center(), 7.5 + 1.5 * k, Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { pal.border }));
-                if resp.on_hover_text(t.name()).clicked() {
-                    self.set(env, |s| s.theme = t);
-                }
+            ui.label(RichText::new(format!("{:.0}", s.font_size)).font(ui_m(13.0)).color(pal.muted));
+            if text_button(ui, "A+", false).on_hover_text("Larger text (Ctrl +)").clicked() {
+                self.set(env, |s| s.font_size = (s.font_size + 1.0).min(48.0));
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if ui::icon_toggle(ui, Icon::Fullscreen, "Fullscreen (F)", self.fullscreen).clicked() {
-                    self.toggle_fullscreen(ctx);
-                }
-                if text_button(ui, "Aa", self.settings_open).on_hover_text("All reading settings").clicked() {
-                    self.settings_open = !self.settings_open;
-                }
-                // go to: percent or page
-                let r = ui.add(egui::TextEdit::singleline(&mut self.goto_text).id(egui::Id::new("goto")).hint_text(if flow { "go to %" } else { "page" }).desired_width(64.0).margin(vec2(8.0, 5.0)));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Ok(v) = self.goto_text.trim().trim_end_matches('%').parse::<f32>() {
-                        let target = match &self.book.content {
-                            Content::Flow(f) => f.loc_at_fraction(v / 100.0),
-                            Content::Fixed(fx) => Loc::new((v.max(1.0) as usize - 1).min(fx.pages - 1), 0, 0),
-                        };
-                        self.jump(target, true);
-                    }
-                    self.goto_text.clear();
-                }
-                sep(ui, pal);
-                if text_button(ui, "Auto", self.auto).on_hover_text(if flow && s.layout == Layout::Scrolled { "Auto-scroll" } else { "Turn pages automatically" }).clicked() {
-                    self.auto = !self.auto;
-                    self.auto_last = std::time::Instant::now();
-                }
-                if flow {
-                    let playing = self.speaker.is_some();
-                    if ui::icon_toggle(ui, Icon::Speaker, "Read aloud", playing).clicked() {
-                        if playing {
-                            self.stop_tts();
-                        } else {
-                            self.start_tts(self.loc, env.app.tts_rate);
-                        }
-                    }
-                }
-                let bm = self.bookmark_here().is_some();
-                if ui::icon_toggle(ui, if bm { Icon::BookmarkOn } else { Icon::Bookmark }, "Bookmark this page (B)", bm).clicked() {
-                    self.toggle_bookmark();
-                }
-                if flow {
-                    // highlighter: when on, selecting text highlights it immediately
-                    if let Some(c) = self.hl_mode {
-                        for col in store::HL_COLORS.iter().rev() {
-                            let [r, g, b] = col.rgb();
-                            let (rr, resp) = ui.allocate_exact_size(vec2(14.0, 22.0), Sense::click());
-                            let on = *col == c;
-                            ui.painter().rect_filled(Rect::from_center_size(rr.center(), vec2(10.0, if on { 16.0 } else { 10.0 })), CornerRadius::same(3), Color32::from_rgb(r, g, b));
-                            if resp.clicked() {
-                                self.hl_mode = Some(*col);
-                            }
-                        }
-                    }
-                    if ui::icon_toggle(ui, Icon::Pen, "Highlighter: select text to highlight instantly (H)", self.hl_mode.is_some()).clicked() {
-                        self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };
+        } else {
+            let z = self.fx.zoom as usize;
+            if let Some(i) = ui::segmented(ui, "zoom", &["Fit page", "Fit width"], z) {
+                self.fx.zoom = i as u8;
+                self.fx.scale = 1.0;
+            }
+            if ui::icon_button(ui, Icon::ZoomOut, "Zoom out").clicked() {
+                self.fx.scale = (self.fx.scale / 1.15).max(0.3);
+            }
+            if ui::icon_button(ui, Icon::ZoomIn, "Zoom in").clicked() {
+                self.fx.scale = (self.fx.scale * 1.15).min(5.0);
+            }
+            if text_button(ui, "RTL", self.fx.rtl).on_hover_text("Right-to-left page order (manga)").clicked() {
+                self.fx.rtl = !self.fx.rtl;
+            }
+        }
+        sep(ui, pal);
+        // theme: one swatch; every theme in a small popover
+        let p = ui::palette_for(s.theme, s.custom_bg, s.custom_fg);
+        let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+        let k = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+        ui.painter().circle_filled(r.center(), 8.5 + 1.5 * k, p.bg);
+        ui.painter().circle_stroke(r.center(), 8.5 + 1.5 * k, Stroke::new(1.5, pal.border.lerp_to_gamma(ACCENT, k)));
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "a", ui_m(10.0), p.fg);
+        let pid = ui.make_persistent_id("theme-pop");
+        let resp = resp.on_hover_text("Theme");
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(pid));
+        }
+        egui::popup_below_widget(ui, pid, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.horizontal(|ui| {
+                for t in THEMES {
+                    let p = ui::palette_for(*t, s.custom_bg, s.custom_fg);
+                    let (r, resp) = ui.allocate_exact_size(vec2(40.0, 46.0), Sense::click());
+                    let c = r.center() - vec2(0.0, 7.0);
+                    ui.painter().circle_filled(c, 12.0, p.bg);
+                    ui.painter().circle_stroke(c, 12.0, Stroke::new(if s.theme == *t { 2.0 } else { 1.0 }, if s.theme == *t { ACCENT } else { pal.border }));
+                    ui.painter().text(c, egui::Align2::CENTER_CENTER, "a", ui_m(11.0), p.fg);
+                    ui.painter().text(pos2(c.x, r.bottom() - 6.0), egui::Align2::CENTER_CENTER, t.name(), ui_m(9.5), pal.muted);
+                    if resp.clicked() {
+                        self.set(env, |s| s.theme = *t);
                     }
                 }
             });
         });
     }
 
-    /// The toolbar floats over the book (no reflow) and slides in on demand:
-    /// pointer near the top, T, a click in the page centre, or while a panel is open.
+    /// Reading modes and the rest (laid out right-to-left).
+    fn tools_right(&mut self, ui: &mut egui::Ui, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
+        let flow = self.book.flow().is_some();
+        if text_button(ui, "Aa", self.settings_open).on_hover_text("All reading settings").clicked() {
+            self.settings_open = !self.settings_open;
+            if self.settings_open {
+                self.notebook = false;
+            }
+        }
+        // page-turn motion, right where you'd look for it
+        let label = ["Flip: Full", "Flip: Simple", "Flip: Off"][s.motion.min(2) as usize];
+        let r = text_button(ui, label, false).on_hover_text("Page-turn motion");
+        let pid = ui.make_persistent_id("motion-pop");
+        if r.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(pid));
+        }
+        egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(230.0);
+            for (i, (name, desc)) in [("Full", "Cover opens, pages curl over the spine"), ("Simple", "A quick fade between pages"), ("Off", "Pages change instantly")].iter().enumerate() {
+                let on = s.motion as usize == i;
+                let resp = ui.add(egui::SelectableLabel::new(on, RichText::new(format!("{name}\n{desc}")).font(ui_m(12.5))));
+                if resp.clicked() {
+                    self.set(env, |s| s.motion = i as u8);
+                }
+            }
+        });
+        sep(ui, pal);
+        if text_button(ui, "Auto", self.auto).on_hover_text(if flow && s.layout == Layout::Scrolled { "Auto-scroll (A)" } else { "Turn pages automatically (A)" }).clicked() {
+            self.auto = !self.auto;
+            self.auto_last = std::time::Instant::now();
+        }
+        if flow {
+            let playing = self.speaker.is_some();
+            if ui::icon_toggle(ui, Icon::Speaker, "Read aloud", playing).clicked() {
+                if playing {
+                    self.stop_tts();
+                } else {
+                    self.start_tts(self.loc, env.app.tts_rate);
+                }
+            }
+        }
+        let bm = self.bookmark_here().is_some();
+        if ui::icon_toggle(ui, if bm { Icon::BookmarkOn } else { Icon::Bookmark }, "Bookmark this page (B)", bm).clicked() {
+            self.toggle_bookmark();
+        }
+        if flow {
+            if let Some(c) = self.hl_mode {
+                for col in store::HL_COLORS.iter().rev() {
+                    let [r, g, b] = col.rgb();
+                    let (rr, resp) = ui.allocate_exact_size(vec2(12.0, 22.0), Sense::click());
+                    let on = *col == c;
+                    ui.painter().rect_filled(Rect::from_center_size(rr.center(), vec2(9.0, if on { 16.0 } else { 9.0 })), CornerRadius::same(3), Color32::from_rgb(r, g, b));
+                    if resp.clicked() {
+                        self.hl_mode = Some(*col);
+                    }
+                }
+            }
+            if ui::icon_toggle(ui, Icon::Pen, "Highlighter: selections become highlights (H)", self.hl_mode.is_some()).clicked() {
+                self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };
+            }
+        }
+    }
+
+    /// Fullscreen only: the same row slides in when the pointer nears the top.
     pub(super) fn floating_toolbar(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
-        let top = if self.fullscreen { 0.0 } else { 48.0 };
-        let left = ctx.available_rect().left();
-        let near = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < top + 56.0 && p.x >= left);
-        let held = ctx.memory(|m| m.focused().is_some_and(|f| f == egui::Id::new("goto")));
-        let want = near || self.tools || self.settings_open || held;
-        let t = ctx.animate_bool_with_time(egui::Id::new("float-tools"), want, 0.2);
+        if !self.fullscreen {
+            return;
+        }
+        let near = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < 64.0);
+        let t = ctx.animate_bool_with_time(egui::Id::new("float-tools"), near || self.tools || self.settings_open, 0.2);
         if t < 0.01 {
             return;
         }
-        let w = ctx.screen_rect().width() - left;
-        egui::Area::new("float-tools".into()).fixed_pos(pos2(left, top - 44.0 * (1.0 - super::ease(t)))).order(egui::Order::Foreground).show(ctx, |ui| {
-            ui.set_clip_rect(egui::Rect::from_min_max(pos2(left, top), pos2(left + w, top + 46.0)));
+        let w = ctx.screen_rect().width();
+        egui::Area::new("float-tools".into()).fixed_pos(pos2(0.0, -BAR_H * (1.0 - super::ease(t)))).order(egui::Order::Foreground).show(ctx, |ui| {
             ui.multiply_opacity(t);
             egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
                 ui.set_width(w - 24.0);
-                ui.set_height(44.0);
-                self.toolbar_contents(ui, ctx, s, pal, env);
+                ui.set_height(BAR_H);
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    self.tools_left(ui, ctx, s, pal, env);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if text_button(ui, "Exit fullscreen", false).clicked() {
+                            self.toggle_fullscreen(ctx);
+                        }
+                        sep(ui, pal);
+                        self.tools_right(ui, s, pal, env);
+                    });
+                });
             });
             let r = ui.min_rect();
             ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0, pal.border));
@@ -276,11 +317,27 @@ impl Reader {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
+
+    /// Go to a percentage (or page, for PDFs/comics).
+    pub(super) fn goto_field(&mut self, ui: &mut egui::Ui) {
+        let flow = self.book.flow().is_some();
+        let r = ui.add(egui::TextEdit::singleline(&mut self.goto_text).id(egui::Id::new("goto")).hint_text(if flow { "go to %" } else { "page" }).desired_width(64.0).margin(vec2(8.0, 4.0)));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Ok(v) = self.goto_text.trim().trim_end_matches('%').parse::<f32>() {
+                let target = match &self.book.content {
+                    Content::Flow(f) => f.loc_at_fraction(v / 100.0),
+                    Content::Fixed(fx) => Loc::new((v.max(1.0) as usize - 1).min(fx.pages - 1), 0, 0),
+                };
+                self.jump(target, true);
+            }
+            self.goto_text.clear();
+        }
+    }
 }
 
 fn sep(ui: &mut egui::Ui, pal: &Palette) {
-    ui.add_space(6.0);
-    let (r, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
+    ui.add_space(4.0);
+    let (r, _) = ui.allocate_exact_size(vec2(1.0, 18.0), Sense::hover());
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, pal.border));
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }

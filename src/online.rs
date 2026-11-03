@@ -22,6 +22,7 @@ enum Msg {
     DlDone(Result<(String, PathBuf), String>),
     Quiet(u64, Result<api::SearchPage, String>),
     CoverFetched(String, bool),
+    Quota(Result<(u32, u32), String>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -76,6 +77,13 @@ pub struct Online {
     pub covers_updated: Vec<String>,
     pub recent: Vec<(String, PathBuf)>,
     covers: TexLoader,
+    quota: Option<(u32, u32)>,
+    refresh_quota_after: bool,
+    quota_asked: bool,
+    dl_started: std::time::Instant,
+    dl_temp: bool,
+    /// A book fetched with “Read online”, ready to open without shelving it.
+    pub read_now: Option<PathBuf>,
     quiet_q: String,
     quiet_sent: String,
     quiet_changed: std::time::Instant,
@@ -124,6 +132,12 @@ impl Online {
             covers_updated: Vec::new(),
             recent: Vec::new(),
             covers: TexLoader::new(ctx, 3),
+            quota: None,
+            refresh_quota_after: false,
+            quota_asked: false,
+            dl_started: std::time::Instant::now(),
+            dl_temp: false,
+            read_now: None,
             quiet_q: String::new(),
             quiet_sent: String::new(),
             quiet_changed: std::time::Instant::now(),
@@ -264,6 +278,7 @@ impl Online {
                         d.2 = t;
                     }
                 }
+                Msg::Quota(r) => self.quota = r.ok(),
                 Msg::CoverFetched(id, ok) => {
                     if ok {
                         self.covers_updated.push(id);
@@ -282,8 +297,13 @@ impl Online {
                     match r {
                         Ok((title, p)) => {
                             self.dl_error.clear();
-                            self.downloaded.push((title.clone(), p.clone()));
-                            self.recent.insert(0, (title, p));
+                            if self.dl_temp {
+                                self.read_now = Some(p);
+                            } else {
+                                self.downloaded.push((title.clone(), p.clone()));
+                                self.recent.insert(0, (title, p));
+                            }
+                            self.refresh_quota_after = true;
                         }
                         Err(e) => self.dl_error = e,
                     }
@@ -333,14 +353,16 @@ impl Online {
         self.spawn(move || Msg::DetailsDone(api::book_details(&sess, &proxy, &id, &hash)));
     }
 
-    fn do_download(&mut self, book: api::Book, app: &AppSettings) {
+    fn do_download(&mut self, book: api::Book, app: &AppSettings, temp: bool) {
         if self.active_dl.is_some() {
             return;
         }
         let Some(sess) = self.session.clone() else { return };
         self.dl_error.clear();
+        self.dl_temp = temp;
+        self.dl_started = std::time::Instant::now();
         let proxy = app.proxy_opt();
-        let dest = PathBuf::from(&app.download_dir);
+        let dest = if temp { store::cache_dir().join("online") } else { PathBuf::from(&app.download_dir) };
         let title = book.title.clone();
         self.active_dl = Some((title.clone(), 0, None));
         let tx = self.tx.clone();
@@ -358,7 +380,9 @@ impl Online {
             });
             if let Ok(p) = &res {
                 // carry the catalogue's cover and metadata over to the library
-                attach_catalogue_data(p, &book, &proxy);
+                if !temp {
+                    attach_catalogue_data(p, &book, &proxy);
+                }
             }
             let _ = tx.send(Msg::DlDone(res.map(|p| (title, p))));
             ctx.request_repaint();
@@ -390,10 +414,39 @@ impl Online {
         self.session.is_some()
     }
 
+    fn fetch_quota(&mut self, app: &AppSettings) {
+        if let Some(sess) = self.session.clone() {
+            let proxy = app.proxy_opt();
+            self.spawn(move || Msg::Quota(api::quota(&sess, &proxy)));
+        }
+    }
+
+    /// Ten little squares: today's downloads used vs. left.
+    pub fn quota_ui(&self, ui: &mut egui::Ui, pal: &Palette) {
+        let Some((used, limit)) = self.quota else { return };
+        let limit = limit.max(1);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} of {} left today", limit.saturating_sub(used), limit)).font(ui::ui_m(12.0)).color(pal.muted));
+        });
+        let n = limit.min(20);
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width().min(n as f32 * 12.0), 10.0), Sense::hover());
+        let w = r.width() / n as f32;
+        for i in 0..n {
+            let cell = egui::Rect::from_min_size(egui::pos2(r.left() + i as f32 * w, r.top()), vec2(w - 3.0, 8.0));
+            let filled = (i as f32) < used as f32 * n as f32 / limit as f32;
+            ui.painter().rect_filled(cell, CornerRadius::same(2), if filled { pal.border } else { ui::ACCENT });
+        }
+        ui.add_space(4.0);
+    }
+
     /// Background tick for the quiet library-search integration.
     pub fn tick(&mut self, query: &str, app: &AppSettings) {
         self.drain();
         self.covers.poll();
+        if self.session.is_some() && (self.quota.is_none() && !self.quota_asked || std::mem::take(&mut self.refresh_quota_after)) {
+            self.quota_asked = true;
+            self.fetch_quota(app);
+        }
         let q = query.trim();
         if q != self.quiet_q {
             self.quiet_q = q.to_string();
@@ -509,16 +562,13 @@ impl Online {
     /// Download status block for the navigation sidebar.
     pub fn downloads_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<PathBuf> {
         let mut open = None;
+        if self.session.is_some() {
+            self.quota_ui(ui, pal);
+        }
         if let Some((t, w, total)) = &self.active_dl {
-            ui.label(ui::tag("Downloading").color(ui::ACCENT));
+            ui.label(RichText::new(if self.dl_temp { "Opening online" } else { "Downloading" }).font(ui::ui_m(12.0)).color(ui::ACCENT));
             ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
-            let frac = total.map(|t| *w as f32 / t.max(1) as f32).unwrap_or(0.0);
-            let r = ui.available_rect_before_wrap();
-            let bar = egui::Rect::from_min_size(r.min, vec2(r.width(), 2.0));
-            ui.painter().rect_filled(bar, CornerRadius::ZERO, pal.border);
-            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, 2.0)), CornerRadius::ZERO, ui::ACCENT);
-            ui.add_space(6.0);
-            ui.label(ui::tag(format!("{:.1} MB", *w as f64 / 1_048_576.0)).color(pal.muted));
+            self.progress_bar(ui, pal, *w, *total);
         }
         if !self.dl_error.is_empty() {
             ui.label(RichText::new(&self.dl_error).size(11.5).color(ui::ACCENT));
@@ -531,6 +581,24 @@ impl Online {
             }
         }
         open
+    }
+
+    fn progress_bar(&self, ui: &mut egui::Ui, pal: &Palette, w: u64, total: Option<u64>) {
+        let frac = total.map(|t| w as f32 / t.max(1) as f32).unwrap_or(0.0).clamp(0.0, 1.0);
+        let r = ui.available_rect_before_wrap();
+        let bar = egui::Rect::from_min_size(r.min + vec2(0.0, 2.0), vec2(r.width(), 6.0));
+        ui.painter().rect_filled(bar, CornerRadius::same(3), pal.border);
+        let shown = ui.ctx().animate_value_with_time(egui::Id::new("dl-frac"), frac, 0.25);
+        ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * shown, 6.0)), CornerRadius::same(3), ui::ACCENT);
+        ui.add_space(12.0);
+        let secs = self.dl_started.elapsed().as_secs_f64().max(0.1);
+        let speed = w as f64 / secs / 1_048_576.0;
+        let size = match total {
+            Some(t) => format!("{:.1} of {:.1} MB · {:.0}%", w as f64 / 1_048_576.0, t as f64 / 1_048_576.0, frac * 100.0),
+            None => format!("{:.1} MB", w as f64 / 1_048_576.0),
+        };
+        ui.label(RichText::new(format!("{size} · {speed:.1} MB/s")).font(ui::ui_m(11.5)).color(pal.muted));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
 
     pub fn ui(&mut self, ctx: &egui::Context, app: &mut AppSettings, pal: &Palette) -> Option<PathBuf> {
@@ -819,9 +887,18 @@ impl Online {
                 }
                 Some(Ok(d)) => {
                     let d = d.clone();
-                    let busy = self.active_dl.is_some();
-                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("⬇  Download to library").color(Color32::WHITE).strong()).fill(ui::ACCENT).min_size(vec2(ui.available_width(), 34.0))).clicked() {
-                        self.do_download(d.clone(), app);
+                    self.quota_ui(ui, pal);
+                    if let Some((_, w, total)) = self.active_dl.clone() {
+                        self.progress_bar(ui, pal, w, total);
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui::primary_button(ui, "Add to library").clicked() {
+                                self.do_download(d.clone(), app, false);
+                            }
+                            if ui::text_button(ui, "Read online", false).on_hover_text("Opens it straight away without shelving it. Uses one download from today's quota.").clicked() {
+                                self.do_download(d.clone(), app, true);
+                            }
+                        });
                     }
                     if !d.description.is_empty() {
                         ui.add_space(10.0);

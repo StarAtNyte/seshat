@@ -88,6 +88,7 @@ pub struct Reader {
     // flow state
     pub loc: Loc,
     layout: Option<SectionLayout>,
+    prev_layout: Option<SectionLayout>,
     page: usize,
     scroll_y: f32,
     overscroll: f32,
@@ -193,6 +194,7 @@ impl Reader {
             last_save: Instant::now(),
             loc,
             layout: None,
+            prev_layout: None,
             page: 0,
             scroll_y: 0.0,
             overscroll: 0.0,
@@ -751,7 +753,7 @@ impl Reader {
         self.tick_auto(ctx, &s);
 
         if !self.fullscreen {
-            self.title_bar(ctx, &pal, &mut actions);
+            self.title_bar(ctx, &s, &pal, env, &mut actions);
             if let Some(side) = self.side {
                 panels::sidebar(self, ctx, side, &pal, env);
             }
@@ -986,7 +988,7 @@ impl Reader {
                     if ui::text_button(ui, "← Ch", false).on_hover_text("Previous chapter").clicked() {
                         self.chapter_step(-1);
                     }
-                    let info_w = 300.0;
+                    let info_w = 300.0 + 80.0;
                     let mut f = frac * 100.0;
                     ui.spacing_mut().slider_width = (ui.available_width() - info_w - 70.0).max(80.0);
                     let r = ui.add(egui::Slider::new(&mut f, 0.0..=100.0).show_value(false).trailing_fill(true));
@@ -1003,6 +1005,7 @@ impl Reader {
                     if ui::text_button(ui, "Ch →", false).on_hover_text("Next chapter").clicked() {
                         self.chapter_step(1);
                     }
+                    self.goto_field(ui);
                     ui.add_sized(vec2(info_w, 20.0), egui::Label::new(RichText::new(info.to_uppercase()).font(ui::mono(10.5)).color(pal.muted)).truncate());
                 });
             });
