@@ -8,7 +8,7 @@ use eframe::egui::{self, vec2, Color32, CornerRadius, RichText, Sense};
 use crate::api;
 use crate::store::{self, AppSettings};
 use crate::texload::{Src, TexLoader};
-use crate::ui::{self, chip, Palette};
+use crate::ui::{self, Palette};
 
 enum Msg {
     ProbeDone(Vec<(String, bool)>, Option<String>),
@@ -20,6 +20,7 @@ enum Msg {
     DetailsDone(Result<api::Book, String>),
     DlProgress(u64, Option<u64>),
     DlDone(Result<(String, PathBuf), String>),
+    Quiet(u64, Result<api::SearchPage, String>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -72,6 +73,12 @@ pub struct Online {
     pub downloaded: Vec<(String, PathBuf)>,
     pub recent: Vec<(String, PathBuf)>,
     covers: TexLoader,
+    quiet_q: String,
+    quiet_sent: String,
+    quiet_changed: std::time::Instant,
+    quiet_gen: u64,
+    quiet_busy: bool,
+    quiet: Option<Result<Vec<api::Book>, String>>,
 }
 
 impl Online {
@@ -113,6 +120,12 @@ impl Online {
             downloaded: Vec::new(),
             recent: Vec::new(),
             covers: TexLoader::new(ctx, 3),
+            quiet_q: String::new(),
+            quiet_sent: String::new(),
+            quiet_changed: std::time::Instant::now(),
+            quiet_gen: 0,
+            quiet_busy: false,
+            quiet: None,
         }
     }
 
@@ -247,6 +260,12 @@ impl Online {
                         d.2 = t;
                     }
                 }
+                Msg::Quiet(gen, r) => {
+                    if gen == self.quiet_gen {
+                        self.quiet_busy = false;
+                        self.quiet = Some(r.map(|p| p.books));
+                    }
+                }
                 Msg::DlDone(r) => {
                     self.active_dl = None;
                     match r {
@@ -331,44 +350,162 @@ impl Online {
         });
     }
 
+    pub fn connected(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Background tick for the quiet library-search integration.
+    pub fn tick(&mut self, query: &str, app: &AppSettings) {
+        self.drain();
+        self.covers.poll();
+        let q = query.trim();
+        if q != self.quiet_q {
+            self.quiet_q = q.to_string();
+            self.quiet_changed = std::time::Instant::now();
+        }
+        if !app.zlib_enabled || self.session.is_none() || q.chars().count() < 3 {
+            if q.chars().count() < 3 {
+                self.quiet = None;
+                self.quiet_sent.clear();
+            }
+            return;
+        }
+        if q != self.quiet_sent {
+            let idle = self.quiet_changed.elapsed();
+            if idle < std::time::Duration::from_millis(650) {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(700) - idle);
+                return;
+            }
+            self.quiet_sent = q.to_string();
+            self.quiet_gen += 1;
+            self.quiet_busy = true;
+            let (gen, sess, proxy, q2) = (self.quiet_gen, self.session.clone().unwrap(), app.proxy_opt(), q.to_string());
+            self.spawn(move || Msg::Quiet(gen, api::search(&sess, &proxy, &q2, 1, &api::Filters::default())));
+        }
+    }
+
+    /// Compact "elsewhere" strip under local search results.
+    pub fn quiet_strip(&mut self, ui: &mut egui::Ui, pal: &Palette, app: &AppSettings) -> bool {
+        if !app.zlib_enabled || self.quiet_q.chars().count() < 3 {
+            return false;
+        }
+        let mut go_source = false;
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(ui::tag("Elsewhere — Z-Library").color(pal.muted));
+            if self.session.is_none() {
+                if ui::text_button(ui, "Connect source →", false).clicked() {
+                    go_source = true;
+                }
+                return;
+            }
+            if self.quiet_busy {
+                ui.spinner();
+            } else if let Some(Ok(b)) = &self.quiet {
+                ui.label(ui::tag(format!("{:02} results", b.len())).color(pal.muted));
+            }
+            if ui::text_button(ui, "Open in source →", false).clicked() {
+                self.query = self.quiet_q.clone();
+                go_source = true;
+            }
+        });
+        ui::rule(ui);
+        ui.add_space(8.0);
+        let books = match &self.quiet {
+            Some(Ok(b)) => b.clone(),
+            Some(Err(e)) => {
+                ui.label(RichText::new(e).color(pal.muted).size(12.0));
+                return go_source;
+            }
+            None => return go_source,
+        };
+        let proxy = app.proxy_opt();
+        egui::ScrollArea::horizontal().id_salt("quiet").show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for (i, b) in books.iter().take(14).enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(112.0, 236.0), Sense::click());
+                    let cover = egui::Rect::from_min_size(rect.min + vec2(0.0, if resp.hovered() { -3.0 } else { 0.0 }), vec2(112.0, 166.0));
+                    let key = format!("zl:{}", b.id);
+                    if !b.cover.is_empty() && ui.is_rect_visible(rect) {
+                        let (url, px) = (b.cover.clone(), proxy.clone());
+                        self.covers.request(&key, || Some(Src::Url { url, proxy: px }), 320);
+                    }
+                    match self.covers.get(&key) {
+                        Some(t) => {
+                            ui.painter().image(t.tex.id(), cover, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        None => ui::paint_placeholder_cover(ui.painter(), cover, &b.title, &b.author),
+                    }
+                    if resp.hovered() {
+                        let strip = egui::Rect::from_min_max(egui::pos2(cover.left(), cover.bottom() - 22.0), cover.max);
+                        ui.painter().rect_filled(strip, CornerRadius::ZERO, ui::INK);
+                        ui.painter().text(strip.left_center() + vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, "+ GET", ui::mono_m(10.5), ui::PAPER);
+                    }
+                    let y = cover.bottom() + 8.0;
+                    ui.painter().text(egui::pos2(rect.left(), y), egui::Align2::LEFT_TOP, format!("Z{:02} — {}", i + 1, b.extension.to_uppercase()), ui::mono(9.5), pal.muted);
+                    let mut job = egui::text::LayoutJob::simple(b.title.clone(), ui::ui_m(12.5), pal.fg, 112.0);
+                    job.wrap.max_rows = 2;
+                    job.wrap.overflow_character = Some('…');
+                    let g = ui.painter().layout_job(job);
+                    let th = g.size().y;
+                    ui.painter().galley(egui::pos2(rect.left(), y + 15.0), g, pal.fg);
+                    ui.painter().text(egui::pos2(rect.left(), y + 18.0 + th), egui::Align2::LEFT_TOP, trunc(&b.author, 18), ui::mono(9.5), pal.muted);
+                    if resp.clicked() {
+                        self.fetch_details(b, app);
+                    }
+                    ui.add_space(14.0);
+                }
+            });
+        });
+        go_source
+    }
+
+    /// Right-hand details/download pane, shown wherever the plugin is surfaced.
+    pub fn side_details(&mut self, ctx: &egui::Context, app: &mut AppSettings, pal: &Palette) {
+        if self.selected.is_none() {
+            return;
+        }
+        egui::SidePanel::right("zl-details").resizable(false).exact_width(320.0).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::same(18)).stroke(egui::Stroke::new(1.0, pal.border))).show(ctx, |ui| {
+            self.ui_details(ui, app, pal);
+        });
+    }
+
+    /// Download status block for the navigation sidebar.
+    pub fn downloads_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<PathBuf> {
+        let mut open = None;
+        if let Some((t, w, total)) = &self.active_dl {
+            ui.label(ui::tag("Downloading").color(ui::ACCENT));
+            ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
+            let frac = total.map(|t| *w as f32 / t.max(1) as f32).unwrap_or(0.0);
+            let r = ui.available_rect_before_wrap();
+            let bar = egui::Rect::from_min_size(r.min, vec2(r.width(), 2.0));
+            ui.painter().rect_filled(bar, CornerRadius::ZERO, pal.border);
+            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, 2.0)), CornerRadius::ZERO, ui::ACCENT);
+            ui.add_space(6.0);
+            ui.label(ui::tag(format!("{:.1} MB", *w as f64 / 1_048_576.0)).color(pal.muted));
+        }
+        if !self.dl_error.is_empty() {
+            ui.label(RichText::new(&self.dl_error).size(11.5).color(ui::ACCENT));
+        }
+        if let Some((t, p)) = self.recent.first() {
+            ui.label(ui::tag("Downloaded").color(pal.muted));
+            ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
+            if ui::text_button(ui, "Read now →", false).clicked() {
+                open = Some(p.clone());
+            }
+        }
+        open
+    }
+
     pub fn ui(&mut self, ctx: &egui::Context, app: &mut AppSettings, pal: &Palette) -> Option<PathBuf> {
         self.start(app);
         self.drain();
         self.covers.poll();
-        let mut open = None;
-        if self.screen == Screen::Search && self.selected.is_some() {
-            egui::SidePanel::right("zl-details").resizable(true).default_width(360.0).frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::same(14))).show(ctx, |ui| {
-                self.ui_details(ui, app, pal);
-            });
+        let open = None;
+        if self.screen == Screen::Search {
+            self.side_details(ctx, app, pal);
         }
-        if self.active_dl.is_some() || !self.dl_error.is_empty() || !self.recent.is_empty() {
-            egui::TopBottomPanel::bottom("zl-dl").frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::symmetric(14, 8))).show(ctx, |ui| {
-                if let Some((t, w, total)) = &self.active_dl {
-                    ui.horizontal(|ui| {
-                        ui.label("Downloading");
-                        ui.strong(t);
-                        let frac = total.map(|t| *w as f32 / t.max(1) as f32).unwrap_or(0.0);
-                        ui.add(egui::ProgressBar::new(frac).desired_width(260.0).text(format!("{:.1} MB", *w as f64 / 1_048_576.0)));
-                    });
-                }
-                if !self.dl_error.is_empty() {
-                    ui.colored_label(Color32::from_rgb(220, 70, 60), &self.dl_error);
-                }
-                for (t, p) in self.recent.iter().take(3) {
-                    ui.horizontal(|ui| {
-                        ui.label("✓");
-                        ui.label(RichText::new(t).strong());
-                        if ui::primary_button(ui, "Read now").clicked() {
-                            open = Some(p.clone());
-                        }
-                        if ui.small_button("Show in folder").clicked() {
-                            crate::platform::reveal(p);
-                        }
-                    });
-                }
-            });
-        }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(20, 14))).show(ctx, |ui| match self.screen {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 36, right: 28, top: 26, bottom: 10 })).show(ctx, |ui| match self.screen {
             Screen::Connecting => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
@@ -395,13 +532,14 @@ impl Online {
         ui.vertical_centered(|ui| {
             ui.set_max_width(440.0);
             ui.add_space(30.0);
-            ui.heading("Connect to Z-Library");
+            ui.label(ui::tag("Source / plugin").color(ui.visuals().weak_text_color()));
+            ui.label(ui::display("Connect Z-Library", 34.0));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if chip(ui, self.auth_mode == AuthMode::SignIn, "Sign in").clicked() {
+                if ui::text_button(ui, "Sign in", self.auth_mode == AuthMode::SignIn).clicked() {
                     self.auth_mode = AuthMode::SignIn;
                 }
-                if chip(ui, self.auth_mode == AuthMode::Register, "Create account").clicked() {
+                if ui::text_button(ui, "Create account", self.auth_mode == AuthMode::Register).clicked() {
                     self.auth_mode = AuthMode::Register;
                 }
                 if ui.small_button("Rescan mirrors").clicked() {
@@ -499,6 +637,9 @@ impl Online {
     }
 
     fn ui_search(&mut self, ui: &mut egui::Ui, app: &mut AppSettings, pal: &Palette) {
+        ui.label(ui::tag("Source / plugin").color(pal.muted));
+        ui.label(ui::display("Z-Library", 40.0));
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search Z-Library — title, author, ISBN…").desired_width(ui.available_width() - 110.0).margin(vec2(10.0, 7.0)));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));

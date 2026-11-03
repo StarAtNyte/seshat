@@ -186,7 +186,7 @@ pub struct ReaderSettings {
 impl Default for ReaderSettings {
     fn default() -> Self {
         ReaderSettings {
-            theme: Theme::Light,
+            theme: Theme::Paper,
             custom_bg: [250, 246, 236],
             custom_fg: [40, 36, 30],
             font: String::new(),
@@ -264,6 +264,11 @@ pub struct AppSettings {
     pub translate_to: String,
     pub tts_rate: f32,
     pub reading_speed_cpm: f32,
+    /// Z-Library source plugin: blend results into library search.
+    pub zlib_enabled: bool,
+    pub right_panel: bool,
+    /// Library grouping: 0 none, 1 author, 2 status, 3 format, 4 folder.
+    pub lib_group: u8,
 }
 
 impl Default for AppSettings {
@@ -279,11 +284,14 @@ impl Default for AppSettings {
             lib_view: LibView::Grid,
             sort: SortKey::Recent,
             sort_desc: true,
-            cover_size: 150.0,
+            cover_size: 168.0,
             kosync: KoSync { server: "https://sync.koreader.rocks".into(), ..Default::default() },
             translate_to: "en".into(),
             tts_rate: 1.0,
             reading_speed_cpm: 1200.0,
+            zlib_enabled: true,
+            right_panel: true,
+            lib_group: 0,
         }
     }
 }

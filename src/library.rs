@@ -26,6 +26,8 @@ pub struct Entry {
     pub publisher: String,
     pub description: String,
     pub has_cover: bool,
+    /// cover height / width (0 = unknown)
+    pub cover_aspect: f32,
     pub fraction: f32,
     pub last_read: i64,
     pub finished: bool,
@@ -82,21 +84,28 @@ fn mtime(m: &std::fs::Metadata) -> u64 {
     m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub fn save_thumbnail(id: &str, bytes: &[u8]) -> bool {
-    let Ok(img) = image::load_from_memory(bytes) else { return false };
+pub fn save_thumbnail(id: &str, bytes: &[u8]) -> Option<f32> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let aspect = img.height() as f32 / img.width().max(1) as f32;
     let img = if img.height() > 480 { img.resize(480, 480, image::imageops::FilterType::Triangle) } else { img };
     let rgb = img.to_rgb8();
     let p = cover_path(id);
     let _ = std::fs::create_dir_all(store::covers_dir());
-    let Ok(f) = std::fs::File::create(&p) else { return false };
+    let f = std::fs::File::create(&p).ok()?;
     let mut w = std::io::BufWriter::new(f);
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 85).encode_image(&rgb).is_ok()
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 85).encode_image(&rgb).ok()?;
+    Some(aspect)
+}
+
+fn thumb_aspect(id: &str) -> f32 {
+    image::image_dimensions(cover_path(id)).map(|(w, h)| h as f32 / w.max(1) as f32).unwrap_or(0.0)
 }
 
 fn make_entry(path: &Path, meta: &std::fs::Metadata) -> Option<Entry> {
     let id = store::book_id(path)?;
     let m = crate::book::read_meta(path);
-    let has_cover = cover_path(&id).exists() || m.cover.as_ref().is_some_and(|c| save_thumbnail(&id, c));
+    let cover_aspect = if cover_path(&id).exists() { thumb_aspect(&id) } else { m.cover.as_ref().and_then(|c| save_thumbnail(&id, c)).unwrap_or(0.0) };
+    let has_cover = cover_aspect > 0.0;
     let mut e = Entry {
         id: id.clone(),
         path: path.to_string_lossy().into_owned(),
@@ -111,6 +120,7 @@ fn make_entry(path: &Path, meta: &std::fs::Metadata) -> Option<Entry> {
         publisher: m.publisher,
         description: m.description.chars().take(4000).collect(),
         has_cover,
+        cover_aspect,
         ..Default::default()
     };
     // existing reading data (e.g. after the library index was deleted)
@@ -152,7 +162,13 @@ pub fn scan(dirs: &[PathBuf], extra: &[String], hidden: &[String], old: &Index, 
                 let Ok(meta) = std::fs::metadata(p) else { continue };
                 let key = p.to_string_lossy();
                 let e = match by_path.get(key.as_ref()) {
-                    Some(old) if old.size == meta.len() && old.mtime == mtime(&meta) && !old.id.is_empty() => Some((*old).clone()),
+                    Some(old) if old.size == meta.len() && old.mtime == mtime(&meta) && !old.id.is_empty() => {
+                        let mut e = (*old).clone();
+                        if e.has_cover && e.cover_aspect == 0.0 {
+                            e.cover_aspect = thumb_aspect(&e.id);
+                        }
+                        Some(e)
+                    }
                     Some(old) => make_entry(p, &meta).map(|mut e| {
                         e.added = old.added;
                         e
