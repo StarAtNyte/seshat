@@ -15,8 +15,14 @@ rfd = "0.15"
 
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+md-5 = "0.10"
+hayro = "0.9"
+fontdb = "0.24"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
+codegen-units = 1
+panic = "abort"
 lto = true
 strip = true
