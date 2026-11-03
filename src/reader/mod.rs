@@ -821,13 +821,15 @@ impl Reader {
                 }
                 Key::Home => self.section_edge(false),
                 Key::End => self.section_edge(true),
-                Key::F if mods.command => {
+                Key::F | Key::K if mods.command => {
                     self.side = Some(Side::Search);
                     self.focus_search = true;
                 }
-                Key::B | Key::D if mods.command => self.toggle_bookmark(),
-                Key::T => {
-                    self.side = if self.side == Some(Side::Toc) { None } else { Some(Side::Toc) };
+                Key::B | Key::D => self.toggle_bookmark(),
+                Key::T => self.chrome = !self.chrome,
+                Key::C | Key::N => {
+                    let want = if k == Key::C { Side::Toc } else { Side::Notes };
+                    self.side = if self.side == Some(want) { None } else { Some(want) };
                     self.toc_scroll = true;
                 }
                 Key::F11 | Key::F => {
@@ -853,34 +855,43 @@ impl Reader {
     fn top_bar(&mut self, ctx: &egui::Context, pal: &Palette, env: &mut Env, actions: &mut Vec<Action>) {
         let left = ctx.available_rect().left();
         let w = ctx.screen_rect().width() - left;
+        let chapter = self.chapter_title(match &self.book.content {
+            Content::Flow(_) => self.loc,
+            Content::Fixed(_) => Loc::new(self.fx.page, 0, 0),
+        });
         egui::Area::new("reader-top".into()).fixed_pos(pos2(left, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            egui::Frame::new().fill(pal.panel).stroke(egui::Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
-                ui.set_width(w - 16.0);
+            egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 8 }).show(ui, |ui| {
+                ui.set_width(w - 32.0);
                 ui.horizontal(|ui| {
-                    if icon_button(ui, Icon::Back, "Back to library (Esc)").clicked() {
+                    if ui::text_button(ui, "← Library", false).on_hover_text("Esc").clicked() {
                         actions.push(Action::Close);
                     }
-                    if icon_toggle(ui, Icon::Menu, "Contents, notes & bookmarks (T)", self.side.is_some()).clicked() {
+                    if ui::text_button(ui, "Contents", self.side.is_some()).on_hover_text("C").clicked() {
                         self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                         self.toc_scroll = true;
                     }
-                    if !self.history.is_empty() && icon_button(ui, Icon::Undo, "Go back to previous location (Backspace)").clicked() {
+                    if !self.history.is_empty() && ui::text_button(ui, "↶ Back", false).on_hover_text("Backspace").clicked() {
                         self.back();
                     }
-                    ui.add_space(6.0);
-                    let title = self.book.meta.title.clone();
-                    let rest = ui.available_width() - 5.0 * 36.0;
-                    ui.allocate_ui(vec2(rest.max(80.0), 32.0), |ui| {
-                        ui.add(egui::Label::new(RichText::new(title).strong().size(15.0)).truncate());
+                    let rest = ui.available_width() - 330.0;
+                    ui.allocate_ui(vec2(rest.max(80.0), 26.0), |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.add_space(12.0);
+                            ui.add(egui::Label::new(RichText::new(&self.book.meta.title).font(ui::ui_m(14.0))).truncate());
+                            if !chapter.is_empty() && chapter != self.book.meta.title {
+                                ui.label(RichText::new("/").font(ui::ui_m(14.0)).color(ACCENT));
+                                ui.add(egui::Label::new(RichText::new(&chapter).size(14.0).color(pal.muted)).truncate());
+                            }
+                        });
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_toggle(ui, Icon::Fullscreen, "Fullscreen (F11)", self.fullscreen).clicked() {
+                        if ui::text_button(ui, "Full", self.fullscreen).on_hover_text("F").clicked() {
                             self.fullscreen = !self.fullscreen;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                         }
                         if self.book.flow().is_some() {
                             let playing = self.speaker.is_some();
-                            if icon_toggle(ui, Icon::Speaker, "Read aloud", playing).clicked() {
+                            if ui::text_button(ui, "Listen", playing).clicked() {
                                 if playing {
                                     self.stop_tts();
                                 } else {
@@ -888,20 +899,22 @@ impl Reader {
                                 }
                             }
                         }
-                        if icon_toggle(ui, Icon::Font, "Reading settings", self.settings_open).clicked() {
+                        if ui::text_button(ui, "Aa", self.settings_open).clicked() {
                             self.settings_open = !self.settings_open;
                         }
                         let bm = self.bookmark_here().is_some();
-                        if icon_toggle(ui, if bm { Icon::BookmarkOn } else { Icon::Bookmark }, "Bookmark this page (Ctrl+B)", bm).clicked() {
+                        if ui::text_button(ui, "Mark", bm).on_hover_text("B").clicked() {
                             self.toggle_bookmark();
                         }
-                        if icon_toggle(ui, Icon::Search, "Search in book (Ctrl+F)", self.side == Some(Side::Search)).clicked() {
+                        if ui::text_button(ui, "Find", self.side == Some(Side::Search)).on_hover_text("Ctrl+K").clicked() {
                             self.side = if self.side == Some(Side::Search) { None } else { Some(Side::Search) };
                             self.focus_search = true;
                         }
                     });
                 });
             });
+            let r = ui.min_rect();
+            ui.painter().hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, pal.border));
         });
     }
 
@@ -911,17 +924,19 @@ impl Reader {
         let bottom = ctx.screen_rect().bottom();
         let frac = self.fraction();
         let info = self.position_text(env.app.reading_speed_cpm);
-        egui::Area::new("reader-bottom".into()).fixed_pos(pos2(left, bottom - 52.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            egui::Frame::new().fill(pal.panel).stroke(egui::Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
-                ui.set_width(w - 20.0);
-                ui.set_height(36.0);
+        egui::Area::new("reader-bottom".into()).fixed_pos(pos2(left, bottom - 50.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            let r0 = ui.max_rect();
+            ui.painter().hline(r0.left()..=r0.left() + w, r0.top(), egui::Stroke::new(1.0, pal.border));
+            egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
+                ui.set_width(w - 32.0);
+                ui.set_height(34.0);
                 ui.horizontal_centered(|ui| {
-                    if icon_button(ui, Icon::Left, "Previous chapter").clicked() {
+                    if ui::text_button(ui, "← Ch", false).on_hover_text("Previous chapter").clicked() {
                         self.chapter_step(-1);
                     }
-                    let info_w = 260.0;
+                    let info_w = 300.0;
                     let mut f = frac * 100.0;
-                    ui.spacing_mut().slider_width = (ui.available_width() - info_w - 50.0).max(80.0);
+                    ui.spacing_mut().slider_width = (ui.available_width() - info_w - 70.0).max(80.0);
                     let r = ui.add(egui::Slider::new(&mut f, 0.0..=100.0).show_value(false).trailing_fill(true));
                     if r.drag_stopped() || (r.changed() && !r.dragged()) {
                         let target = match &self.book.content {
@@ -933,10 +948,10 @@ impl Reader {
                     if r.dragged() {
                         r.on_hover_text(format!("{f:.0}%"));
                     }
-                    if icon_button(ui, Icon::Right, "Next chapter").clicked() {
+                    if ui::text_button(ui, "Ch →", false).on_hover_text("Next chapter").clicked() {
                         self.chapter_step(1);
                     }
-                    ui.add_sized(vec2(info_w, 20.0), egui::Label::new(RichText::new(info).size(12.5).color(pal.muted)).truncate());
+                    ui.add_sized(vec2(info_w, 20.0), egui::Label::new(RichText::new(info.to_uppercase()).font(ui::mono(10.5)).color(pal.muted)).truncate());
                 });
             });
         });
@@ -1054,40 +1069,26 @@ impl Reader {
         if let (Some(pos), Some(_)) = (self.sel_popup, self.sel) {
             let mut act: Option<&str> = None;
             let mut color = None;
-            egui::Area::new("sel-pop".into()).fixed_pos(clamp_popup(ctx, pos, vec2(330.0, 90.0))).order(egui::Order::Foreground).show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).fill(pal.panel).show(ui, |ui| {
+            egui::Area::new("sel-pop".into()).fixed_pos(clamp_popup(ctx, pos, vec2(560.0, 44.0))).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::new().fill(ui::INK).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                    ui.visuals_mut().override_text_color = Some(ui::PAPER);
+                    ui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::from_gray(40);
                     ui.horizontal(|ui| {
                         for c in store::HL_COLORS {
                             let [r, g, b] = c.rgb();
-                            let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), egui::Sense::click());
-                            ui.painter().circle_filled(rect.center(), if resp.hovered() { 10.0 } else { 8.5 }, Color32::from_rgb(r, g, b));
+                            let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 26.0), egui::Sense::click());
+                            let t = ui.ctx().animate_bool_with_time(ui.id().with(("sw", *c as u8)), resp.hovered(), 0.12);
+                            let sq = egui::Rect::from_center_size(rect.center() - vec2(0.0, 3.0 * t), vec2(12.0 + 2.0 * t, 12.0 + 2.0 * t));
+                            ui.painter().rect_filled(sq, egui::CornerRadius::ZERO, Color32::from_rgb(r, g, b));
                             if resp.on_hover_text("Highlight").clicked() {
                                 color = Some(*c);
                             }
                         }
-                        ui.separator();
-                        if icon_button(ui, Icon::Note, "Add note").clicked() {
-                            act = Some("note");
-                        }
-                        if icon_button(ui, Icon::Copy, "Copy").clicked() {
-                            act = Some("copy");
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if icon_button(ui, Icon::Book, "Dictionary").clicked() {
-                            act = Some("dict");
-                        }
-                        if icon_button(ui, Icon::Globe, "Wikipedia").clicked() {
-                            act = Some("wiki");
-                        }
-                        if icon_button(ui, Icon::Translate, "Translate").clicked() {
-                            act = Some("translate");
-                        }
-                        if icon_button(ui, Icon::Speaker, "Read aloud from here").clicked() {
-                            act = Some("speak");
-                        }
-                        if icon_button(ui, Icon::Search, "Search in book").clicked() {
-                            act = Some("search");
+                        ui.add_space(6.0);
+                        for (k, label) in [("note", "Note"), ("copy", "Copy"), ("dict", "Define"), ("wiki", "Wiki"), ("translate", "Translate"), ("speak", "Listen"), ("search", "Find")] {
+                            if ui::text_button(ui, label, false).clicked() {
+                                act = Some(k);
+                            }
                         }
                     });
                 });
