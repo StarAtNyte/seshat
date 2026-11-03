@@ -148,8 +148,9 @@ pub struct Reader {
     auto: bool,
     auto_last: Instant,
     opened_at: Option<Instant>,
-    turn: Option<(Instant, i8)>,
-    page_anim: bool,
+    turn: Option<Turn>,
+    motion: u8,
+    motion_hint: bool,
     notebook: bool,
     quick_note: String,
     /// Toolbar pinned open (otherwise it slides in on demand).
@@ -240,7 +241,8 @@ impl Reader {
             auto_last: Instant::now(),
             opened_at: None,
             turn: None,
-            page_anim: true,
+            motion: 0,
+            motion_hint: false,
             notebook: false,
             quick_note: String::new(),
             tools: false,
@@ -767,6 +769,7 @@ impl Reader {
             self.settings_open = open;
         }
         self.popups(ctx, &pal, env);
+        self.motion_hint_bar(ctx, &pal, env);
         self.sync_bar(ctx, &pal);
         if let Some((t, at)) = &self.toast {
             if at.elapsed() < Duration::from_secs(4) {
@@ -1078,6 +1081,40 @@ impl Reader {
         });
     }
 
+    /// Once, after the first animated opening: let people pick how much motion they want.
+    fn motion_hint_bar(&mut self, ctx: &egui::Context, pal: &Palette, env: &mut Env) {
+        if env.app.motion_hint_shown || self.book.flow().is_none() {
+            return;
+        }
+        let Some(t0) = self.opened_at else { return };
+        if t0.elapsed() < Duration::from_millis(1400) {
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+        let cur = self.effective(&env.app.reader).motion as usize;
+        let mut pick = None;
+        let mut done = false;
+        egui::Area::new("motion-hint".into()).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -28.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::new().fill(pal.bg).stroke(egui::Stroke::new(1.0, pal.border)).corner_radius(22).inner_margin(egui::Margin::symmetric(16, 8)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Page motion").font(ui::ui_m(13.5)));
+                    if let Some(i) = ui::segmented(ui, "motion-hint", &["Full", "Simple", "Off"], cur) {
+                        pick = Some(i as u8);
+                    }
+                    if ui::text_button(ui, "Keep it", false).clicked() {
+                        done = true;
+                    }
+                });
+            });
+        });
+        if let Some(m) = pick {
+            self.set(env, |s| s.motion = m);
+        }
+        if done {
+            env.app.motion_hint_shown = true;
+        }
+    }
+
     fn sync_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
         let Some(p) = self.sync_prompt.clone() else { return };
         egui::Area::new("sync".into()).anchor(Align2::CENTER_TOP, vec2(0.0, 60.0)).order(egui::Order::Foreground).show(ctx, |ui| {
@@ -1380,6 +1417,14 @@ pub fn deco_color(c: HlColor, dark: bool) -> Color32 {
 #[allow(dead_code)]
 fn _unused(_: Rect) {
     let _ = ACCENT;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Turn {
+    pub at: Instant,
+    pub dir: i8,
+    pub from: usize,
+    pub section: usize,
 }
 
 pub(crate) fn ease(t: f32) -> f32 {

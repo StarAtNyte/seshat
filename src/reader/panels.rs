@@ -418,6 +418,10 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
                     });
                     ui.checkbox(&mut r.fx.rtl, "Right-to-left (manga)");
                 }
+                ui::section_label(ui, "Motion");
+                if let Some(i) = ui::segmented(ui, "motion", &["Full", "Simple", "Off"], s.motion as usize) {
+                    s.motion = i as u8;
+                }
                 ui.checkbox(&mut s.tap_zones, "Click page edges to turn pages");
                 ui.checkbox(&mut s.dim_images, "Dim images in dark themes");
 

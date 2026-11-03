@@ -185,6 +185,8 @@ pub struct ReaderSettings {
     pub auto_secs: f32,
     pub auto_px: f32,
     pub page_anim: bool,
+    /// Motion: 0 full (3D cover + page flips), 1 simple (quick fades), 2 off.
+    pub motion: u8,
 }
 
 impl Default for ReaderSettings {
@@ -213,6 +215,7 @@ impl Default for ReaderSettings {
             auto_secs: 25.0,
             auto_px: 30.0,
             page_anim: true,
+            motion: 0,
         }
     }
 }
@@ -276,6 +279,7 @@ pub struct AppSettings {
     pub right_panel: bool,
     /// Library grouping: 0 none, 1 author, 2 status, 3 format, 4 folder.
     pub lib_group: u8,
+    pub motion_hint_shown: bool,
 }
 
 impl Default for AppSettings {
@@ -299,6 +303,7 @@ impl Default for AppSettings {
             zlib_enabled: true,
             right_panel: true,
             lib_group: 0,
+            motion_hint_shown: false,
         }
     }
 }

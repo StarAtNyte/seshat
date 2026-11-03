@@ -183,8 +183,8 @@ impl Reader {
         if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
             return self.scroll_by(self.view_h * 0.9);
         }
-        if self.page_anim {
-            self.turn = Some((Instant::now(), 1));
+        if self.motion < 2 {
+            self.turn = Some(super::Turn { at: Instant::now(), dir: 1, from: self.page, section: l.section });
         }
         if self.page + self.step < l.pages.len() {
             self.page += self.step;
@@ -209,8 +209,8 @@ impl Reader {
         if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
             return self.scroll_by(-self.view_h * 0.9);
         }
-        if self.page_anim && (self.page > 0 || l.section > 0) {
-            self.turn = Some((Instant::now(), -1));
+        if self.motion < 2 && (self.page > 0 || l.section > 0) {
+            self.turn = Some(super::Turn { at: Instant::now(), dir: -1, from: self.page, section: l.section });
         }
         if self.page >= self.step {
             self.page -= self.step;
@@ -339,7 +339,7 @@ impl Reader {
         let g = self.geometry(rect, s);
         self.view_h = g.page_h;
         self.ensure_layout(ui.ctx(), s, pal, env, &g);
-        self.page_anim = s.page_anim;
+        self.motion = s.motion;
         if self.opened_at.is_none() {
             let _ = self.cover_tex();
             if self.tex.get("__cover").is_some() || self.book.meta.cover.is_none() || self.tex.state("__cover").is_some_and(|s| matches!(s, crate::texload::State::Failed)) {
@@ -475,23 +475,38 @@ impl Reader {
         self.paint_book(&painter, &g, pal, frac);
         // opening: the cover swings away toward the spine
         let now = std::time::Instant::now();
-        let open_t = self.opened_at.map(|t| (now - t).as_secs_f32() / 0.95).unwrap_or(0.0);
-        let turn_t = self.turn.map(|(t, _)| (now - t).as_secs_f32() / 0.26).unwrap_or(1.0);
+        let open_t = if self.motion == 0 { self.opened_at.map(|t| (now - t).as_secs_f32() / 0.95).unwrap_or(0.0) } else { 1.0 };
+        let turn = self.turn.filter(|t| paginated && t.section == l.section && t.from != self.page);
+        let dur = if self.motion == 0 { 0.55 } else { 0.22 };
+        let turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
+        let flip3d = self.motion == 0 && turn_t < 1.0;
         if open_t < 1.0 || turn_t < 1.0 {
             ui.ctx().request_repaint();
         }
         let mut text_painter = painter.clone();
         if open_t < 1.0 {
             text_painter.multiply_opacity(super::ease((open_t - 0.3) / 0.6));
-        } else if turn_t < 1.0 {
+        } else if turn_t < 1.0 && !flip3d {
             text_painter.multiply_opacity(0.35 + 0.65 * super::ease(turn_t));
         }
         let tex = &self.tex;
         let texfn = |k: &str| tex.get(k).map(|t| t.tex.id());
         let dim = s.dim_images && pal.dark;
         if paginated {
-            for col in 0..g.cols {
-                if let Some(pg) = l.pages.get(self.page + col) {
+            // during a 3D flip, the side the leaf starts from still shows the old spread
+            let base: Vec<usize> = match (flip3d, turn) {
+                (true, Some(t)) if g.cols == 2 => {
+                    if t.dir > 0 {
+                        vec![t.from, self.page + 1]
+                    } else {
+                        vec![self.page, t.from + 1]
+                    }
+                }
+                (true, Some(t)) if t.dir < 0 => vec![t.from],
+                _ => (0..g.cols).map(|c| self.page + c).collect(),
+            };
+            for (col, pi) in base.into_iter().enumerate() {
+                if let Some(pg) = l.pages.get(pi) {
                     l.paint(&text_painter, g.origin(col), pg.top, pg.bottom, &texfn, &decos, pal.fg, dim);
                 }
             }
@@ -551,9 +566,14 @@ impl Reader {
             painter.add(egui::Shape::convex_polygon(vec![r.left_top(), r.right_top(), r.right_bottom(), pos2(r.center().x, r.bottom() - 7.0), r.left_bottom()], ACCENT, egui::Stroke::NONE));
         }
 
-        // page-turn leaf: a sheet sweeping into the spine with a shadowed edge
-        if turn_t < 1.0 && paginated {
-            let dir = self.turn.map(|t| t.1).unwrap_or(1);
+        if flip3d {
+            if let Some(t) = turn {
+                self.paint_flip(ui.ctx(), &painter, &g, pal, t, turn_t, dim);
+            }
+        }
+        // simple motion: a sheet sweeping into the spine with a shadowed edge
+        if turn_t < 1.0 && paginated && !flip3d {
+            let dir = turn.map(|t| t.dir).unwrap_or(1);
             let e = super::ease(turn_t);
             let target = if dir > 0 { g.sheet(g.cols - 1) } else { g.sheet(0) };
             let hinge = match (g.spine, dir > 0) {
@@ -620,6 +640,103 @@ impl Reader {
                 painter.with_clip_rect(r).text(r.left_top() + vec2(24.0, 40.0), egui::Align2::LEFT_TOP, &self.book.meta.title, ui::ui_b(28.0), ui::PAPER);
             }
         }
+    }
+
+    /// Tessellate one laid-out page into meshes (text + images) so it can be bent.
+    fn page_meshes(&self, ctx: &egui::Context, page: usize, origin: Pos2, fg: Color32, dim: bool) -> Vec<egui::Mesh> {
+        let Some(l) = &self.layout else { return Vec::new() };
+        let Some(pg) = l.pages.get(page) else { return Vec::new() };
+        let (top, bottom) = (pg.top, pg.bottom);
+        let clip = Rect::from_min_max(pos2(origin.x - 40.0, origin.y - 1.0), pos2(origin.x + l.width + 40.0, origin.y + (bottom - top) + 1.0));
+        let mut shapes = Vec::new();
+        let start = l.blocks.partition_point(|b| b.y + b.h < top);
+        for b in l.blocks.iter().skip(start) {
+            if b.y > bottom {
+                break;
+            }
+            let by = origin.y + b.y - top;
+            match &b.item {
+                super::layout::Item::Text { galley, ax } => shapes.push(egui::Shape::galley(pos2(origin.x + ax, by), galley.clone(), fg)),
+                super::layout::Item::Image { key, size, x } => {
+                    if let Some(t) = self.tex.get(key) {
+                        let tint = if dim { Color32::from_gray(225) } else { Color32::WHITE };
+                        shapes.push(egui::Shape::image(t.tex.id(), Rect::from_min_size(pos2(origin.x + x, by), *size), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let clipped: Vec<egui::epaint::ClippedShape> = shapes.into_iter().map(|shape| egui::epaint::ClippedShape { clip_rect: clip, shape }).collect();
+        let mut out = Vec::new();
+        for p in ctx.tessellate(clipped, ctx.pixels_per_point()) {
+            if let egui::epaint::Primitive::Mesh(m) = p.primitive {
+                // keep only triangles inside this page (galleys may run past it)
+                let mut nm = egui::Mesh::with_texture(m.texture_id);
+                nm.vertices = m.vertices.clone();
+                for tri in m.indices.chunks_exact(3) {
+                    let cy = tri.iter().map(|&i| m.vertices[i as usize].pos.y).sum::<f32>() / 3.0;
+                    if cy >= clip.top() && cy <= clip.bottom() {
+                        nm.indices.extend_from_slice(tri);
+                    }
+                }
+                out.push(nm);
+            }
+        }
+        out
+    }
+
+    /// A real page flip: the leaf rotates about the spine with perspective,
+    /// carrying the old page's text on its front and the new page's on its back.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_flip(&self, ctx: &egui::Context, painter: &egui::Painter, g: &Geo, pal: &Palette, t: super::Turn, turn_t: f32, dim: bool) {
+        let k = turn_t.clamp(0.0, 1.0);
+        let k = k * k * (3.0 - 2.0 * k);
+        let pi = std::f32::consts::PI;
+        let two = g.cols == 2;
+        // (hinge x, front page+origin+sheet, back page+origin+sheet, angle)
+        let (hinge, front, back, theta) = if two {
+            let h = g.spine.unwrap_or(g.sheet(0).right());
+            if t.dir > 0 {
+                (h, (t.from + 1, g.origin(1), g.sheet(1)), Some((self.page, g.origin(0), g.sheet(0))), k * pi)
+            } else {
+                (h, (t.from, g.origin(0), g.sheet(0)), Some((self.page + 1, g.origin(1), g.sheet(1))), k * pi)
+            }
+        } else if t.dir > 0 {
+            (g.sheet(0).left(), (t.from, g.origin(0), g.sheet(0)), None, k * pi / 2.0)
+        } else {
+            (g.sheet(0).left(), (self.page, g.origin(0), g.sheet(0)), None, (1.0 - k) * pi / 2.0)
+        };
+        let w = g.sheet(0).width();
+        let cy = g.sheet(0).center().y;
+        let show_front = theta < pi / 2.0;
+        let (page, origin, sheet) = if show_front { front } else { back.unwrap_or(front) };
+        let sign = if show_front { 1.0 } else { -1.0 };
+        let (c, s) = (theta.cos(), theta.sin());
+        let warp = |p: Pos2| -> Pos2 {
+            let rel = p.x - hinge;
+            let x = hinge + sign * rel * c;
+            let persp = 1.0 + 0.09 * s * (rel.abs() / w);
+            pos2(x, cy + (p.y - cy) * persp)
+        };
+        // shadow the leaf throws onto the spread
+        let reach = (w * c.abs()).max(12.0);
+        let side = if (t.dir > 0) == show_front { 1.0 } else { -1.0 };
+        let sh_rect = if side > 0.0 { Rect::from_min_max(pos2(hinge, sheet.top()), pos2(hinge + reach + 30.0 * s, sheet.bottom())) } else { Rect::from_min_max(pos2(hinge - reach - 30.0 * s, sheet.top()), pos2(hinge, sheet.bottom())) };
+        painter.rect_filled(sh_rect, CornerRadius::ZERO, Color32::from_black_alpha((40.0 * s) as u8));
+        // the paper of the leaf
+        let shade = 1.0 - 0.22 * s;
+        let paper = Color32::from_rgb((pal.bg.r() as f32 * shade) as u8, (pal.bg.g() as f32 * shade) as u8, (pal.bg.b() as f32 * shade) as u8);
+        let corners = [sheet.left_top(), sheet.right_top(), sheet.right_bottom(), sheet.left_bottom()].map(warp);
+        painter.add(egui::Shape::convex_polygon(corners.to_vec(), paper, Stroke::new(1.0, Color32::from_black_alpha(30))));
+        // the page's own text, bent with the leaf
+        for mut m in self.page_meshes(ctx, page, origin, pal.fg, dim) {
+            for v in &mut m.vertices {
+                v.pos = warp(v.pos);
+                v.color = v.color.linear_multiply(shade);
+            }
+            painter.add(egui::Shape::mesh(m));
+        }
+        ctx.request_repaint();
     }
 
     fn on_click(&mut self, g: &Geo, p: Pos2, rect: Rect, s: &ReaderSettings, paginated: bool) {
