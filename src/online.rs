@@ -82,6 +82,7 @@ pub struct Online {
     quota_asked: bool,
     dl_started: std::time::Instant,
     dl_temp: bool,
+    dl_book: Option<String>,
     /// A book fetched with “Read online”, ready to open without shelving it.
     pub read_now: Option<PathBuf>,
     quiet_q: String,
@@ -137,6 +138,7 @@ impl Online {
             quota_asked: false,
             dl_started: std::time::Instant::now(),
             dl_temp: false,
+            dl_book: None,
             read_now: None,
             quiet_q: String::new(),
             quiet_sent: String::new(),
@@ -741,104 +743,160 @@ impl Online {
     }
 
     fn ui_search(&mut self, ui: &mut egui::Ui, app: &mut AppSettings, pal: &Palette) {
-        ui.label(ui::tag("Source / plugin").color(pal.muted));
-        ui.label(ui::display("Z-Library", 40.0));
-        ui.add_space(10.0);
+        // header: name on the left, account + quota on the right
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search Z-Library — title, author, ISBN…").desired_width(ui.available_width() - 110.0).margin(vec2(10.0, 7.0)));
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Source").font(ui::ui_m(12.0)).color(pal.muted));
+                ui.label(ui::display("Z-Library", 30.0));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.session.is_some() && ui::text_button(ui, "Sign out", false).clicked() {
+                    self.logout(app);
+                }
+                if let Some(s) = &self.session {
+                    ui.label(RichText::new(if s.email.is_empty() { "Signed in".to_string() } else { s.email.clone() }).font(ui::ui_m(12.5)).color(pal.muted));
+                }
+                if let Some((used, limit)) = self.quota {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(format!("{} of {} downloads left today", limit.saturating_sub(used), limit)).font(ui::ui_m(12.5)).color(ui::ACCENT));
+                }
+            });
+        });
+        ui.add_space(12.0);
+        // search pill
+        ui.horizontal(|ui| {
+            let (sr, _) = ui.allocate_exact_size(vec2((ui.available_width() - 120.0).max(200.0), 38.0), Sense::hover());
+            ui.painter().rect_filled(sr, CornerRadius::same(19), pal.hover);
+            ui::paint_icon(ui.painter(), egui::Rect::from_center_size(egui::pos2(sr.left() + 20.0, sr.center().y), vec2(15.0, 15.0)), ui::Icon::Search, pal.muted);
+            let inner = egui::Rect::from_min_max(egui::pos2(sr.left() + 38.0, sr.top() + 8.0), egui::pos2(sr.right() - 16.0, sr.bottom() - 6.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+            let r = child.add(egui::TextEdit::singleline(&mut self.query).frame(false).hint_text(RichText::new("Title, author or ISBN").color(pal.muted)).desired_width(f32::INFINITY).font(ui::ui_m(15.0)));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui::primary_button(ui, if self.searching { "Searching…" } else { "Search" }).clicked() || enter {
+            ui.add_space(8.0);
+            if ui::primary_button(ui, if self.searching { "Searching" } else { "Search" }).clicked() || enter {
                 self.do_search(1, app);
             }
         });
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.filters.exact, "Exact match");
-            ui.label("Year");
-            ui.add(egui::TextEdit::singleline(&mut self.filters.year_from).desired_width(48.0).hint_text("from"));
-            ui.add(egui::TextEdit::singleline(&mut self.filters.year_to).desired_width(48.0).hint_text("to"));
+        ui.add_space(8.0);
+        // filters, quietly
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui::text_button(ui, "Exact", self.filters.exact).on_hover_text("Exact title match").clicked() {
+                self.filters.exact = !self.filters.exact;
+            }
             egui::ComboBox::from_id_salt("ext").selected_text(if self.filters.extension.is_empty() { "Any format".to_string() } else { self.filters.extension.clone() }).width(110.0).show_ui(ui, |ui| {
                 for e in ["", "EPUB", "PDF", "MOBI", "AZW3", "FB2", "TXT", "DJVU", "CBZ"] {
                     ui.selectable_value(&mut self.filters.extension, e.into(), if e.is_empty() { "Any format" } else { e });
                 }
             });
-            ui.add(egui::TextEdit::singleline(&mut self.filters.language).desired_width(90.0).hint_text("language"));
             egui::ComboBox::from_id_salt("order").selected_text(order_label(&self.filters.order)).width(130.0).show_ui(ui, |ui| {
                 for (v, l) in [("bestmatch", "Best match"), ("popular", "Popular"), ("date_created", "Newest"), ("date_updated", "Recently updated"), ("year", "Year"), ("titleA", "Title A–Z")] {
                     ui.selectable_value(&mut self.filters.order, v.into(), l);
                 }
             });
-            if let Some(s) = &self.session {
-                ui.label(RichText::new(format!("{} · {}", s.domain.trim_start_matches("https://"), if s.email.is_empty() { "signed in" } else { &s.email })).small().color(pal.muted));
-                if ui.small_button("Sign out").clicked() {
-                    self.logout(app);
-                }
-            }
+            ui.add(egui::TextEdit::singleline(&mut self.filters.language).desired_width(96.0).hint_text("Language").margin(vec2(8.0, 4.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.filters.year_from).desired_width(58.0).hint_text("From").margin(vec2(8.0, 4.0)));
+            ui.label(RichText::new("–").color(pal.muted));
+            ui.add(egui::TextEdit::singleline(&mut self.filters.year_to).desired_width(58.0).hint_text("To").margin(vec2(8.0, 4.0)));
         });
         if !self.search_error.is_empty() {
-            ui.colored_label(Color32::from_rgb(220, 70, 60), &self.search_error);
+            ui.add_space(6.0);
+            ui.label(RichText::new(&self.search_error).color(ui::ACCENT));
         }
-        ui.separator();
+        ui.add_space(10.0);
+        ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), egui::Stroke::new(1.0, pal.border));
+        ui.add_space(4.0);
         if self.results.books.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                if self.searching {
-                    ui.spinner();
-                } else {
-                    ui.label(RichText::new("Search millions of books and download them straight into your library.").color(pal.muted));
-                }
-            });
+            ui.add_space(40.0);
+            if self.searching {
+                ui.spinner();
+            } else {
+                ui.label(RichText::new("Search for a book. Add it to your library, or open it right away with Read online.").font(ui::ui_m(15.0)).color(pal.muted));
+            }
             return;
         }
         let books = self.results.books.clone();
         let proxy = app.proxy_opt();
         let mut clicked = None;
+        let mut get: Option<(api::Book, bool)> = None;
+        let downloading = self.active_dl.clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for b in &books {
                 let sel = self.selected.as_ref().is_some_and(|s| s.id == b.id);
                 let w = ui.available_width();
-                let (rect, resp) = ui.allocate_exact_size(vec2(w, 84.0), Sense::click());
-                if sel {
-                    ui.painter().rect_filled(rect, CornerRadius::same(8), ui::ACCENT.linear_multiply(0.12));
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(rect, CornerRadius::same(8), pal.hover);
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, 92.0), Sense::click());
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || sel, 0.12);
+                if t > 0.01 {
+                    ui.painter().rect_filled(rect, CornerRadius::same(10), if sel { ui::ACCENT.linear_multiply(0.09) } else { pal.hover.linear_multiply(t) });
                 }
-                let cover = egui::Rect::from_min_size(rect.min + vec2(8.0, 6.0), vec2(48.0, 72.0));
+                let cover = egui::Rect::from_min_size(rect.min + vec2(12.0, 8.0), vec2(50.0, 76.0));
                 let key = format!("zl:{}", b.id);
                 if !b.cover.is_empty() && ui.is_rect_visible(rect) {
-                    let url = b.cover.clone();
-                    let px = proxy.clone();
+                    let (url, px) = (b.cover.clone(), proxy.clone());
                     self.covers.request(&key, || Some(Src::Url { url, proxy: px }), 240);
                 }
                 match self.covers.get(&key) {
-                    Some(t) => {
-                        ui.painter().image(t.tex.id(), cover, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    Some(tx) => {
+                        ui.painter().image(tx.tex.id(), cover, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                     }
                     None => ui::paint_placeholder_cover(ui.painter(), cover, &b.title, ""),
                 }
-                let x = cover.right() + 12.0;
-                let tw = w - (x - rect.left()) - 10.0;
-                let g = ui.painter().layout(b.title.clone(), egui::FontId::proportional(15.0), pal.fg, tw);
-                let g = if g.rows.len() > 1 { ui.painter().layout_no_wrap(trunc(&b.title, (tw / 7.5) as usize), egui::FontId::proportional(15.0), pal.fg) } else { g };
-                ui.painter().galley(egui::pos2(x, rect.top() + 10.0), g, pal.fg);
-                ui.painter().text(egui::pos2(x, rect.top() + 34.0), egui::Align2::LEFT_TOP, trunc(&b.author, (tw / 6.5) as usize), egui::FontId::proportional(13.0), pal.muted);
-                let meta = [b.year.as_str(), &b.extension.to_uppercase(), &b.size, &b.language].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
-                ui.painter().text(egui::pos2(x, rect.top() + 56.0), egui::Align2::LEFT_TOP, meta, egui::FontId::proportional(12.0), pal.muted);
+                let actions_w = 96.0;
+                let x = cover.right() + 16.0;
+                let tw = (rect.right() - actions_w - x - 12.0).max(80.0);
+                let mut job = egui::text::LayoutJob::simple(b.title.clone(), ui::ui_m(15.0), pal.fg, tw);
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                ui.painter().galley(egui::pos2(x, rect.top() + 14.0), ui.painter().layout_job(job), pal.fg);
+                let mut job = egui::text::LayoutJob::simple(b.author.clone(), egui::FontId::proportional(13.0), pal.muted, tw);
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                ui.painter().galley(egui::pos2(x, rect.top() + 38.0), ui.painter().layout_job(job), pal.muted);
+                let meta = [b.year.as_str(), &b.extension.to_uppercase(), &b.size, &b.language].iter().filter(|s| !s.is_empty() && **s != "0").cloned().collect::<Vec<_>>().join("  ·  ");
+                ui.painter().text(egui::pos2(x, rect.top() + 62.0), egui::Align2::LEFT_TOP, meta, ui::ui_m(11.5), pal.muted);
+                // row actions (or this row's download progress)
+                let is_dl = downloading.as_ref().is_some_and(|d| d.0 == b.title) && self.dl_book.as_deref() == Some(b.id.as_str());
+                if is_dl {
+                    let (_, wr, total) = downloading.clone().unwrap();
+                    let frac = total.map(|t| wr as f32 / t.max(1) as f32).unwrap_or(0.0).clamp(0.0, 1.0);
+                    let bar = egui::Rect::from_min_size(egui::pos2(rect.right() - actions_w - 4.0, rect.center().y - 3.0), vec2(actions_w - 8.0, 6.0));
+                    ui.painter().rect_filled(bar, CornerRadius::same(3), pal.border);
+                    ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, 6.0)), CornerRadius::same(3), ui::ACCENT);
+                    ui.painter().text(egui::pos2(bar.center().x, bar.bottom() + 12.0), egui::Align2::CENTER_CENTER, format!("{:.0}%", frac * 100.0), ui::ui_m(11.0), pal.muted);
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                } else {
+                    for (i, (icon, tip, temp)) in [(ui::Icon::Download, "Add to library", false), (ui::Icon::Book, "Read online (opens right away, not shelved)", true)].into_iter().enumerate() {
+                        let c = egui::pos2(rect.right() - 28.0 - i as f32 * 42.0, rect.center().y);
+                        let br = egui::Rect::from_center_size(c, vec2(36.0, 36.0));
+                        let bresp = ui.interact(br, resp.id.with(i), Sense::click());
+                        let h = ui.ctx().animate_bool_with_time(bresp.id, bresp.hovered(), 0.12);
+                        ui.painter().circle_filled(c, 17.0, if h > 0.01 { ui::ACCENT.linear_multiply(0.15 + 0.85 * h) } else { pal.bg });
+                        ui.painter().circle_stroke(c, 17.0, egui::Stroke::new(1.0, pal.border.lerp_to_gamma(ui::ACCENT, h)));
+                        ui::paint_icon(ui.painter(), br.shrink(10.0), icon, if h > 0.5 { Color32::WHITE } else { pal.fg });
+                        if bresp.on_hover_text(tip).clicked() && downloading.is_none() {
+                            get = Some((b.clone(), temp));
+                        }
+                    }
+                }
                 if resp.clicked() {
                     clicked = Some(b.clone());
                 }
             }
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(self.page > 1 && !self.searching, egui::Button::new("← Previous")).clicked() {
+                if self.page > 1 && !self.searching && ui::text_button(ui, "← Previous", false).clicked() {
                     self.do_search(self.page - 1, app);
                 }
-                ui.label(format!("Page {} of {}", self.results.page, self.results.total_pages.max(1)));
-                if ui.add_enabled(self.page < self.results.total_pages && !self.searching, egui::Button::new("Next →")).clicked() {
+                ui.label(RichText::new(format!("Page {} of {}", self.results.page, self.results.total_pages.max(1))).font(ui::ui_m(12.5)).color(pal.muted));
+                if self.page < self.results.total_pages && !self.searching && ui::text_button(ui, "Next →", false).clicked() {
                     self.do_search(self.page + 1, app);
                 }
             });
         });
+        if let Some((b, temp)) = get {
+            self.dl_book = Some(b.id.clone());
+            self.do_download(b, app, temp);
+        }
         if let Some(b) = clicked {
             self.fetch_details(&b, app);
         }

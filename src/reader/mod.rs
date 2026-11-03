@@ -759,13 +759,13 @@ impl Reader {
             if let Some(side) = self.side {
                 panels::sidebar(self, ctx, side, &pal, env);
             }
-            if self.settings_open {
-                let mut open = true;
-                panels::settings_window(self, ctx, &mut open, env, &mut actions);
-                self.settings_open = open;
-            } else if self.notebook {
-                panels::notebook(self, ctx, &pal);
-            }
+        }
+        if self.settings_open {
+            let mut open = true;
+            panels::settings_window(self, ctx, &mut open, env, &mut actions);
+            self.settings_open = open;
+        } else if self.notebook {
+            panels::notebook(self, ctx, &pal);
         }
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::desk(&pal))).show(ctx, |ui| {
