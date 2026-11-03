@@ -66,10 +66,16 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             if depth > 0 {
                 walk(&p, depth - 1, out);
             }
-        } else if crate::book::is_supported(&p) && !name.ends_with(".part") {
+        } else if crate::book::is_supported(&p) && !name.ends_with(".part") && !is_loose_doc(&p) {
             out.push(p);
         }
     }
+}
+
+/// Plain text / HTML / Markdown are only indexed when imported explicitly;
+/// folder scans would otherwise sweep up every stray note and web page.
+fn is_loose_doc(p: &Path) -> bool {
+    matches!(crate::book::ext_of(p).as_str(), "txt" | "md" | "html" | "htm" | "xhtml")
 }
 
 fn mtime(m: &std::fs::Metadata) -> u64 {

@@ -295,6 +295,19 @@ impl AppSettings {
         if s.download_dir.is_empty() {
             s.download_dir = AppSettings::default().download_dir;
         }
+        // First run: pick up a ~/Books folder if the user has one.
+        if !config_dir().join("settings.json").exists() || s.library_dirs.is_empty() && !config_dir().join(".books-checked").exists() {
+            let _ = std::fs::create_dir_all(config_dir());
+            let _ = std::fs::write(config_dir().join(".books-checked"), "");
+            if let Some(h) = dirs::home_dir() {
+                for name in ["Books", "books", "Ebooks", "eBooks", "Calibre Library"] {
+                    let d = h.join(name);
+                    if d.is_dir() && !s.library_dirs.iter().any(|x| Path::new(x) == d) {
+                        s.library_dirs.push(d.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
         if s.kosync.server.is_empty() {
             s.kosync.server = "https://sync.koreader.rocks".into();
         }

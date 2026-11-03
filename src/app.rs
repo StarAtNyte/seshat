@@ -72,6 +72,9 @@ pub struct App {
     kosync_password: String,
     kosync_status: String,
     pending_open: Option<PathBuf>,
+    debug_start: Option<Instant>,
+    debug_keys_sent: usize,
+    debug_shot_requested: bool,
 }
 
 impl App {
@@ -122,6 +125,9 @@ impl App {
             kosync_password: String::new(),
             kosync_status: String::new(),
             pending_open: open,
+            debug_start: None,
+            debug_keys_sent: 0,
+            debug_shot_requested: false,
         };
         app.rescan();
         if let Some(p) = app.pending_open.take() {
@@ -362,7 +368,9 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.debug_screenshot(ctx);
         self.drain();
+        self.covers.poll();
         for (_, p) in std::mem::take(&mut self.online.downloaded) {
             let _ = p;
             self.rescan();
@@ -415,6 +423,51 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// `ZR_SHOT=out.png` (debug aid): save a screenshot after startup settles, then quit.
+    /// `ZR_KEYS=Right,Right,t` presses keys first.
+    fn debug_screenshot(&mut self, ctx: &egui::Context) {
+        let Ok(path) = std::env::var("ZR_SHOT") else { return };
+        let started = *self.debug_start.get_or_insert_with(Instant::now);
+        let t = started.elapsed();
+        ctx.request_repaint_after(Duration::from_millis(50));
+        if let Ok(keys) = std::env::var("ZR_KEYS") {
+            let steps: Vec<&str> = keys.split(',').filter(|k| !k.is_empty()).collect();
+            let i = ((t.as_millis() as i64 - 2500) / 400).max(-1);
+            if i >= 0 && (i as usize) < steps.len() && self.debug_keys_sent <= i as usize {
+                self.debug_keys_sent = i as usize + 1;
+                let name = steps[i as usize];
+                if let Some(rest) = name.strip_prefix("click:") {
+                    let v: Vec<f32> = rest.split('x').filter_map(|x| x.parse().ok()).collect();
+                    if v.len() == 2 {
+                        let pos = egui::pos2(v[0], v[1]);
+                        ctx.input_mut(|inp| {
+                            inp.events.push(egui::Event::PointerMoved(pos));
+                            inp.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+                            inp.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+                        });
+                    }
+                } else if let Some(k) = egui::Key::from_name(name) {
+                    let modifiers = if std::env::var("ZR_CTRL").is_ok() { egui::Modifiers::COMMAND } else { Default::default() };
+                    ctx.input_mut(|inp| inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }));
+                }
+            }
+        }
+        let wait = std::env::var("ZR_WAIT").ok().and_then(|w| w.parse().ok()).unwrap_or(4000u64);
+        if t > Duration::from_millis(wait) && !self.debug_shot_requested {
+            self.debug_shot_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        let shot = ctx.input(|i| i.raw.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+        if let Some(img) = shot {
+            let [w, h] = img.size;
+            let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, bytes) {
+                let _ = buf.save(&path);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
         egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::symmetric(14, 8)).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
             ui.horizontal(|ui| {

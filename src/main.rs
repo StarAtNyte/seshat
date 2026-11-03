@@ -27,7 +27,8 @@ fn main() -> eframe::Result<()> {
                         book::Content::Flow(f) => (f.sections.len(), f.total_chars()),
                         book::Content::Fixed(f) => (f.pages, 0),
                     };
-                    println!("{} | {} | {} | sections/pages {units} | chars {chars} | toc {} | {:?}", b.meta.title, b.meta.author, b.meta.language, b.toc.len(), t.elapsed());
+                    let cov = book::read_meta(std::path::Path::new(a)).cover.map(|c| c.len()).unwrap_or(0);
+                    println!("cover {cov} | {} | {} | {} | sections/pages {units} | chars {chars} | toc {} | {:?}", b.meta.title, b.meta.author, b.meta.language, b.toc.len(), t.elapsed());
                 }
                 Err(e) => println!("ERR {a}: {e}"),
             }
