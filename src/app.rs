@@ -538,7 +538,7 @@ impl eframe::App for App {
                 if show_right {
                     self.right_column(ctx, &pal);
                 }
-                egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 40, right: 28, top: 26, bottom: 0 })).show(ctx, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 32, right: 32, top: 24, bottom: 0 })).show(ctx, |ui| {
                     ui.multiply_opacity(vt);
                     ui.add_space((1.0 - vt) * 18.0);
                     match self.view {
@@ -676,7 +676,7 @@ impl App {
     }
 
     fn nav(&mut self, ctx: &egui::Context, pal: &Palette) {
-        egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 14, right: 14, top: 18, bottom: 14 })).show(ctx, |ui| {
+        egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 16 })).show(ctx, |ui| {
             let mut marker: Option<Rect> = None;
             let row = |ui: &mut egui::Ui, me: &mut App, icon: Icon, label: &str, count: Option<usize>, v: Option<View>, marker: &mut Option<Rect>| -> bool {
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
@@ -766,7 +766,7 @@ impl App {
     // ---------- right column ----------
 
     fn right_column(&mut self, ctx: &egui::Context, pal: &Palette) {
-        egui::SidePanel::right("right").exact_width(264.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 20, right: 22, top: 26, bottom: 16 }).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
+        egui::SidePanel::right("right").exact_width(264.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 24, right: 24, top: 24, bottom: 16 }).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let current = self.index.entries.iter().filter(|e| e.fraction > 0.0 && !e.finished).max_by_key(|e| e.last_read).cloned();
                 ui.label(tag("Progress").color(pal.muted));
@@ -915,7 +915,7 @@ impl App {
         }
 
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            ui.add_space(22.0);
+            ui.add_space(24.0);
             if self.query.is_empty() && self.view == View::All && self.settings.lib_group == 0 {
                 self.featured(ui, pal);
             }
@@ -1106,7 +1106,7 @@ impl App {
         ui.add_space(10.0);
         let jump = self.shelf_jump.take();
         for (k, idx) in &groups {
-            ui.add_space(18.0);
+            ui.add_space(24.0);
             let hdr = ui.horizontal(|ui| {
                 ui.label(RichText::new(k).font(ui_b(22.0)));
                 ui.label(RichText::new(idx.len().to_string()).font(ui_m(13.0)).color(pal.muted));
@@ -1243,7 +1243,7 @@ impl App {
         }
         let recent: Vec<Entry> = reading.into_iter().filter(|e| e.id != cur.id).take(10).collect();
         if !recent.is_empty() {
-            ui.add_space(38.0);
+            ui.add_space(32.0);
             ui.label(tag(format!("Recently opened / {:03}", recent.len())).color(pal.muted));
             ui::rule(ui);
             ui.add_space(14.0);
@@ -1271,7 +1271,7 @@ impl App {
                 }
             });
         }
-        ui.add_space(38.0);
+        ui.add_space(32.0);
     }
 
     /// Asymmetric masonry: real cover proportions, every seventh book set large,
