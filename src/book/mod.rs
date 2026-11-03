@@ -269,6 +269,7 @@ pub struct Meta {
     pub publisher: String,
     pub description: String,
     pub series: String,
+    pub subjects: Vec<String>,
     #[serde(skip)]
     pub cover: Option<Vec<u8>>,
 }

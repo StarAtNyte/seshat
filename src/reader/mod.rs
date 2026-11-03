@@ -870,7 +870,7 @@ impl Reader {
                         self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                         self.toc_scroll = true;
                     }
-                    if !self.history.is_empty() && ui::text_button(ui, "↶ Back", false).on_hover_text("Backspace").clicked() {
+                    if !self.history.is_empty() && ui::text_button(ui, "← Back", false).on_hover_text("Backspace").clicked() {
                         self.back();
                     }
                     let rest = ui.available_width() - 330.0;

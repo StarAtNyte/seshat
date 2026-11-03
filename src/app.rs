@@ -26,7 +26,7 @@ use crate::online::Online;
 use crate::reader::{Action, Env, Reader};
 use crate::store::{self, Annotation, AppSettings, BookData, Bookmark, LibView, SortKey, Theme, UiTheme};
 use crate::texload::{Src, TexLoader};
-use crate::ui::{self, display, mono, mono_m, tag, text_button, ui_b, ui_m, Palette, ACCENT, INK, PAPER};
+use crate::ui::{self, display, mono, mono_m, tag, text_button, ui_b, ui_m, Icon, Palette, ACCENT, INK, PAPER};
 
 enum Msg {
     Scanned(Index),
@@ -94,6 +94,8 @@ pub struct App {
     kosync_password: String,
     kosync_status: String,
     pending_open: Option<PathBuf>,
+    shelf_open: Option<String>,
+    shelf_jump: Option<String>,
     debug_start: Option<Instant>,
     debug_keys_sent: usize,
     debug_shot_requested: bool,
@@ -149,6 +151,8 @@ impl App {
             kosync_password: String::new(),
             kosync_status: String::new(),
             pending_open: open,
+            shelf_open: None,
+            shelf_jump: None,
             debug_start: None,
             debug_keys_sent: 0,
             debug_shot_requested: false,
@@ -568,82 +572,78 @@ impl App {
     }
 
     fn nav(&mut self, ctx: &egui::Context, pal: &Palette) {
-        egui::SidePanel::left("nav").exact_width(212.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 22, right: 16, top: 24, bottom: 16 }).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
-            // wordmark
-            let (r, _) = ui.allocate_exact_size(vec2(170.0, 30.0), Sense::hover());
-            let g1 = ui.painter().layout_no_wrap("ZLIB".into(), ui_b(25.0), pal.fg);
-            let w1 = g1.size().x;
-            ui.painter().galley(r.left_top(), g1, pal.fg);
-            ui.painter().text(r.left_top() + vec2(w1 + 1.0, 0.0), egui::Align2::LEFT_TOP, "/", ui_b(25.0), ACCENT);
-            ui.painter().text(r.left_top() + vec2(w1 + 12.0, 0.0), egui::Align2::LEFT_TOP, "READER", ui_b(25.0), pal.fg);
-            ui.label(tag("Desktop edition").color(pal.muted));
-            ui.add_space(26.0);
-
-            let mut marker_y: Option<f32> = None;
-            let mut nav_item = |ui: &mut egui::Ui, me: &mut App, idx: &str, label: &str, count: Option<usize>, v: View, marker: &mut Option<f32>| {
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-                let active = me.view == v;
-                let hov = ui.ctx().animate_bool_with_time(ui.id().with(("nav", idx)), resp.hovered() || active, 0.15);
-                let c = pal.fg.linear_multiply(0.7 + 0.3 * hov);
-                ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, idx, mono(10.0), if active { ACCENT } else { pal.muted });
-                ui.painter().text(rect.left_center() + vec2(26.0 + 4.0 * hov, 0.0), egui::Align2::LEFT_CENTER, label, if active { ui_m(14.5) } else { egui::FontId::proportional(14.5) }, c);
+        egui::SidePanel::left("nav").exact_width(220.0).resizable(false).frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 14, right: 14, top: 18, bottom: 14 })).show(ctx, |ui| {
+            let mut marker: Option<Rect> = None;
+            let row = |ui: &mut egui::Ui, me: &mut App, icon: Icon, label: &str, count: Option<usize>, v: Option<View>, marker: &mut Option<Rect>| -> bool {
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                let active = v.is_some_and(|v| me.view == v);
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                if t > 0.01 && !active {
+                    ui.painter().rect_filled(rect, CornerRadius::same(8), pal.hover.linear_multiply(t));
+                }
+                let fg = if active { ACCENT } else { pal.fg.linear_multiply(0.82 + 0.18 * t) };
+                ui::paint_icon(ui.painter(), Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(16.0, 16.0)), icon, if active { ACCENT } else { pal.muted.lerp_to_gamma(pal.fg, t) });
+                ui.painter().text(pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, ui_m(14.0), fg);
                 if let Some(n) = count {
-                    ui.painter().text(rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{n:03}"), mono(10.5), pal.muted);
+                    ui.painter().text(pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, n.to_string(), ui_m(12.0), if active { ACCENT } else { pal.muted });
                 }
                 if active {
-                    *marker = Some(rect.top() + 6.0);
+                    *marker = Some(rect);
                 }
-                if resp.clicked() {
-                    me.set_view(v);
-                }
+                resp.clicked()
             };
-            ui.label(tag("Library").color(pal.muted));
-            ui::rule(ui);
-            ui.add_space(4.0);
-            for (i, (v, l)) in [(View::All, "All books"), (View::Reading, "Reading"), (View::Unread, "Unread"), (View::Finished, "Finished")].into_iter().enumerate() {
+            let heading = |ui: &mut egui::Ui, text: &str| {
+                ui.add_space(14.0);
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+                ui.painter().text(pos2(r.left() + 8.0, r.center().y), egui::Align2::LEFT_CENTER, text, ui_m(11.5), pal.muted);
+                ui.add_space(2.0);
+            };
+            // the active pill is painted first (behind rows) at its animated position
+            let pill_layer = ui.painter().add(egui::Shape::Noop);
+            heading(ui, "Library");
+            for (v, l, ic) in [(View::All, "All books", Icon::Library), (View::Reading, "Reading", Icon::Book), (View::Unread, "Unread", Icon::Bookmark), (View::Finished, "Finished", Icon::BookmarkOn)] {
                 let n = self.count(v);
-                nav_item(ui, self, &format!("{:02}", i + 1), l, Some(n), v, &mut marker_y);
+                if row(ui, self, ic, l, Some(n), Some(v), &mut marker) {
+                    self.set_view(v);
+                    self.shelf_open = None;
+                }
             }
-            ui.add_space(18.0);
-            ui.label(tag("Marginalia").color(pal.muted));
-            ui::rule(ui);
-            ui.add_space(4.0);
+            heading(ui, "Marginalia");
             let (nn, nb) = (self.overview.notes.len(), self.overview.bookmarks.len());
-            nav_item(ui, self, "05", "Notes", Some(nn), View::Notes, &mut marker_y);
-            nav_item(ui, self, "06", "Bookmarks", Some(nb), View::Bookmarks, &mut marker_y);
-            ui.add_space(18.0);
-            ui.label(tag("Sources").color(pal.muted));
-            ui::rule(ui);
-            ui.add_space(4.0);
+            if row(ui, self, Icon::Note, "Notes", Some(nn), Some(View::Notes), &mut marker) {
+                self.set_view(View::Notes);
+            }
+            if row(ui, self, Icon::Bookmark, "Bookmarks", Some(nb), Some(View::Bookmarks), &mut marker) {
+                self.set_view(View::Bookmarks);
+            }
             if self.settings.zlib_enabled {
-                nav_item(ui, self, "07", "Z-Library", None, View::Source, &mut marker_y);
-                let y = ui.cursor().top() - 14.0;
-                let x = ui.max_rect().right() - 4.0;
-                ui.painter().rect_filled(Rect::from_center_size(pos2(x, y), vec2(6.0, 6.0)), CornerRadius::ZERO, if self.online.connected() { Color32::from_rgb(40, 170, 90) } else { pal.border });
-            } else {
-                ui.label(RichText::new("No sources enabled").size(12.5).color(pal.muted));
+                heading(ui, "Sources");
+                let r0 = ui.cursor().top();
+                if row(ui, self, Icon::Globe, "Z-Library", None, Some(View::Source), &mut marker) {
+                    self.set_view(View::Source);
+                }
+                let right = ui.max_rect().right();
+                ui.painter().circle_filled(pos2(right - 14.0, r0 + 16.0), 3.5, if self.online.connected() { Color32::from_rgb(52, 190, 110) } else { pal.border });
             }
-            // sliding accent marker
-            if let Some(y) = marker_y {
-                let ay = ui.ctx().animate_value_with_time(egui::Id::new("nav-marker"), y, 0.22);
-                ui.painter().rect_filled(Rect::from_min_size(pos2(ui.max_rect().left() - 22.0, ay), vec2(4.0, 16.0)), CornerRadius::ZERO, ACCENT);
+            if let Some(m) = marker {
+                let y = ui.ctx().animate_value_with_time(egui::Id::new("nav-pill"), m.top(), 0.2);
+                let pill = Rect::from_min_size(pos2(m.left(), y), m.size());
+                ui.painter().set(pill_layer, egui::Shape::rect_filled(pill, CornerRadius::same(8), ACCENT.linear_multiply(0.11)));
             }
-            ui.add_space(14.0);
+            ui.add_space(12.0);
             if let Some(p) = self.online.downloads_ui(ui, pal) {
                 self.open_path(&p);
             }
-
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.label(tag("Reading is a form of attention.").color(pal.muted));
-                ui.add_space(10.0);
                 if self.scanning {
                     let (d, t) = (self.scan_done.load(Ordering::Relaxed), self.scan_total.load(Ordering::Relaxed));
-                    ui.label(tag(if t > 0 { format!("Indexing {d}/{t}") } else { "Indexing…".into() }).color(ACCENT));
+                    ui.label(tag(if t > 0 { format!("Indexing {d} of {t}") } else { "Indexing…".into() }).color(ACCENT));
                 }
-                if text_button(ui, "Settings", self.settings_open).clicked() {
+                let mut m2 = None;
+                if row(ui, self, Icon::Gear, "Settings", None, None, &mut m2) {
                     self.settings_open = !self.settings_open;
                 }
-                if text_button(ui, "Add folder", false).clicked() {
+                if row(ui, self, Icon::Folder, "Add folder", None, None, &mut m2) {
                     if let Some(d) = rfd::FileDialog::new().pick_folder() {
                         let s = d.to_string_lossy().into_owned();
                         if !self.settings.library_dirs.contains(&s) {
@@ -652,7 +652,7 @@ impl App {
                         self.rescan();
                     }
                 }
-                if text_button(ui, "+ Import", false).on_hover_text("Ctrl+O").clicked() {
+                if row(ui, self, Icon::Plus, "Import books", None, None, &mut m2) {
                     self.import_dialog();
                 }
             });
@@ -803,61 +803,7 @@ impl App {
             View::Finished => "Finished",
             _ => "The Library",
         };
-        ui.horizontal(|ui| {
-            ui.label(display(title, 34.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                ui.label(tag(format!("{:03} objects / {}", self.index.entries.len(), store::date_string(store::now()))).color(pal.muted));
-            });
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let (sr, _) = ui.allocate_exact_size(vec2((ui.available_width() * 0.4).clamp(220.0, 440.0), 30.0), Sense::hover());
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
-            let focused = child
-                .horizontal(|ui| {
-                    ui.label(RichText::new("FIND").font(mono_m(10.5)).color(ACCENT));
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.query).id(egui::Id::new("lib-search")).frame(false).hint_text(RichText::new("title, author — or any book in the world").color(pal.muted)).desired_width(f32::INFINITY).font(ui_m(15.0)));
-                    r.has_focus()
-                })
-                .inner;
-            let f = ui.ctx().animate_bool_with_time(egui::Id::new("search-line"), focused || !self.query.is_empty(), 0.25);
-            ui.painter().hline(sr.x_range(), sr.bottom(), Stroke::new(1.0, pal.border));
-            ui.painter().hline(sr.left()..=sr.left() + sr.width() * f, sr.bottom(), Stroke::new(1.5, pal.fg));
-            ui.add_space(16.0);
-            ui.label(tag("Sort").color(pal.muted));
-            for (k, l) in [(SortKey::Recent, "Recent"), (SortKey::Title, "Title"), (SortKey::Author, "Author"), (SortKey::Added, "Added"), (SortKey::Progress, "Progress")] {
-                if text_button(ui, l, self.settings.sort == k).clicked() {
-                    if self.settings.sort == k {
-                        self.settings.sort_desc = !self.settings.sort_desc;
-                    } else {
-                        self.settings.sort = k;
-                        self.settings.sort_desc = !matches!(k, SortKey::Title | SortKey::Author);
-                    }
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(tag("Shelve by").color(pal.muted));
-            for (g, l) in [(0u8, "Nothing"), (1, "Author"), (2, "Status"), (3, "Format"), (4, "Folder")] {
-                if text_button(ui, l, self.settings.lib_group == g).clicked() {
-                    self.settings.lib_group = g;
-                    self.view_changed = Instant::now();
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if text_button(ui, "Index", self.settings.lib_view == LibView::List).clicked() {
-                    self.settings.lib_view = LibView::List;
-                    self.view_changed = Instant::now();
-                }
-                if text_button(ui, "Covers", self.settings.lib_view == LibView::Grid).clicked() {
-                    self.settings.lib_view = LibView::Grid;
-                    self.view_changed = Instant::now();
-                }
-                ui.label(tag("View").color(pal.muted));
-            });
-        });
-        ui.add_space(4.0);
-        ui::rule(ui);
+        self.header(ui, pal, title);
 
         if self.index.entries.is_empty() {
             self.empty_state(ui, pal);
@@ -890,6 +836,75 @@ impl App {
         });
     }
 
+    /// One calm row: title + count, search, and two dropdowns + view icons.
+    fn header(&mut self, ui: &mut egui::Ui, pal: &Palette, title: &str) {
+        ui.horizontal(|ui| {
+            ui.label(display(title, 30.0));
+            ui.label(RichText::new(self.count(self.view).to_string()).font(ui_m(14.0)).color(pal.muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let grid = self.settings.lib_view == LibView::Grid;
+                if ui::icon_toggle(ui, Icon::List, "List", !grid).clicked() {
+                    self.settings.lib_view = LibView::List;
+                    self.view_changed = Instant::now();
+                }
+                if ui::icon_toggle(ui, Icon::Grid, "Covers", grid).clicked() {
+                    self.settings.lib_view = LibView::Grid;
+                    self.view_changed = Instant::now();
+                }
+                ui.add_space(6.0);
+                let shelves = [(0u8, "None"), (5, "Genre"), (1, "Author"), (2, "Status"), (3, "Format"), (4, "Folder")];
+                let cur = shelves.iter().find(|s| s.0 == self.settings.lib_group).map(|s| s.1).unwrap_or("None");
+                let mut pick_group = None;
+                dropdown(ui, "shelf-dd", &format!("Shelves · {cur}"), self.settings.lib_group != 0, |ui| {
+                    for (g, l) in shelves {
+                        if ui.selectable_label(self.settings.lib_group == g, l).clicked() {
+                            pick_group = Some(g);
+                        }
+                    }
+                });
+                if let Some(g) = pick_group {
+                    self.settings.lib_group = g;
+                    self.shelf_open = None;
+                    self.view_changed = Instant::now();
+                }
+                let sorts = [(SortKey::Recent, "Recent"), (SortKey::Title, "Title"), (SortKey::Author, "Author"), (SortKey::Added, "Added"), (SortKey::Progress, "Progress"), (SortKey::Size, "Size")];
+                let cur = sorts.iter().find(|s| s.0 == self.settings.sort).map(|s| s.1).unwrap_or("Recent");
+                let mut pick_sort = None;
+                dropdown(ui, "sort-dd", &format!("Sort · {cur} {}", if self.settings.sort_desc { "↓" } else { "↑" }), false, |ui| {
+                    for (k, l) in sorts {
+                        if ui.selectable_label(self.settings.sort == k, l).clicked() {
+                            pick_sort = Some(k);
+                        }
+                    }
+                });
+                if let Some(k) = pick_sort {
+                    if self.settings.sort == k {
+                        self.settings.sort_desc = !self.settings.sort_desc;
+                    } else {
+                        self.settings.sort = k;
+                        self.settings.sort_desc = !matches!(k, SortKey::Title | SortKey::Author);
+                    }
+                }
+                ui.add_space(8.0);
+                // search pill
+                let w = (ui.available_width() - 8.0).clamp(160.0, 380.0);
+                let (sr, _) = ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
+                let focused = ui.memory(|m| m.has_focus(egui::Id::new("lib-search")));
+                let f = ui.ctx().animate_bool_with_time(egui::Id::new("search-focus"), focused || !self.query.is_empty(), 0.18);
+                ui.painter().rect_filled(sr, CornerRadius::same(17), pal.hover);
+                ui.painter().rect_stroke(sr, CornerRadius::same(17), Stroke::new(1.0 + f, ACCENT.linear_multiply(f)), egui::StrokeKind::Inside);
+                ui::paint_icon(ui.painter(), Rect::from_center_size(pos2(sr.left() + 18.0, sr.center().y), vec2(15.0, 15.0)), Icon::Search, pal.muted.lerp_to_gamma(ACCENT, f));
+                let inner = Rect::from_min_max(pos2(sr.left() + 34.0, sr.top() + 6.0), pos2(sr.right() - 14.0, sr.bottom() - 4.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                child.add(egui::TextEdit::singleline(&mut self.query).id(egui::Id::new("lib-search")).frame(false).hint_text(RichText::new("Search your shelves — and beyond").color(pal.muted)).desired_width(f32::INFINITY).font(ui_m(14.0)));
+            });
+        });
+        ui.add_space(10.0);
+        let r = ui.available_rect_before_wrap();
+        ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, pal.border));
+    }
+
     fn format_filter(&mut self, ui: &mut egui::Ui) {
         let mut formats: Vec<String> = self.index.entries.iter().map(|e| e.format.clone()).collect();
         formats.sort();
@@ -914,79 +929,163 @@ impl App {
         }
     }
 
-    /// Typographic shelves: a giant label column beside each group of books.
+    fn group_key(&self, e: &Entry) -> String {
+        match self.settings.lib_group {
+            1 => {
+                let a = e.author.split([',', ';', '&']).next().unwrap_or("").trim().to_string();
+                if a.is_empty() { "Unknown author".into() } else { a }
+            }
+            2 => (if e.finished { "Finished" } else if e.fraction > 0.0 { "Reading" } else { "Unread" }).into(),
+            3 => e.format.clone(),
+            5 => if e.genre.is_empty() { "Uncategorised".into() } else { e.genre.clone() },
+            _ => Path::new(&e.path).parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        }
+    }
+
+    /// Shelves as rows: each group is one horizontally sliding shelf, with a
+    /// jump strip on top and "See all" to drill into a single shelf.
     fn grouped(&mut self, ui: &mut egui::Ui, pal: &Palette, items: &[usize]) {
-        let mode = self.settings.lib_group;
-        let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
         for &i in items {
-            let e = &self.index.entries[i];
-            let (key, big) = match mode {
-                1 => {
-                    let a = e.author.split([',', ';', '&']).next().unwrap_or("").trim().to_string();
-                    let a = if a.is_empty() { "Unknown".to_string() } else { a };
-                    let surname = a.split_whitespace().last().unwrap_or("?").to_string();
-                    (a, surname.chars().next().unwrap_or('?').to_uppercase().to_string())
-                }
-                2 => {
-                    let s = if e.finished { "Finished" } else if e.fraction > 0.0 { "Reading" } else { "Unread" };
-                    (s.to_string(), s.to_string())
-                }
-                3 => (e.format.clone(), e.format.clone()),
-                _ => {
-                    let d = Path::new(&e.path).parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    (d.clone(), d)
-                }
-            };
-            match groups.iter_mut().find(|g| g.0 == key) {
-                Some(g) => g.2.push(i),
-                None => groups.push((key, big, vec![i])),
+            let k = self.group_key(&self.index.entries[i]);
+            match groups.iter_mut().find(|g| g.0 == k) {
+                Some(g) => g.1.push(i),
+                None => groups.push((k, vec![i])),
             }
         }
-        match mode {
-            1 => groups.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0))),
+        match self.settings.lib_group {
+            1 => groups.sort_by(|a, b| a.0.split_whitespace().last().cmp(&b.0.split_whitespace().last())),
             2 => groups.sort_by_key(|g| match g.0.as_str() {
                 "Reading" => 0,
                 "Unread" => 1,
                 _ => 2,
             }),
-            _ => groups.sort_by(|a, b| b.2.len().cmp(&a.2.len())),
+            _ => groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0))),
         }
-        let mut offset = 0;
-        let mut last_big = String::new();
-        for (gi, (key, big, idx)) in groups.iter().enumerate() {
-            ui.add_space(if gi == 0 { 6.0 } else { 34.0 });
-            let w = ui.available_width();
-            let label_w = if mode == 1 { 150.0 } else { (w * 0.3).clamp(200.0, 340.0) };
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(label_w);
-                    let r = ui.available_rect_before_wrap();
-                    ui.painter().hline(r.left()..=r.left() + label_w - 24.0, r.top(), Stroke::new(2.0, pal.fg));
-                    ui.add_space(8.0);
-                    if mode == 1 {
-                        if *big != last_big {
-                            ui.label(RichText::new(big).font(ui_b(72.0)).color(ACCENT).line_height(Some(70.0)));
-                        }
-                        ui.label(RichText::new(key).font(ui_m(15.0)));
-                    } else {
-                        let size = if big.chars().count() > 9 { 34.0 } else { 52.0 };
-                        let mut job = egui::text::LayoutJob::single_section(big.to_uppercase(), egui::TextFormat { font_id: ui_b(size), color: pal.fg, line_height: Some(size * 0.95), extra_letter_spacing: -size * 0.03, ..Default::default() });
-                        job.wrap.max_width = label_w - 24.0;
-                        let g = ui.painter().layout_job(job);
-                        let (rr, _) = ui.allocate_exact_size(g.size(), Sense::hover());
-                        ui.painter().galley(rr.min, g, pal.fg);
+        // drilled into one shelf
+        if let Some(open) = self.shelf_open.clone() {
+            if let Some((k, idx)) = groups.iter().find(|g| g.0 == open) {
+                ui.horizontal(|ui| {
+                    if text_button(ui, "← All shelves", false).clicked() {
+                        self.shelf_open = None;
+                        self.view_changed = Instant::now();
                     }
-                    ui.label(RichText::new(format!("{:03}", idx.len())).font(ui_b(28.0)).color(if mode == 1 { pal.muted } else { ACCENT }));
-                    ui.label(tag(if idx.len() == 1 { "object" } else { "objects" }).color(pal.muted));
+                    ui.label(display(k, 24.0));
+                    ui.label(RichText::new(idx.len().to_string()).font(ui_m(14.0)).color(pal.muted));
                 });
-                ui.vertical(|ui| {
-                    ui.set_width(w - label_w - 8.0);
-                    ui.add_space(14.0);
-                    self.shelf(ui, pal, idx, offset);
+                ui.add_space(16.0);
+                let idx = idx.clone();
+                self.shelf(ui, pal, &idx, 0);
+                return;
+            }
+            self.shelf_open = None;
+        }
+        // jump strip
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for (k, idx) in &groups {
+                let label = format!("{k}  {}", idx.len());
+                if text_button(ui, &label, false).clicked() {
+                    self.shelf_jump = Some(k.clone());
+                }
+            }
+        });
+        ui.add_space(10.0);
+        let jump = self.shelf_jump.take();
+        for (k, idx) in &groups {
+            ui.add_space(18.0);
+            let hdr = ui.horizontal(|ui| {
+                ui.label(RichText::new(k).font(ui_b(22.0)));
+                ui.label(RichText::new(idx.len().to_string()).font(ui_m(13.0)).color(pal.muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if text_button(ui, "See all →", false).clicked() {
+                        self.shelf_open = Some(k.clone());
+                        self.view_changed = Instant::now();
+                    }
                 });
             });
-            last_big = big.clone();
-            offset += idx.len();
+            if jump.as_deref() == Some(k.as_str()) {
+                hdr.response.scroll_to_me(Some(egui::Align::TOP));
+            }
+            ui.add_space(8.0);
+            self.shelf_row(ui, pal, k, idx);
+        }
+    }
+
+    /// One shelf: a clipped strip of covers that slides with ‹ › (animated).
+    fn shelf_row(&mut self, ui: &mut egui::Ui, pal: &Palette, key: &str, idx: &[usize]) {
+        let h = (self.settings.cover_size * 1.15).clamp(140.0, 240.0);
+        let gap = 20.0;
+        let w = ui.available_width();
+        let (row, _) = ui.allocate_exact_size(vec2(w, h + 52.0), Sense::hover());
+        let widths: Vec<f32> = idx.iter().map(|&i| h / self.aspect(&self.index.entries[i])).collect();
+        let total: f32 = widths.iter().sum::<f32>() + gap * idx.len().saturating_sub(1) as f32;
+        let max_off = (total - w).max(0.0);
+        let id = egui::Id::new(("shelf", key));
+        let mut target = ui.ctx().data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+        // wheel over the row scrolls it sideways
+        if ui.rect_contains_pointer(row) {
+            let d = ui.input(|i| i.raw_scroll_delta);
+            let dx = if d.x != 0.0 { d.x } else if ui.input(|i| i.modifiers.shift) { d.y } else { 0.0 };
+            target = (target - dx).clamp(0.0, max_off);
+        }
+        let step = w * 0.8;
+        let off = ui.ctx().animate_value_with_time(id.with("anim"), target, 0.3);
+        let painter = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
+        let mut x = row.left() - off;
+        let mut open = None;
+        for (n, &i) in idx.iter().enumerate() {
+            let cw = widths[n];
+            if x > row.right() {
+                break;
+            }
+            if x + cw >= row.left() {
+                let e = self.index.entries[i].clone();
+                let r = Rect::from_min_size(pos2(x, row.top()), vec2(cw, h + 52.0));
+                let resp = ui.interact(r.intersect(row), id.with(n), Sense::click());
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.15);
+                let cover = Rect::from_min_size(r.min + vec2(0.0, 6.0 - 6.0 * t), vec2(cw, h));
+                self.paint_cover(&painter, cover, &e);
+                if e.fraction > 0.0 {
+                    painter.rect_filled(Rect::from_min_size(pos2(cover.left(), cover.bottom() - 3.0), vec2(cw * e.fraction, 3.0)), CornerRadius::ZERO, if e.finished { pal.fg } else { ACCENT });
+                }
+                let mut job = egui::text::LayoutJob::simple(e.title.clone(), ui_m(13.0), pal.fg, cw);
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                painter.galley(pos2(x, row.top() + h + 14.0), painter.layout_job(job), pal.fg);
+                let mut job = egui::text::LayoutJob::simple(e.author.clone(), egui::FontId::proportional(12.0), pal.muted, cw);
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                painter.galley(pos2(x, row.top() + h + 32.0), painter.layout_job(job), pal.muted);
+                if resp.clicked() {
+                    open = Some(e.path.clone());
+                }
+                resp.context_menu(|ui| self.book_menu(ui, &e));
+            }
+            x += cw + gap;
+        }
+        // arrows appear only when the shelf overflows
+        for (left, show) in [(true, target > 1.0), (false, target < max_off - 1.0)] {
+            if !show {
+                continue;
+            }
+            let c = if left { pos2(row.left() + 20.0, row.top() + h / 2.0) } else { pos2(row.right() - 20.0, row.top() + h / 2.0) };
+            let r = Rect::from_center_size(c, vec2(36.0, 36.0));
+            let resp = ui.interact(r, id.with(("arrow", left)), Sense::click());
+            let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+            ui.painter().circle_filled(c, 17.0 + 2.0 * t, pal.bg);
+            ui.painter().circle_stroke(c, 17.0 + 2.0 * t, Stroke::new(1.0, pal.border));
+            ui::paint_icon(ui.painter(), r.shrink(10.0), if left { Icon::Left } else { Icon::Right }, if t > 0.5 { ACCENT } else { pal.fg });
+            if resp.clicked() {
+                target = if left { (target - step).max(0.0) } else { (target + step).min(max_off) };
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(id, target));
+        if (off - target).abs() > 0.5 {
+            ui.ctx().request_repaint();
+        }
+        if let Some(p) = open {
+            self.open_path(Path::new(&p));
         }
     }
 
@@ -1662,4 +1761,22 @@ fn trunc(s: &str, n: usize) -> String {
     } else {
         s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
     }
+}
+
+/// Pill dropdown: label chip that opens a small menu.
+fn dropdown(ui: &mut egui::Ui, id: &str, label: &str, active: bool, body: impl FnOnce(&mut egui::Ui)) {
+    let r = text_button(ui, label, active);
+    let (cr, _) = ui.allocate_exact_size(vec2(10.0, 28.0), Sense::hover());
+    let c = cr.center() - vec2(4.0, 0.0);
+    let col = if active { ACCENT } else { ui.visuals().text_color() };
+    ui.painter().line_segment([c + vec2(-3.5, -1.5), c + vec2(0.0, 2.0)], Stroke::new(1.3, col));
+    ui.painter().line_segment([c + vec2(0.0, 2.0), c + vec2(3.5, -1.5)], Stroke::new(1.3, col));
+    let pid = ui.make_persistent_id(id);
+    if r.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(pid));
+    }
+    egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(150.0);
+        body(ui);
+    });
 }

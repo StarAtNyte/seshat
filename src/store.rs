@@ -181,6 +181,10 @@ pub struct ReaderSettings {
     pub tap_zones: bool,
     pub wheel_turns_page: bool,
     pub dim_images: bool,
+    /// Auto-advance: seconds per page (paged) / pixels per second (scroll).
+    pub auto_secs: f32,
+    pub auto_px: f32,
+    pub page_anim: bool,
 }
 
 impl Default for ReaderSettings {
@@ -206,6 +210,9 @@ impl Default for ReaderSettings {
             tap_zones: true,
             wheel_turns_page: true,
             dim_images: true,
+            auto_secs: 25.0,
+            auto_px: 30.0,
+            page_anim: true,
         }
     }
 }

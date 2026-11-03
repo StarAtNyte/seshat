@@ -28,6 +28,8 @@ pub struct Entry {
     pub has_cover: bool,
     /// cover height / width (0 = unknown)
     pub cover_aspect: f32,
+    pub genre: String,
+    pub genre_checked: bool,
     pub fraction: f32,
     pub last_read: i64,
     pub finished: bool,
@@ -125,6 +127,8 @@ fn make_entry(path: &Path, meta: &std::fs::Metadata) -> Option<Entry> {
         description: m.description.chars().take(4000).collect(),
         has_cover,
         cover_aspect,
+        genre: genre_of(&m.subjects),
+        genre_checked: true,
         ..Default::default()
     };
     // catalogue metadata saved at download time beats sparse embedded metadata
@@ -189,6 +193,10 @@ pub fn scan(dirs: &[PathBuf], extra: &[String], hidden: &[String], old: &Index, 
                 let e = match by_path.get(key.as_ref()) {
                     Some(old) if old.size == meta.len() && old.mtime == mtime(&meta) && !old.id.is_empty() => {
                         let mut e = (*old).clone();
+                        if !e.genre_checked {
+                            e.genre = genre_of(&crate::book::read_meta(p).subjects);
+                            e.genre_checked = true;
+                        }
                         if e.has_cover && e.cover_aspect == 0.0 {
                             e.cover_aspect = thumb_aspect(&e.id);
                         }
@@ -216,6 +224,35 @@ pub fn scan(dirs: &[PathBuf], extra: &[String], hidden: &[String], old: &Index, 
     let mut seen = std::collections::HashSet::new();
     entries.retain(|e| seen.insert(e.id.clone()));
     Index { entries }
+}
+
+/// A readable shelf name from free-form subjects ("FICTION / Literary" → "Fiction").
+pub fn genre_of(subjects: &[String]) -> String {
+    let generic = ["general", "fiction - general", "ebook", "ebooks", "book", "books", "english"];
+    for s in subjects {
+        let first = s.split(['/', '>', ';', ',', '|']).next().unwrap_or("").split(" -- ").next().unwrap_or("").trim();
+        let low = first.to_lowercase();
+        if first.is_empty() || first.chars().count() > 32 || generic.contains(&low.as_str()) || first.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            continue;
+        }
+        let mut out = String::new();
+        for (i, w) in low.split_whitespace().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let mut c = w.chars();
+            if let Some(f) = c.next() {
+                if i == 0 || !matches!(w, "and" | "of" | "the" | "in" | "&") {
+                    out.extend(f.to_uppercase());
+                } else {
+                    out.push(f);
+                }
+                out.push_str(c.as_str());
+            }
+        }
+        return out;
+    }
+    String::new()
 }
 
 pub fn fmt_size(size: u64) -> String {

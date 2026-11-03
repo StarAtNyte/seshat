@@ -95,6 +95,7 @@ fn parse_head(src: &str, want_binaries: bool, only_cover: bool) -> Parsed {
                             last.clear();
                         }
                         "lang" => p.meta.language = v.clone(),
+                        "genre" if !v.is_empty() => p.meta.subjects.push(v.replace('_', " ")),
                         "p" if stack.iter().any(|s| s == "annotation") => {
                             if !p.meta.description.is_empty() {
                                 p.meta.description.push('\n');

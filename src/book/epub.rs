@@ -60,7 +60,7 @@ fn parse_opf(xml: &str) -> Opf {
             let a = |k: &str| attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
             match name.as_str() {
                 "metadata" => in_meta = true,
-                "title" | "creator" | "language" | "description" | "publisher" if in_meta && !self_closing => {
+                "title" | "creator" | "language" | "description" | "publisher" | "subject" if in_meta && !self_closing => {
                     field = Some(name.clone());
                     buf.clear();
                 }
@@ -130,6 +130,7 @@ fn parse_opf(xml: &str) -> Opf {
                     "language" if m.language.is_empty() => m.language = v,
                     "publisher" if m.publisher.is_empty() => m.publisher = v,
                     "description" if m.description.is_empty() => m.description = strip_tags(&v),
+                    "subject" if !v.is_empty() && m.subjects.len() < 8 => m.subjects.push(v),
                     _ => {}
                 }
                 field = None;

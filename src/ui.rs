@@ -517,3 +517,92 @@ pub fn paint_placeholder_cover(painter: &egui::Painter, rect: Rect, title: &str,
 
 #[allow(dead_code)]
 fn _keep(_: Pos2, _: Shape) {}
+
+// ---------- custom window chrome (undecorated windows) ----------
+
+/// Make `resp` behave like a native title bar: drag to move, double-click to maximise.
+pub fn titlebar_behaviour(ctx: &egui::Context, resp: &Response) {
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if resp.double_clicked() {
+        let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+    }
+}
+
+/// Minimise / maximise / close as three small playful shapes. Returns true on close.
+pub fn window_controls(ui: &mut Ui, fg: Color32) -> bool {
+    let mut close = false;
+    let ctx = ui.ctx().clone();
+    ui.spacing_mut().item_spacing.x = 4.0;
+    // close: ink circle that turns accent with a cross
+    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    ui.painter().circle_filled(r.center(), 6.0 + 2.0 * t, mix(fg, ACCENT, t));
+    if t > 0.3 {
+        let c = r.center();
+        let s = Stroke::new(1.4, Color32::WHITE);
+        ui.painter().line_segment([c + vec2(-3.0, -3.0), c + vec2(3.0, 3.0)], s);
+        ui.painter().line_segment([c + vec2(3.0, -3.0), c + vec2(-3.0, 3.0)], s);
+    }
+    if resp.on_hover_text("Close").clicked() {
+        close = true;
+    }
+    // maximise: outlined square
+    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let sq = Rect::from_center_size(r.center(), vec2(10.0 + 2.0 * t, 10.0 + 2.0 * t));
+    ui.painter().rect_stroke(sq, CornerRadius::same(2), Stroke::new(1.5, mix(fg, ACCENT, t)), egui::StrokeKind::Middle);
+    if resp.on_hover_text("Maximise").clicked() {
+        let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+    }
+    // minimise: lime pill
+    let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    ui.painter().rect_filled(Rect::from_center_size(r.center(), vec2(14.0 + 4.0 * t, 5.0)), CornerRadius::same(3), mix(LIME, ACCENT, t * 0.3));
+    if resp.on_hover_text("Minimise").clicked() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+    close
+}
+
+/// Edge/corner resize handles for undecorated windows.
+pub fn resize_edges(ctx: &egui::Context) {
+    use egui::{CursorIcon, ResizeDirection as D, ViewportCommand};
+    let (max, full) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
+    if max || full {
+        return;
+    }
+    let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    let r = ctx.screen_rect();
+    let m = 5.0;
+    let (l, rt, t, b) = (p.x < r.left() + m, p.x > r.right() - m, p.y < r.top() + m, p.y > r.bottom() - m);
+    let dir = match (l, rt, t, b) {
+        (true, _, true, _) => Some((D::NorthWest, CursorIcon::ResizeNorthWest)),
+        (_, true, true, _) => Some((D::NorthEast, CursorIcon::ResizeNorthEast)),
+        (true, _, _, true) => Some((D::SouthWest, CursorIcon::ResizeSouthWest)),
+        (_, true, _, true) => Some((D::SouthEast, CursorIcon::ResizeSouthEast)),
+        (true, ..) => Some((D::West, CursorIcon::ResizeWest)),
+        (_, true, ..) => Some((D::East, CursorIcon::ResizeEast)),
+        (_, _, true, _) => Some((D::North, CursorIcon::ResizeNorth)),
+        (_, _, _, true) => Some((D::South, CursorIcon::ResizeSouth)),
+        _ => None,
+    };
+    if let Some((d, icon)) = dir {
+        ctx.set_cursor_icon(icon);
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(d));
+        }
+    }
+}
+
+/// "Desk" colour around the open book.
+pub fn desk(p: &Palette) -> Color32 {
+    if p.dark {
+        mix(p.bg, Color32::BLACK, 0.35)
+    } else {
+        mix(p.bg, p.fg, 0.07)
+    }
+}

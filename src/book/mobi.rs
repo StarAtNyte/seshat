@@ -257,6 +257,7 @@ fn meta_from(h: &Header) -> Meta {
         publisher: exth_str(h, 101),
         description: exth_str(h, 103),
         language: exth_str(h, 524),
+        subjects: h.exth.get(&105).map(|v| v.iter().map(|b| decode(b, h.utf8)).collect()).unwrap_or_default(),
         ..Default::default()
     };
     if m.title.is_empty() {

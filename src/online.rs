@@ -551,7 +551,7 @@ impl Online {
                     ui.heading(if self.probing { "Finding a reachable Z-Library mirror…" } else { "No mirror reachable" });
                     ui.add_space(12.0);
                     for (d, ok) in &self.probe_results {
-                        ui.label(format!("{d}  {}", if *ok { "✓ reachable" } else { "—" }));
+                        ui.label(format!("{d}  {}", if *ok { "reachable" } else { "—" }));
                     }
                     if !self.probing && ui.button("Retry").clicked() {
                         self.start_probe(app);
