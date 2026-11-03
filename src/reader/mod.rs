@@ -96,6 +96,7 @@ pub struct Reader {
     last_turn: Instant,
     step: usize,
     view_h: f32,
+    last_layout: store::Layout,
     tex: TexLoader,
 
     // chrome / panels
@@ -188,6 +189,7 @@ impl Reader {
             last_turn: Instant::now(),
             step: 1,
             view_h: 600.0,
+            last_layout: app.reader.layout,
             tex: TexLoader::new(ctx, 2),
             side: None,
             settings_open: false,

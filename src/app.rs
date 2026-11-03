@@ -1,1308 +1,1076 @@
-use std::path::PathBuf;
+//! Application shell: library (grid/list, search, filters, sort, import,
+//! drag & drop), book details, settings, Z-Library tab, and the reader.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use eframe::egui;
+use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Rect, RichText, Sense, Stroke};
 
-use crate::api;
+use crate::book::Book;
+use crate::fonts::{self, FontDb, Installed};
+use crate::library::{self, Entry, Index};
+use crate::online::Online;
+use crate::reader::{Action, Env, Reader};
+use crate::store::{self, AppSettings, LibView, SortKey, Theme, UiTheme};
+use crate::texload::{Src, TexLoader};
+use crate::ui::{self, chip, icon_button, icon_toggle, Icon, Palette, ACCENT};
 
-// ---------- worker messages ----------
-
-#[derive(Clone, Debug)]
-pub struct DownloadEntry {
-    pub title: String,
-    pub path: String,
-    pub size: u64,
-}
-
-#[derive(Clone, Debug)]
-pub enum Msg {
-    ProbeDone(Vec<(String, bool)>, Option<String>),
-    LoginDone(Result<api::Session, String>),
-    RegisterDone(Result<(), String>),
-    ConfirmDone(Result<api::Session, String>),
-    ResendDone(Result<(), String>),
-    SearchDone(Result<api::SearchPage, String>),
-    DetailsDone(Result<api::Book, String>),
-    DlProgress {
-        title: String,
-        written: u64,
-        total: Option<u64>,
-    },
-    DlDone(Result<(String, String, u64), String>), // (title, path, size)
-    LibraryScanned(Vec<crate::library::LibraryEntry>),
-}
-
-// ---------- persisted state ----------
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SavedSession {
-    domain: String,
-    user_id: String,
-    user_key: String,
-    email: String,
-}
-
-pub fn config_dir_path() -> PathBuf {
-    config_dir()
-}
-
-fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("zlib-lite")
-}
-
-fn load_session() -> Option<api::Session> {
-    let p = config_dir().join("session.json");
-    let text = std::fs::read_to_string(p).ok()?;
-    let s: SavedSession = serde_json::from_str(&text).ok()?;
-    if s.user_id.is_empty() || s.user_key.is_empty() {
-        return None;
-    }
-    Some(api::Session {
-        domain: s.domain,
-        user_id: s.user_id,
-        user_key: s.user_key,
-        email: s.email,
-    })
-}
-
-fn save_session(sess: &api::Session) {
-    let dir = config_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let s = SavedSession {
-        domain: sess.domain.clone(),
-        user_id: sess.user_id.clone(),
-        user_key: sess.user_key.clone(),
-        email: sess.email.clone(),
-    };
-    if let Ok(text) = serde_json::to_string_pretty(&s) {
-        let _ = std::fs::write(dir.join("session.json"), text);
-    }
-}
-
-fn load_download_dir() -> PathBuf {
-    let p = config_dir().join("settings.json");
-    if let Ok(text) = std::fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(d) = v.get("download_dir").and_then(|d| d.as_str()) {
-                return PathBuf::from(d);
-            }
-        }
-    }
-    dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn save_download_dir(dir: &std::path::Path) {
-    let cfg = config_dir();
-    let _ = std::fs::create_dir_all(&cfg);
-    let mut v = serde_json::json!({});
-    if let Ok(text) = std::fs::read_to_string(cfg.join("settings.json")) {
-        v = serde_json::from_str(&text).unwrap_or(v);
-    }
-    v["download_dir"] = serde_json::Value::String(dir.to_string_lossy().into_owned());
-    let _ = std::fs::write(
-        cfg.join("settings.json"),
-        serde_json::to_string_pretty(&v).unwrap_or_default(),
-    );
+enum Msg {
+    Scanned(Index),
+    Opened(Result<(String, PathBuf, Arc<Book>), String>),
+    Fonts(FontDb),
+    Kosync(Result<String, String>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum AuthMode {
-    SignIn,
-    Register,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum RegStage {
-    Idle,
-    CodeSent,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum MainTab {
+enum Tab {
     Library,
     Online,
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Screen {
-    Connecting,
-    Login,
-    Search,
-}
-
-pub struct OpenBook {
-    pub path: String,
-    pub title: String,
-    pub author: String,
-    pub epub: Option<crate::epub::Epub>,
-    pub chapter: usize,
-    pub font_size: f32,
-}
-
-impl OpenBook {
-    pub fn total_chapters(&self) -> usize {
-        match &self.epub {
-            Some(e) => e.chapters.len(),
-            None => 1,
-        }
-    }
+enum Filter {
+    All,
+    Reading,
+    Unread,
+    Finished,
 }
 
 pub struct App {
+    ctx: egui::Context,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-
-    screen: Screen,
-    session: Option<api::Session>,
-
-    // connecting
-    probe_results: Vec<(String, bool)>,
-    probing: bool,
-
-    // login form
-    email: String,
-    password: String,
-    cookie_userid: String,
-    cookie_userkey: String,
-    login_error: String,
-    logging_in: bool,
-    use_cookies: bool,
-    manual_domain: String,
-
-    // registration
-    auth_mode: AuthMode,
-    reg_nickname: String,
-    reg_code: String,
-    reg_stage: RegStage,
-    reg_busy: bool,
-    reg_info: String,
-
-    // search
+    settings: AppSettings,
+    saved_settings: String,
+    last_settings_check: Instant,
+    index: Index,
+    scanning: bool,
+    scan_done: Arc<AtomicUsize>,
+    scan_total: Arc<AtomicUsize>,
+    rescan_after: bool,
+    tab: Tab,
     query: String,
-    filters: api::Filters,
-    results: api::SearchPage,
-    searching: bool,
-    search_error: String,
-    page: u32,
-
-    // selection + details
-    selected: Option<api::Book>,
-    details: Option<Result<api::Book, String>>,
-    fetching_details: bool,
-
-    // downloads
-    download_dir: PathBuf,
-    active_dl: Option<(String, u64, Option<u64>)>,
-    downloads: Vec<DownloadEntry>,
-    dl_error: String,
-
-    proxy: String,
-
-    // library + reader
-    main_tab: MainTab,
-    library: Vec<crate::library::LibraryEntry>,
-    library_query: String,
-    library_scanning: bool,
-    progress_store: crate::library::ProgressStore,
-    open_book: Option<OpenBook>,
+    filter: Filter,
+    format: String,
+    covers: TexLoader,
+    reader: Option<Reader>,
+    opening: Option<String>,
+    error: Option<String>,
+    fontdb: Option<FontDb>,
+    families: Vec<String>,
+    installed: Installed,
+    font_req: (String, bool),
+    want_cjk: bool,
+    online: Online,
+    details: Option<String>,
+    settings_open: bool,
+    confirm_delete: Option<String>,
+    style_key: Option<(Color32, Color32, bool)>,
+    kosync_password: String,
+    kosync_status: String,
+    pending_open: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
+        let ctx = cc.egui_ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let settings = AppSettings::load();
+        let installed = fonts::install(&ctx, None, "", false);
+        {
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let db = FontDb::load();
+                let _ = tx.send(Msg::Fonts(db));
+                ctx.request_repaint();
+            });
+        }
+        let saved_settings = serde_json::to_string(&settings).unwrap_or_default();
         let mut app = App {
+            ctx: ctx.clone(),
             tx,
             rx,
-            screen: Screen::Connecting,
-            session: load_session(),
-            probe_results: Vec::new(),
-            probing: false,
-            email: String::new(),
-            password: String::new(),
-            cookie_userid: String::new(),
-            cookie_userkey: String::new(),
-            login_error: String::new(),
-            logging_in: false,
-            use_cookies: false,
-            manual_domain: String::new(),
-            auth_mode: AuthMode::SignIn,
-            reg_nickname: String::new(),
-            reg_code: String::new(),
-            reg_stage: RegStage::Idle,
-            reg_busy: false,
-            reg_info: String::new(),
+            settings,
+            saved_settings,
+            last_settings_check: Instant::now(),
+            index: Index::load(),
+            scanning: false,
+            scan_done: Arc::new(AtomicUsize::new(0)),
+            scan_total: Arc::new(AtomicUsize::new(0)),
+            rescan_after: false,
+            tab: Tab::Library,
             query: String::new(),
-            filters: api::Filters::default(),
-            results: api::SearchPage::default(),
-            searching: false,
-            search_error: String::new(),
-            page: 1,
-            selected: None,
+            filter: Filter::All,
+            format: String::new(),
+            covers: TexLoader::new(&ctx, 2),
+            reader: None,
+            opening: None,
+            error: None,
+            fontdb: None,
+            families: Vec::new(),
+            installed,
+            font_req: (String::from("\u{0}"), false),
+            want_cjk: false,
+            online: Online::new(&ctx),
             details: None,
-            fetching_details: false,
-            download_dir: load_download_dir(),
-            active_dl: None,
-            downloads: Vec::new(),
-            dl_error: String::new(),
-            proxy: String::new(),
-            main_tab: MainTab::Library,
-            library: Vec::new(),
-            library_query: String::new(),
-            library_scanning: false,
-            progress_store: crate::library::load_progress(),
-            open_book: None,
+            settings_open: false,
+            confirm_delete: None,
+            style_key: None,
+            kosync_password: String::new(),
+            kosync_status: String::new(),
+            pending_open: open,
         };
-        app.scan_library();
-        if app.session.is_some() {
-            // still verify the saved session with a quick probe of its domain
-            app.screen = Screen::Search;
-            let tx = app.tx.clone();
-            let domain = app.session.as_ref().unwrap().domain.clone();
-            std::thread::spawn(move || {
-                let ok = api::probe(&domain, &None);
-                let _ = tx.send(Msg::ProbeDone(
-                    vec![(domain.clone(), ok)],
-                    if ok { Some(domain) } else { None },
-                ));
-            });
-        } else {
-            app.start_probe();
+        app.rescan();
+        if let Some(p) = app.pending_open.take() {
+            app.open_path(&p);
         }
         app
     }
 
-    fn start_probe(&mut self) {
-        self.screen = Screen::Connecting;
-        self.probing = true;
-        self.probe_results.clear();
-        let tx = self.tx.clone();
-        let proxy = if self.proxy.trim().is_empty() {
-            None
-        } else {
-            Some(self.proxy.trim().to_string())
-        };
-        let mut extra: Vec<String> = Vec::new();
-        let md = self.manual_domain.trim().to_string();
-        if !md.is_empty() {
-            extra.push(api::normalize(&md));
+    fn rescan(&mut self) {
+        if self.scanning {
+            self.rescan_after = true;
+            return;
         }
+        self.scanning = true;
+        self.scan_done.store(0, Ordering::Relaxed);
+        self.scan_total.store(0, Ordering::Relaxed);
+        let dirs = self.settings.all_dirs();
+        let extra = self.settings.extra_files.clone();
+        let hidden = self.settings.hidden_paths.clone();
+        let old = Index { entries: self.index.entries.clone() };
+        let (tx, ctx, done, total) = (self.tx.clone(), self.ctx.clone(), self.scan_done.clone(), self.scan_total.clone());
         std::thread::spawn(move || {
-            let mut all: Vec<String> = extra;
-            all.extend(api::DEFAULT_DOMAINS.iter().map(|s| s.to_string()));
-            let mut statuses: Vec<(String, bool)> = Vec::new();
-            let mut first_ok: Option<String> = None;
-            // probe concurrently
-            let handles: Vec<_> = all
-                .clone()
-                .into_iter()
-                .map(|d| {
-                    let proxy = proxy.clone();
-                    std::thread::spawn(move || {
-                        let ok = api::probe(&d, &proxy);
-                        (d, ok)
-                    })
-                })
-                .collect();
-            for h in handles {
-                if let Ok((d, ok)) = h.join() {
-                    if ok && first_ok.is_none() {
-                        first_ok = Some(d.clone());
-                    }
-                    statuses.push((d.clone(), ok));
-                }
-            }
-            let _ = tx.send(Msg::ProbeDone(statuses, first_ok));
+            let ctx2 = ctx.clone();
+            let idx = library::scan(&dirs, &extra, &hidden, &old, &move |d, t| {
+                done.store(d, Ordering::Relaxed);
+                total.store(t, Ordering::Relaxed);
+                ctx2.request_repaint();
+            });
+            let _ = tx.send(Msg::Scanned(idx));
+            ctx.request_repaint();
         });
     }
 
-    fn drain_messages(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                Msg::ProbeDone(results, domain) => {
-                    self.probing = false;
-                    self.probe_results = results;
-                    match domain {
-                        Some(d) if self.session.is_none() => {
-                            self.session = None;
-                            self.screen = Screen::Login;
-                            self.manual_domain = d;
-                        }
-                        _ => {
-                            if self.session.is_none() {
-                                self.screen = Screen::Login;
+    fn open_path(&mut self, path: &Path) {
+        if self.opening.is_some() {
+            return;
+        }
+        let in_lib = self.index.entries.iter().any(|e| Path::new(&e.path) == path);
+        if !in_lib {
+            let s = path.to_string_lossy().into_owned();
+            if !self.settings.extra_files.contains(&s) && !self.settings.all_dirs().iter().any(|d| path.starts_with(d)) {
+                self.settings.extra_files.push(s.clone());
+            }
+            self.settings.hidden_paths.retain(|h| h != &s);
+            self.rescan();
+        }
+        self.opening = Some(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        self.error = None;
+        let p = path.to_path_buf();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let res = (|| {
+                let id = store::book_id(&p).ok_or("cannot read file")?;
+                let book = crate::book::open(&p)?;
+                Ok((id, p, Arc::new(book)))
+            })();
+            let _ = tx.send(Msg::Opened(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn drain(&mut self) {
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                Msg::Scanned(idx) => {
+                    self.scanning = false;
+                    self.index = idx;
+                    self.index.save();
+                    if std::mem::take(&mut self.rescan_after) {
+                        self.rescan();
+                    }
+                }
+                Msg::Opened(r) => {
+                    self.opening = None;
+                    match r {
+                        Ok((id, path, book)) => {
+                            if let Some(mut old) = self.reader.take() {
+                                old.close(&self.settings);
                             }
+                            self.ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — zlib-reader", book.meta.title)));
+                            let r = Reader::new(&self.ctx, id.clone(), path.clone(), book, &self.settings);
+                            if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == id) {
+                                e.last_read = store::now();
+                            }
+                            self.reader = Some(r);
                         }
+                        Err(e) => self.error = Some(e),
                     }
                 }
-                Msg::LoginDone(res) => {
-                    self.logging_in = false;
-                    match res {
-                        Ok(sess) => {
-                            save_session(&sess);
-                            self.session = Some(sess);
-                            self.screen = Screen::Search;
-                            self.password.clear();
-                        }
-                        Err(e) => self.login_error = e,
-                    }
+                Msg::Fonts(db) => {
+                    self.families = db.families.clone();
+                    self.fontdb = Some(db);
+                    self.font_req = ("\u{0}".into(), false);
                 }
-                Msg::RegisterDone(res) => {
-                    self.reg_busy = false;
-                    match res {
-                        Ok(()) => {
-                            self.reg_stage = RegStage::CodeSent;
-                            self.reg_info = "Check your email for the confirmation code.".into();
-                        }
-                        Err(e) => self.login_error = e,
-                    }
-                }
-                Msg::ConfirmDone(res) => {
-                    self.reg_busy = false;
-                    match res {
-                        Ok(sess) => {
-                            save_session(&sess);
-                            self.session = Some(sess);
-                            self.screen = Screen::Search;
-                            self.password.clear();
-                            self.reg_stage = RegStage::Idle;
-                        }
-                        Err(e) => self.login_error = e,
-                    }
-                }
-                Msg::ResendDone(res) => {
-                    self.reg_busy = false;
-                    match res {
-                        Ok(()) => self.reg_info = "Code resent — check your email.".into(),
-                        Err(e) => self.login_error = e,
-                    }
-                }
-                Msg::SearchDone(res) => {
-                    self.searching = false;
-                    match res {
-                        Ok(page) => {
-                            self.results = page;
-                            self.search_error.clear();
-                        }
-                        Err(e) => self.search_error = e,
-                    }
-                }
-                Msg::DetailsDone(res) => {
-                    self.fetching_details = false;
-                    self.details = Some(res);
-                }
-                Msg::DlProgress { title, written, total } => {
-                    self.active_dl = Some((title, written, total));
-                }
-                Msg::LibraryScanned(entries) => {
-                    self.library_scanning = false;
-                    self.library = entries;
-                }
-                Msg::DlDone(res) => {
-                    self.active_dl = None;
-                    match res {
-                        Ok((title, path, size)) => {
-                            self.dl_error.clear();
-                            self.downloads.insert(0, DownloadEntry { title: title.clone(), path: path.clone(), size });
-                            self.scan_library();
-                        }
-                        Err(e) => self.dl_error = e,
+                Msg::Kosync(r) => {
+                    self.kosync_status = match r {
+                        Ok(s) => s,
+                        Err(e) => e,
                     }
                 }
             }
         }
     }
 
-    fn chosen_domain(&self) -> String {
-        if !self.manual_domain.trim().is_empty() {
-            api::normalize(self.manual_domain.trim())
+    fn close_reader(&mut self) {
+        if let Some(mut r) = self.reader.take() {
+            r.close(&self.settings);
+            if let Some(e) = self.index.entries.iter_mut().find(|e| e.id == r.id) {
+                e.fraction = r.data.fraction;
+                e.last_read = r.data.last_read;
+                e.finished = r.data.finished;
+            }
+            self.index.save();
+            self.covers.forget(&r.id);
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Title("zlib-reader".into()));
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+    }
+
+    fn library_palette(&self, ctx: &egui::Context) -> Palette {
+        let dark = match self.settings.ui_theme {
+            UiTheme::Dark => true,
+            UiTheme::Light => false,
+            UiTheme::System => ctx.input(|i| i.raw.system_theme) != Some(egui::Theme::Light),
+        };
+        let mut p = ui::palette_for(if dark { Theme::Dark } else { Theme::Light }, [0; 3], [0; 3]);
+        if dark {
+            p.bg = Color32::from_rgb(24, 24, 27);
+            p.panel = Color32::from_rgb(32, 32, 36);
+            p.hover = Color32::from_rgb(44, 44, 50);
+            p.border = Color32::from_rgb(52, 52, 58);
         } else {
-            self.probe_results
-                .iter()
-                .find(|(_, ok)| *ok)
-                .map(|(d, _)| d.clone())
-                .unwrap_or_else(|| "https://z-lib.gd".into())
+            p.bg = Color32::from_rgb(247, 247, 248);
+            p.panel = Color32::WHITE;
+            p.hover = Color32::from_rgb(236, 236, 240);
+            p.border = Color32::from_rgb(226, 226, 230);
+        }
+        p
+    }
+
+    fn apply_style(&mut self, ctx: &egui::Context, p: &Palette) {
+        let key = (p.bg, p.fg, p.dark);
+        if self.style_key != Some(key) {
+            ui::style(ctx, p);
+            self.style_key = Some(key);
         }
     }
 
-    fn proxy_opt(&self) -> Option<String> {
-        if self.proxy.trim().is_empty() { None } else { Some(self.proxy.trim().to_string()) }
+    fn sync_fonts(&mut self, ctx: &egui::Context) {
+        let family = match &self.reader {
+            Some(r) => r.effective(&self.settings.reader).font,
+            None => self.settings.reader.font.clone(),
+        };
+        let req = (family, self.want_cjk);
+        if req != self.font_req {
+            self.font_req = req.clone();
+            self.installed = fonts::install(ctx, self.fontdb.as_mut(), &req.0, req.1);
+        }
     }
 
-    fn do_register(&mut self) {
-        if self.reg_busy {
+    fn persist_settings(&mut self) {
+        if self.last_settings_check.elapsed() < Duration::from_secs(2) {
             return;
         }
-        self.reg_busy = true;
-        self.login_error.clear();
-        let tx = self.tx.clone();
-        let domain = self.chosen_domain();
-        let proxy = self.proxy_opt();
-        let email = self.email.clone();
-        let password = self.password.clone();
-        let name = self.reg_nickname.clone();
-        std::thread::spawn(move || {
-            let res = api::register(&domain, &proxy, &email, &password, &name);
-            let _ = tx.send(Msg::RegisterDone(res));
-        });
+        self.last_settings_check = Instant::now();
+        let now = serde_json::to_string(&self.settings).unwrap_or_default();
+        if now != self.saved_settings {
+            self.settings.save();
+            self.saved_settings = now;
+        }
     }
 
-    fn do_confirm(&mut self) {
-        if self.reg_busy {
+    fn handle_drops(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            let r = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "drop".into()));
+            painter.rect_filled(r, CornerRadius::ZERO, Color32::from_black_alpha(120));
+            painter.rect_stroke(r.shrink(18.0), CornerRadius::same(16), Stroke::new(3.0, ACCENT), egui::StrokeKind::Inside);
+            painter.text(r.center(), egui::Align2::CENTER_CENTER, "Drop books to add them to your library", egui::FontId::proportional(24.0), Color32::WHITE);
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if dropped.is_empty() {
             return;
         }
-        self.reg_busy = true;
-        self.login_error.clear();
-        let tx = self.tx.clone();
-        let domain = self.chosen_domain();
-        let proxy = self.proxy_opt();
-        let email = self.email.clone();
-        let password = self.password.clone();
-        let name = self.reg_nickname.clone();
-        let code = self.reg_code.trim().to_string();
-        std::thread::spawn(move || {
-            let res = api::confirm_code(&domain, &proxy, &email, &password, &name, &code);
-            let _ = tx.send(Msg::ConfirmDone(res));
-        });
-    }
-
-    fn do_resend(&mut self) {
-        if self.reg_busy {
-            return;
+        let _ = pal;
+        let books: Vec<PathBuf> = dropped.into_iter().filter(|p| crate::book::is_supported(p) || p.is_dir()).collect();
+        let mut files = Vec::new();
+        for p in books {
+            if p.is_dir() {
+                let s = p.to_string_lossy().into_owned();
+                if !self.settings.library_dirs.contains(&s) {
+                    self.settings.library_dirs.push(s);
+                }
+            } else {
+                files.push(p);
+            }
         }
-        self.reg_busy = true;
-        let tx = self.tx.clone();
-        let domain = self.chosen_domain();
-        let proxy = self.proxy_opt();
-        let email = self.email.clone();
-        let password = self.password.clone();
-        let name = self.reg_nickname.clone();
-        std::thread::spawn(move || {
-            let res = api::resend_code(&domain, &proxy, &email, &password, &name);
-            let _ = tx.send(Msg::ResendDone(res));
-        });
-    }
-
-    fn do_login(&mut self) {
-        if self.logging_in {
-            return;
-        }
-        self.logging_in = true;
-        self.login_error.clear();
-        let tx = self.tx.clone();
-        let domain = self.chosen_domain();
-        let proxy = self.proxy_opt();
-        if self.use_cookies {
-            let id = self.cookie_userid.clone();
-            let key = self.cookie_userkey.clone();
-            std::thread::spawn(move || {
-                let res = api::login_with_cookies(&domain, &proxy, &id, &key);
-                let _ = tx.send(Msg::LoginDone(res));
-            });
+        if files.len() == 1 {
+            let f = files.remove(0);
+            self.open_path(&f);
         } else {
-            let email = self.email.clone();
-            let password = self.password.clone();
-            std::thread::spawn(move || {
-                let res = api::login(&domain, &proxy, &email, &password);
-                let _ = tx.send(Msg::LoginDone(res));
-            });
+            for f in files {
+                let s = f.to_string_lossy().into_owned();
+                if !self.settings.extra_files.contains(&s) {
+                    self.settings.extra_files.push(s.clone());
+                }
+                self.settings.hidden_paths.retain(|h| h != &s);
+            }
         }
+        self.rescan();
     }
 
-    fn do_search(&mut self, page: u32) {
-        if self.searching || self.query.trim().is_empty() {
-            return;
+    fn import_dialog(&mut self) {
+        let exts: Vec<&str> = crate::book::SUPPORTED.to_vec();
+        if let Some(files) = rfd::FileDialog::new().add_filter("Books", &exts).pick_files() {
+            if files.len() == 1 {
+                self.open_path(&files[0]);
+                return;
+            }
+            for f in files {
+                let s = f.to_string_lossy().into_owned();
+                if !self.settings.extra_files.contains(&s) {
+                    self.settings.extra_files.push(s.clone());
+                }
+                self.settings.hidden_paths.retain(|h| h != &s);
+            }
+            self.rescan();
         }
-        self.searching = true;
-        self.search_error.clear();
-        self.page = page;
-        let tx = self.tx.clone();
-        let sess = self.session.clone().expect("search requires session");
-        let proxy = if self.proxy.trim().is_empty() { None } else { Some(self.proxy.trim().to_string()) };
-        let query = self.query.trim().to_string();
-        let filters = self.filters.clone();
-        std::thread::spawn(move || {
-            let res = api::search(&sess, &proxy, &query, page, &filters);
-            let _ = tx.send(Msg::SearchDone(res));
-        });
-    }
-
-    fn do_download(&mut self, book: api::Book) {
-        if self.active_dl.is_some() {
-            self.dl_error = "a download is already in progress".into();
-            return;
-        }
-        self.dl_error.clear();
-        let tx = self.tx.clone();
-        let sess = self.session.clone().expect("download requires session");
-        let proxy = if self.proxy.trim().is_empty() { None } else { Some(self.proxy.trim().to_string()) };
-        let dest = self.download_dir.clone();
-        let title = book.title.clone();
-        self.active_dl = Some((title.clone(), 0, None));
-        std::thread::spawn(move || {
-            let tx2 = tx.clone();
-            let title2 = title.clone();
-            let res = api::download_book(&sess, &proxy, &book, &dest, move |written, total| {
-                let _ = tx2.send(Msg::DlProgress {
-                    title: title2.clone(),
-                    written,
-                    total,
-                });
-            });
-            let msg = res.map(|p| (title, p.to_string_lossy().into_owned(), std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)));
-            let _ = tx.send(Msg::DlDone(msg));
-        });
-    }
-
-    fn fetch_details(&mut self, book: &api::Book) {
-        if self.fetching_details {
-            return;
-        }
-        self.fetching_details = true;
-        self.selected = Some(book.clone());
-        self.details = None;
-        let tx = self.tx.clone();
-        let sess = self.session.clone().expect("details requires session");
-        let proxy = if self.proxy.trim().is_empty() { None } else { Some(self.proxy.trim().to_string()) };
-        let id = book.id.clone();
-        let hash = book.hash.clone();
-        std::thread::spawn(move || {
-            let res = api::book_details(&sess, &proxy, &id, &hash);
-            let _ = tx.send(Msg::DetailsDone(res));
-        });
     }
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(ob) = self.open_book.take() {
-            crate::library::set_progress(
-                &mut self.progress_store,
-                &ob.path,
-                crate::library::Progress { chapter: ob.chapter, scroll: 0.0 },
-            );
-        }
-        crate::library::save_progress(&self.progress_store);
+        self.close_reader();
+        self.settings.save();
+        self.index.save();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_messages();
-        ctx.request_repaint_after(Duration::from_millis(200));
+        self.drain();
+        for (_, p) in std::mem::take(&mut self.online.downloaded) {
+            let _ = p;
+            self.rescan();
+        }
+        self.sync_fonts(ctx);
+        self.persist_settings();
 
-        if self.open_book.is_some() {
-            self.ui_reader(ctx);
+        if self.reader.is_some() {
+            let s = self.reader.as_ref().unwrap().effective(&self.settings.reader);
+            let pal = ui::palette(&s);
+            self.apply_style(ctx, &pal);
+            let actions = {
+                let r = self.reader.as_mut().unwrap();
+                let mut env = Env { app: &mut self.settings, families: &self.families, installed: &self.installed };
+                r.ui(ctx, &mut env)
+            };
+            for a in actions {
+                match a {
+                    Action::Close => self.close_reader(),
+                    Action::InstallFont { cjk, .. } => {
+                        if cjk {
+                            self.want_cjk = true;
+                        }
+                    }
+                }
+            }
+            self.handle_drops(ctx, &pal);
             return;
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("zlib-reader");
-                ui.separator();
-                ui.selectable_value(&mut self.main_tab, MainTab::Library, "📚 Library");
-                ui.selectable_value(&mut self.main_tab, MainTab::Online, "🌐 Z-Library");
-                match &self.session {
-                    Some(s) => {
-                        ui.label(format!("{}  •  {}", s.domain, if s.email.is_empty() { "logged in" } else { &s.email }));
-                        if ui.small_button("logout").clicked() {
-                            self.session = None;
-                            self.results = api::SearchPage::default();
-                            self.selected = None;
-                            self.details = None;
-                            let _ = std::fs::remove_file(config_dir().join("session.json"));
-                            self.start_probe();
-                        }
-                    }
-                    None => {
-                        ui.label(if self.probing { "connecting…" } else { "not connected" });
-                    }
-                }
-            });
-        });
-
-        // downloads bar
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Save to:");
-                ui.monospace(self.download_dir.to_string_lossy());
-                if ui.small_button("change…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.download_dir).pick_folder() {
-                        self.download_dir = d;
-                        save_download_dir(&self.download_dir);
-                    }
-                }
-            });
-            if !self.downloads.is_empty() {
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(90.0)
-                    .show(ui, |ui| {
-                        let downloads = self.downloads.clone();
-                        for dl in &downloads {
-                            ui.horizontal(|ui| {
-                                ui.strong(&dl.title);
-                                ui.monospace(format!("{} MB", dl.size / 1_048_576));
-                                let is_epub = dl.path.to_lowercase().ends_with(".epub");
-                                if ui.add_enabled(is_epub, egui::Button::new("📖 Read now")).clicked() {
-                                    self.open_book_from(crate::library::LibraryEntry {
-                                        path: dl.path.clone(),
-                                        title: dl.title.clone(),
-                                        author: String::new(),
-                                        format: "EPUB".into(),
-                                        size: dl.size,
-                                        progress: None,
-                                    });
-                                }
-                                if ui.small_button("open folder").clicked() {
-                                    open_containing(&dl.path);
-                                }
-                            });
-                        }
-                    });
-            }
-            if let Some((title, written, total)) = &self.active_dl {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Downloading:");
-                    ui.strong(title);
-                    let frac = total.map(|t| *written as f32 / t as f32).unwrap_or(0.0);
-                    ui.add(
-                        egui::ProgressBar::new(frac.max(0.01))
-                            .show_percentage()
-                            .text(format!("{} MB", written / 1_048_576)),
-                    );
-                });
-            }
-            if !self.dl_error.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.dl_error);
-            }
-        });
-
-        match self.main_tab {
-            MainTab::Library => self.ui_library(ctx),
-            MainTab::Online => match self.screen {
-                Screen::Connecting => self.ui_connecting(ctx),
-                Screen::Login => self.ui_login(ctx),
-                Screen::Search => self.ui_search(ctx),
-            },
+        let pal = self.library_palette(ctx);
+        self.apply_style(ctx, &pal);
+        if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
+            self.import_dialog();
         }
+        self.top_bar(ctx, &pal);
+        match self.tab {
+            Tab::Library => self.library_ui(ctx, &pal),
+            Tab::Online => {
+                if let Some(p) = self.online.ui(ctx, &mut self.settings, &pal) {
+                    self.open_path(&p);
+                }
+            }
+        }
+        self.details_window(ctx, &pal);
+        self.settings_window(ctx, &pal);
+        self.status_overlays(ctx, &pal);
+        self.handle_drops(ctx, &pal);
     }
 }
 
 impl App {
-    fn scan_library(&mut self) {
-        if self.library_scanning {
-            return;
-        }
-        self.library_scanning = true;
-        let tx = self.tx.clone();
-        let dir = self.download_dir.clone();
-        std::thread::spawn(move || {
-            let entries = crate::library::scan(&dir);
-            let _ = tx.send(Msg::LibraryScanned(entries));
+    fn top_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
+        egui::TopBottomPanel::top("top").frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::symmetric(14, 8)).stroke(Stroke::new(1.0, pal.border))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+                ui.painter().rect_filled(r, CornerRadius::same(7), ACCENT);
+                ui::paint_icon(ui.painter(), r.shrink(5.0), Icon::Book, Color32::WHITE);
+                ui.label(RichText::new("zlib-reader").strong().size(16.0));
+                ui.add_space(12.0);
+                if chip(ui, self.tab == Tab::Library, "Library").clicked() {
+                    self.tab = Tab::Library;
+                }
+                if chip(ui, self.tab == Tab::Online, "Z-Library").clicked() {
+                    self.tab = Tab::Online;
+                }
+                ui.add_space(12.0);
+                if self.tab == Tab::Library {
+                    let w = (ui.available_width() - 190.0).clamp(120.0, 520.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search title, author, series…").desired_width(w).margin(vec2(10.0, 6.0)));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Gear, "Settings").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
+                    if self.tab == Tab::Library {
+                        let r = icon_button(ui, Icon::Sort, "Sort & view");
+                        let pid = ui.make_persistent_id("sort-menu");
+                        if r.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(pid));
+                        }
+                        egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            ui.set_min_width(190.0);
+                            ui.label(RichText::new("Sort by").small().color(pal.muted));
+                            for (k, l) in [(SortKey::Recent, "Recently read"), (SortKey::Added, "Date added"), (SortKey::Title, "Title"), (SortKey::Author, "Author"), (SortKey::Progress, "Progress"), (SortKey::Size, "File size")] {
+                                if ui.selectable_label(self.settings.sort == k, l).clicked() {
+                                    if self.settings.sort == k {
+                                        self.settings.sort_desc = !self.settings.sort_desc;
+                                    } else {
+                                        self.settings.sort = k;
+                                        self.settings.sort_desc = matches!(k, SortKey::Recent | SortKey::Added | SortKey::Progress | SortKey::Size);
+                                    }
+                                }
+                            }
+                            ui.checkbox(&mut self.settings.sort_desc, "Descending");
+                            ui.separator();
+                            ui.label(RichText::new("Cover size").small().color(pal.muted));
+                            ui.add(egui::Slider::new(&mut self.settings.cover_size, 100.0..=240.0).show_value(false));
+                        });
+                        let grid = self.settings.lib_view == LibView::Grid;
+                        if icon_toggle(ui, if grid { Icon::List } else { Icon::Grid }, if grid { "List view" } else { "Grid view" }, false).clicked() {
+                            self.settings.lib_view = if grid { LibView::List } else { LibView::Grid };
+                        }
+                        if icon_button(ui, Icon::Plus, "Import books (Ctrl+O)").clicked() {
+                            self.import_dialog();
+                        }
+                        let spin = self.scanning;
+                        if icon_toggle(ui, Icon::Refresh, "Rescan library folders", spin).clicked() {
+                            self.rescan();
+                        }
+                    }
+                });
+            });
         });
     }
 
-    fn ui_library(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn visible_entries(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.index.entries.len())
+            .filter(|&i| {
+                let e = &self.index.entries[i];
+                library::matches(e, &self.query)
+                    && (self.format.is_empty() || e.format == self.format)
+                    && match self.filter {
+                        Filter::All => true,
+                        Filter::Reading => e.fraction > 0.0 && !e.finished,
+                        Filter::Unread => e.fraction == 0.0 && !e.finished,
+                        Filter::Finished => e.finished,
+                    }
+            })
+            .collect();
+        let es = &self.index.entries;
+        let key = self.settings.sort;
+        v.sort_by(|&a, &b| {
+            let (x, y) = (&es[a], &es[b]);
+            let o = match key {
+                SortKey::Recent => x.last_read.cmp(&y.last_read).then(x.added.cmp(&y.added)),
+                SortKey::Added => x.added.cmp(&y.added),
+                SortKey::Title => y.title.to_lowercase().cmp(&x.title.to_lowercase()),
+                SortKey::Author => y.author.to_lowercase().cmp(&x.author.to_lowercase()),
+                SortKey::Progress => x.fraction.partial_cmp(&y.fraction).unwrap_or(std::cmp::Ordering::Equal),
+                SortKey::Size => x.size.cmp(&y.size),
+            };
+            if self.settings.sort_desc {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        v
+    }
+
+    fn cover_tex(&mut self, e: &Entry) -> Option<egui::TextureId> {
+        if !e.has_cover {
+            return None;
+        }
+        let p = library::cover_path(&e.id);
+        self.covers.request(&e.id, || Some(Src::File(p)), 600);
+        self.covers.get(&e.id).map(|l| l.tex.id())
+    }
+
+    fn paint_cover(&mut self, ui: &egui::Ui, rect: Rect, e: &Entry, shadow: bool) {
+        let painter = ui.painter();
+        if shadow {
+            painter.rect_filled(rect.translate(vec2(0.0, 3.0)).expand(1.0), CornerRadius::same(7), Color32::from_black_alpha(40));
+        }
+        match self.cover_tex(e) {
+            Some(id) => {
+                let img = egui::Image::new((id, rect.size())).corner_radius(6);
+                img.paint_at(ui, rect);
+            }
+            None => {
+                let painter = ui.painter().with_clip_rect(rect);
+                ui::paint_placeholder_cover(&painter, rect, &e.title, &e.author);
+            }
+        }
+        if e.finished {
+            let c = rect.right_top() + vec2(-14.0, 14.0);
+            ui.painter().circle_filled(c, 10.0, Color32::from_rgb(34, 160, 90));
+            ui.painter().text(c, egui::Align2::CENTER_CENTER, "✓", egui::FontId::proportional(13.0), Color32::WHITE);
+        }
+    }
+
+    fn library_ui(&mut self, ctx: &egui::Context, pal: &Palette) {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg).inner_margin(egui::Margin { left: 22, right: 10, top: 14, bottom: 6 })).show(ctx, |ui| {
+            if self.index.entries.is_empty() {
+                self.empty_state(ui, pal);
+                return;
+            }
+            // continue reading
+            let recent = self.index.entries.iter().filter(|e| e.fraction > 0.0 && !e.finished && e.last_read > 0).max_by_key(|e| e.last_read).cloned();
+            if let (Some(e), true) = (recent, self.query.is_empty() && self.filter == Filter::All) {
+                egui::Frame::new().fill(pal.panel).corner_radius(14).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+                    ui.set_width(ui.available_width() - 14.0);
+                    ui.horizontal(|ui| {
+                        let (r, resp) = ui.allocate_exact_size(vec2(64.0, 96.0), Sense::click());
+                        self.paint_cover(ui, r, &e, true);
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("CONTINUE READING").size(11.0).strong().color(ACCENT));
+                            ui.add(egui::Label::new(RichText::new(&e.title).size(19.0).strong()).truncate());
+                            ui.label(RichText::new(&e.author).color(pal.muted));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add(egui::ProgressBar::new(e.fraction).desired_width(220.0).desired_height(6.0).fill(ACCENT));
+                                ui.label(RichText::new(format!("{:.0}% · {}", e.fraction * 100.0, store::relative_time(e.last_read))).size(12.0).color(pal.muted));
+                            });
+                            if ui::primary_button(ui, "Resume").clicked() || resp.clicked() {
+                                self.open_path(Path::new(&e.path));
+                            }
+                        });
+                    });
+                });
+                ui.add_space(12.0);
+            }
+            // filter chips
+            let counts = |f: Filter, es: &[Entry]| {
+                es.iter()
+                    .filter(|e| match f {
+                        Filter::All => true,
+                        Filter::Reading => e.fraction > 0.0 && !e.finished,
+                        Filter::Unread => e.fraction == 0.0 && !e.finished,
+                        Filter::Finished => e.finished,
+                    })
+                    .count()
+            };
             ui.horizontal(|ui| {
-                let mut submit = false;
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.library_query)
-                        .hint_text("Search your library — title, author…")
-                        .desired_width(ui.available_width() - 150.0),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
+                for (f, l) in [(Filter::All, "All"), (Filter::Reading, "Reading"), (Filter::Unread, "Unread"), (Filter::Finished, "Finished")] {
+                    if chip(ui, self.filter == f, &format!("{l}  {}", counts(f, &self.index.entries))).clicked() {
+                        self.filter = f;
+                    }
                 }
-                if ui.button("🔍").clicked() {
-                    submit = true;
+                let mut formats: Vec<String> = self.index.entries.iter().map(|e| e.format.clone()).collect();
+                formats.sort();
+                formats.dedup();
+                if formats.len() > 1 {
+                    egui::ComboBox::from_id_salt("fmt").selected_text(if self.format.is_empty() { "All formats".to_string() } else { self.format.clone() }).width(110.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.format, String::new(), "All formats");
+                        for f in formats {
+                            ui.selectable_value(&mut self.format, f.clone(), f);
+                        }
+                    });
                 }
-                let busy = self.library_scanning;
-                if ui.add_enabled(!busy, egui::Button::new(if busy { "rescanning…" } else { "rescan" })).clicked() {
-                    submit = true;
-                }
-                if submit {
-                    self.scan_library();
+                if self.scanning {
+                    ui.spinner();
+                    let (d, t) = (self.scan_done.load(Ordering::Relaxed), self.scan_total.load(Ordering::Relaxed));
+                    ui.label(RichText::new(if t > 0 { format!("Scanning {d}/{t}") } else { "Scanning…".into() }).size(12.0).color(pal.muted));
                 }
             });
-            ui.add_space(6.0);
-
-            let filtered = crate::library::search(&self.library, &self.library_query);
-            if self.library.is_empty() && !self.library_scanning {
+            ui.add_space(8.0);
+            let items = self.visible_entries();
+            if items.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    ui.label("Your library is empty.");
-                    ui.small("Download books from the Z-Library tab, or place files in the folder shown at the bottom.");
+                    ui.label(RichText::new("No books match.").color(pal.muted));
                 });
                 return;
             }
-            ui.label(format!(
-                "{} {}",
-                filtered.len(),
-                if filtered.len() == 1 { "book" } else { "books" }
-            ));
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let progress_store = self.progress_store.clone();
-                for entry in &filtered {
-                    ui.horizontal(|ui| {
-                        let read = crate::library::get_progress(&progress_store, &entry.path).is_some();
-                        let label = format!(
-                            "{} {} — {} [{}] {}{}",
-                            if read { "📖" } else { "📘" },
-                            entry.title,
-                            if entry.author.is_empty() { "unknown author" } else { &entry.author },
-                            entry.format,
-                            crate::library::fmt_size(entry.size),
-                            if read { " • in progress" } else { "" },
-                        );
-                        let row = egui::SelectableLabel::new(false, label);
-                        if ui.add(row).clicked() {
-                            self.open_book_from(entry.clone());
-                        }
-                        if ui.small_button("open file").clicked() {
-                            open_file(&entry.path);
-                        }
-                    });
-                }
-            });
+            match self.settings.lib_view {
+                LibView::Grid => self.grid(ui, pal, &items),
+                LibView::List => self.list(ui, pal, &items),
+            }
         });
     }
 
-    fn open_book_from(&mut self, entry: crate::library::LibraryEntry) {
-        let path = std::path::PathBuf::from(&entry.path);
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-        let (epub, title, author) = match ext.as_str() {
-            "epub" => match crate::epub::open(&path) {
-                Ok(book) => (Some(book), entry.title.clone(), entry.author.clone()),
-                Err(e) => {
-                    self.dl_error = format!("cannot open book: {e}");
-                    return;
-                }
-            },
-            _ => (None, entry.title.clone(), entry.author.clone()),
-        };
-        let saved = crate::library::get_progress(&self.progress_store, &entry.path);
-        let chapter = saved.map(|p| p.chapter).unwrap_or(0);
-        self.open_book = Some(OpenBook {
-            path: entry.path,
-            title,
-            author,
-            epub,
-            chapter,
-            font_size: 18.0,
-        });
-    }
-
-    fn ui_reader(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        egui::TopBottomPanel::top("reader-top").show(ctx, |ui| {
+    fn empty_state(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.18);
+            let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+            ui::paint_icon(ui.painter(), r, Icon::Library, pal.muted);
+            ui.add_space(10.0);
+            ui.label(RichText::new("Your library is empty").size(22.0).strong());
+            ui.label(RichText::new("Import EPUB, MOBI, AZW3, FB2, PDF, CBZ or TXT files, add a folder, or find books on Z-Library.").color(pal.muted));
+            ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if ui.button("← library").clicked() {
-                    close = true;
+                ui.add_space((ui.available_width() - 420.0).max(0.0) / 2.0);
+                if ui::primary_button(ui, "Import books").clicked() {
+                    self.import_dialog();
                 }
-                ui.separator();
-                let ob = self.open_book.as_ref().unwrap();
-                ui.strong(&ob.title);
-                if !ob.author.is_empty() {
-                    ui.label(format!("— {}", ob.author));
-                }
-                ui.separator();
-                ui.label(format!("{} / {}", ob.chapter + 1, ob.total_chapters()));
-                if ui.button("⏮").clicked() {
-                    if let Some(ob) = self.open_book.as_mut() {
-                        ob.chapter = 0;
+                if ui.button("Add folder").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        self.settings.library_dirs.push(d.to_string_lossy().into_owned());
+                        self.rescan();
                     }
                 }
-                if ui.button("◀").clicked() {
-                    if let Some(ob) = self.open_book.as_mut() {
-                        if ob.chapter > 0 {
-                            ob.chapter -= 1;
-                        }
-                    }
-                }
-                if ui.button("▶").clicked() {
-                    if let Some(ob) = self.open_book.as_mut() {
-                        if ob.chapter + 1 < ob.total_chapters() {
-                            ob.chapter += 1;
-                        }
-                    }
-                }
-                ui.separator();
-                if ui.button("A-").clicked() {
-                    if let Some(ob) = self.open_book.as_mut() {
-                        ob.font_size = (ob.font_size - 1.5).max(11.0);
-                    }
-                }
-                if ui.button("A+").clicked() {
-                    if let Some(ob) = self.open_book.as_mut() {
-                        ob.font_size = (ob.font_size + 1.5).min(32.0);
-                    }
-                }
-                // chapter dropdown
-                let ob = self.open_book.as_ref().unwrap();
-                if let Some(book) = &ob.epub {
-                    let cur = book.chapters.get(ob.chapter).map(|c| c.title.as_str()).unwrap_or("—");
-                    let chapters = book.chapters.clone();
-                    let current = ob.chapter;
-                    egui::ComboBox::from_id_salt("chapter")
-                        .selected_text(cur)
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            for (i, ch) in chapters.iter().enumerate() {
-                                if ui.selectable_label(i == current, &ch.title).clicked() {
-                                    if let Some(ob) = self.open_book.as_mut() {
-                                        ob.chapter = i;
-                                    }
-                                }
-                            }
-                        });
+                if ui.button("Browse Z-Library").clicked() {
+                    self.tab = Tab::Online;
                 }
             });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let ob = self.open_book.as_ref().unwrap();
-            match &ob.epub {
-                Some(book) => {
-                    let heading_size = ob.font_size * 1.4;
-                    if let Some(ch) = book.chapters.get(ob.chapter) {
-                        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                            ui.add_space(12.0);
-                            for block in &ch.blocks {
-                                match block {
-                                    crate::epub::Block::Heading(t) => {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(t)
-                                                    .strong()
-                                                    .size(heading_size),
-                                            )
-                                            .wrap(),
-                                        );
-                                        ui.add_space(6.0);
-                                    }
-                                    crate::epub::Block::Paragraph(t) => {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(t).size(ob.font_size),
-                                            )
-                                            .wrap(),
-                                        );
-                                        ui.add_space(ob.font_size * 0.45);
-                                    }
-                                }
-                            }
-                            ui.add_space(40.0);
-                        });
-                    }
-                }
-                None => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.heading(&ob.title);
-                        ui.label("This format is not supported for in-app reading yet (PDF/MOBI).");
-                        ui.add_space(8.0);
-                        if ui.button("open with system viewer").clicked() {
-                            open_file(&ob.path);
-                        }
-                    });
-                }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Tip: drag and drop files or folders onto this window.").size(12.0).color(pal.muted));
+            if self.scanning {
+                ui.add_space(10.0);
+                ui.spinner();
             }
         });
+    }
 
-        if close {
-            let ob = self.open_book.take();
-            if let Some(ob) = ob {
-                crate::library::set_progress(
-                    &mut self.progress_store,
-                    &ob.path,
-                    crate::library::Progress { chapter: ob.chapter, scroll: 0.0 },
-                );
-                crate::library::save_progress(&self.progress_store);
+    fn book_menu(&mut self, ui: &mut egui::Ui, e: &Entry) {
+        if ui.button("Read").clicked() {
+            self.open_path(Path::new(&e.path));
+            ui.close_menu();
+        }
+        if ui.button("Details").clicked() {
+            self.details = Some(e.id.clone());
+            ui.close_menu();
+        }
+        if ui.button(if e.finished { "Mark as unread" } else { "Mark as finished" }).clicked() {
+            let fin = !e.finished;
+            let mut d = store::BookData::load(&e.id);
+            d.finished = fin;
+            if !fin {
+                d.fraction = 0.0;
+                d.loc = None;
             }
+            d.save(&e.id);
+            if let Some(x) = self.index.entries.iter_mut().find(|x| x.id == e.id) {
+                x.finished = fin;
+                if !fin {
+                    x.fraction = 0.0;
+                }
+            }
+            self.index.save();
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Show in folder").clicked() {
+            crate::platform::reveal(Path::new(&e.path));
+            ui.close_menu();
+        }
+        if ui.button("Open with system app").clicked() {
+            crate::platform::open_path(Path::new(&e.path));
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("Remove from library").clicked() {
+            self.settings.hidden_paths.push(e.path.clone());
+            self.settings.extra_files.retain(|f| f != &e.path);
+            self.index.entries.retain(|x| x.id != e.id);
+            self.index.save();
+            ui.close_menu();
+        }
+        if ui.button(RichText::new("Delete file…").color(Color32::from_rgb(220, 70, 60))).clicked() {
+            self.confirm_delete = Some(e.id.clone());
+            ui.close_menu();
         }
     }
-}
 
-impl App {
-    fn ui_connecting(&self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.heading(if self.probing { "Finding a reachable Z-Library mirror…" } else { "No mirror reachable" });
-                ui.add_space(16.0);
-            });
-            for (domain, ok) in &self.probe_results {
-                ui.horizontal(|ui| {
-                    ui.monospace(domain);
-                    ui.label(if *ok {
-                        "✅ reachable"
+    fn grid(&mut self, ui: &mut egui::Ui, pal: &Palette, items: &[usize]) {
+        let cw = self.settings.cover_size;
+        let ch = cw * 1.5;
+        let card_h = ch + 58.0;
+        let gap = 22.0;
+        let avail = ui.available_width() - 12.0;
+        let cols = ((avail + gap) / (cw + gap)).floor().max(1.0) as usize;
+        let rows = items.len().div_ceil(cols);
+        let gap_x = if cols > 1 { ((avail - cols as f32 * cw) / (cols as f32 - 1.0)).min(gap * 2.0) } else { 0.0 };
+        let mut open = None;
+        let mut menu_for: Option<(Entry, egui::Response)> = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, card_h + gap, rows, |ui, range| {
+            for row in range {
+                let (row_rect, _) = ui.allocate_exact_size(vec2(avail, card_h + gap), Sense::hover());
+                for c in 0..cols {
+                    let Some(&ei) = items.get(row * cols + c) else { break };
+                    let e = self.index.entries[ei].clone();
+                    let x = row_rect.left() + c as f32 * (cw + gap_x);
+                    let card = Rect::from_min_size(pos2(x, row_rect.top()), vec2(cw, card_h));
+                    let resp = ui.interact(card, ui.id().with(("card", &e.id)), Sense::click());
+                    let lift = if resp.hovered() { -3.0 } else { 0.0 };
+                    let cover = Rect::from_min_size(card.min + vec2(0.0, lift), vec2(cw, ch));
+                    self.paint_cover(ui, cover, &e, true);
+                    if e.fraction > 0.0 && !e.finished {
+                        let bar = Rect::from_min_size(pos2(cover.left() + 6.0, cover.bottom() - 9.0), vec2(cw - 12.0, 4.0));
+                        ui.painter().rect_filled(bar, CornerRadius::same(2), Color32::from_black_alpha(110));
+                        ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * e.fraction.clamp(0.02, 1.0), 4.0)), CornerRadius::same(2), Color32::WHITE);
+                    }
+                    let fmt_g = ui.painter().layout_no_wrap(e.format.clone(), egui::FontId::proportional(9.5), Color32::WHITE);
+                    let badge = Rect::from_min_size(cover.left_top() + vec2(6.0, 6.0), fmt_g.size() + vec2(8.0, 4.0));
+                    ui.painter().rect_filled(badge, CornerRadius::same(4), Color32::from_black_alpha(140));
+                    ui.painter().galley(badge.min + vec2(4.0, 2.0), fmt_g, Color32::WHITE);
+                    let tg = ui.painter().layout(e.title.clone(), egui::FontId::proportional(13.5), pal.fg, cw);
+                    let tg = if tg.rows.len() > 2 {
+                        let mut job = egui::text::LayoutJob::simple(e.title.clone(), egui::FontId::proportional(13.5), pal.fg, cw);
+                        job.wrap.max_rows = 2;
+                        job.wrap.overflow_character = Some('…');
+                        ui.painter().layout_job(job)
                     } else {
-                        "—"
-                    });
-                });
-            }
-        });
-    }
-
-    fn ui_login(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(24.0);
-                ui.heading("Z-Library");
-                ui.add_space(8.0);
-            });
-
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.auth_mode, AuthMode::SignIn, "Sign in");
-                ui.selectable_value(&mut self.auth_mode, AuthMode::Register, "Create account");
-                ui.separator();
-                if ui.small_button("rescan mirrors").clicked() {
-                    self.start_probe();
+                        tg
+                    };
+                    let th = tg.size().y;
+                    ui.painter().galley(pos2(card.left(), cover.bottom() + 8.0), tg, pal.fg);
+                    let mut job = egui::text::LayoutJob::simple(e.author.clone(), egui::FontId::proportional(12.0), pal.muted, cw);
+                    job.wrap.max_rows = 1;
+                    job.wrap.overflow_character = Some('…');
+                    let ag = ui.painter().layout_job(job);
+                    ui.painter().galley(pos2(card.left(), cover.bottom() + 10.0 + th), ag, pal.muted);
+                    let resp = resp.on_hover_text(format!("{}\n{}{}", e.title, e.author, if e.fraction > 0.0 { format!("\n{:.0}% read", e.fraction * 100.0) } else { String::new() }));
+                    if resp.clicked() {
+                        open = Some(e.path.clone());
+                    }
+                    if resp.secondary_clicked() || resp.context_menu_opened() {
+                        menu_for = Some((e.clone(), resp.clone()));
+                    }
+                    resp.context_menu(|ui| self.book_menu(ui, &e));
                 }
-            });
-            ui.separator();
-
-            match self.auth_mode {
-                AuthMode::SignIn => self.ui_signin(ui),
-                AuthMode::Register => self.ui_register(ui),
             }
         });
-    }
-
-    fn ui_signin(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("login").num_columns(2).show(ui, |ui| {
-            ui.checkbox(&mut self.use_cookies, "Use session cookies instead");
-            ui.label("(if password login is disabled for your account)");
-            ui.end_row();
-
-            if self.use_cookies {
-                ui.label("remix_userid:");
-                ui.text_edit_singleline(&mut self.cookie_userid);
-                ui.end_row();
-                ui.label("remix_userkey:");
-                ui.text_edit_singleline(&mut self.cookie_userkey);
-                ui.end_row();
-            } else {
-                ui.label("Email:");
-                ui.text_edit_singleline(&mut self.email);
-                ui.end_row();
-                ui.label("Password:");
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                ui.end_row();
-            }
-            ui.label("Domain:");
-            ui.text_edit_singleline(&mut self.manual_domain);
-            ui.end_row();
-            ui.label("Proxy (optional):");
-            ui.text_edit_singleline(&mut self.proxy);
-            ui.end_row();
-        });
-
-        let reachable: Vec<String> = self.probe_results.iter().filter(|(_, ok)| *ok).map(|(d, _)| d.clone()).collect();
-        if !reachable.is_empty() {
-            ui.small(format!("reachable mirrors: {}", reachable.join(", ")));
-        }
-
-        ui.add_space(10.0);
-        let busy = self.logging_in;
-        let btn = egui::Button::new(if busy { "Signing in…" } else { "Sign in" });
-        if ui.add_enabled(!busy, btn).clicked() {
-            self.do_login();
-        }
-        if !self.login_error.is_empty() {
-            ui.colored_label(egui::Color32::RED, &self.login_error);
-            ui.small("If your account cannot use API password login, enable 'Use session cookies' and paste remix_userid / remix_userkey from a logged-in browser session (F12 → Application/Storage → Cookies on z-lib.ws).");
+        let _ = menu_for;
+        if let Some(p) = open {
+            self.open_path(Path::new(&p));
         }
     }
 
-    fn ui_register(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("register").num_columns(2).show(ui, |ui| {
-            ui.label("Email:");
-            ui.text_edit_singleline(&mut self.email);
-            ui.end_row();
-            ui.label("Password:");
-            ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-            ui.end_row();
-            ui.label("Nickname (optional):");
-            ui.text_edit_singleline(&mut self.reg_nickname);
-            ui.end_row();
-            ui.label("Domain:");
-            ui.text_edit_singleline(&mut self.manual_domain);
-            ui.end_row();
-            ui.label("Proxy (optional):");
-            ui.text_edit_singleline(&mut self.proxy);
-            ui.end_row();
-        });
-
-        match self.reg_stage {
-            RegStage::Idle => {
-                let busy = self.reg_busy;
-                if ui.add_enabled(!busy, egui::Button::new("Create account")).clicked() {
-                    self.do_register();
-                }
-            }
-            RegStage::CodeSent => {
-                ui.label("Confirmation code from email:");
-                let mut submit = false;
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.reg_code).desired_width(160.0),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
-                let busy = self.reg_busy;
-                if ui.add_enabled(!busy && !self.reg_code.trim().is_empty(), egui::Button::new("Confirm")).clicked() {
-                    submit = true;
-                }
-                if submit {
-                    self.do_confirm();
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Resend code")).clicked() {
-                    self.do_resend();
-                }
-            }
-        }
-        if !self.reg_info.is_empty() {
-            ui.colored_label(egui::Color32::GREEN, &self.reg_info);
-        }
-        if !self.login_error.is_empty() {
-            ui.colored_label(egui::Color32::RED, &self.login_error);
-        }
-    }
-
-    fn ui_search(&mut self, ctx: &egui::Context) {
-        // details side panel
-        let show_details = self.selected.is_some();
-        if show_details {
-            egui::SidePanel::right("details")
-                .min_width(320.0)
-                .default_width(360.0)
-                .show(ctx, |ui| self.ui_details(ui));
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // search bar
-            ui.horizontal(|ui| {
-                let mut submit = false;
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search title, author, ISBN…")
-                        .desired_width(ui.available_width() - 260.0),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    submit = true;
-                }
-                let busy = self.searching;
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Search"))
-                    .clicked()
-                {
-                    submit = true;
-                }
-                if submit {
-                    self.do_search(1);
-                }
-            });
-            ui.add_space(4.0);
-
-            // filters row
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.filters.exact, "exact");
-                ui.label("year");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filters.year_from)
-                        .desired_width(50.0)
-                        .hint_text("from"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filters.year_to)
-                        .desired_width(50.0)
-                        .hint_text("to"),
-                );
-                egui::ComboBox::from_id_salt("ext")
-                    .selected_text(if self.filters.extension.is_empty() { "any format".into() } else { self.filters.extension.clone() })
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        for ext in ["", "EPUB", "PDF", "MOBI", "AZW3", "FB2", "TXT", "RTF", "DJVU"] {
-                            ui.selectable_value(&mut self.filters.extension, ext.into(), if ext.is_empty() { "any format" } else { ext });
-                        }
-                    });
-                ui.text_edit_singleline(&mut self.filters.language)
-                    .on_hover_text("language, e.g. english");
-                egui::ComboBox::from_id_salt("order")
-                    .selected_text(order_label(&self.filters.order))
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        for (v, label) in [
-                            ("bestmatch", "best match"),
-                            ("popular", "popular"),
-                            ("date_created", "newest"),
-                            ("date_updated", "recently updated"),
-                            ("year", "year"),
-                            ("titleA", "title A–Z"),
-                        ] {
-                            ui.selectable_value(&mut self.filters.order, v.into(), label);
-                        }
-                    });
-            });
-            ui.add_space(6.0);
-
-            if !self.search_error.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.search_error);
+    fn list(&mut self, ui: &mut egui::Ui, pal: &Palette, items: &[usize]) {
+        let mut open = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, 64.0, items.len(), |ui, range| {
+            for &ei in &items[range] {
+                let e = self.index.entries[ei].clone();
+                let w = ui.available_width() - 12.0;
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, 60.0), Sense::click());
                 ui.add_space(4.0);
-            }
-
-            let results = self.results.clone();
-            if results.books.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(if self.searching {
-                        "Searching…"
-                    } else {
-                        "Enter a query and press Search."
-                    });
-                });
-            } else {
-                ui.label(format!(
-                    "Page {} of {} — {} results",
-                    results.page, results.total_pages, results.books.len()
-                ));
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for book in &results.books {
-                        let is_sel = self
-                            .selected
-                            .as_ref()
-                            .map(|s| s.id == book.id && s.hash == book.hash)
-                            .unwrap_or(false);
-                        let row = egui::SelectableLabel::new(
-                            is_sel,
-                            format!(
-                                "📘 {} — {} ({}) [{}] {}",
-                                book.title,
-                                book.author,
-                                book.year,
-                                book.extension.to_uppercase(),
-                                book.size
-                            ),
-                        );
-                        if ui.add(row).clicked() {
-                            self.fetch_details(book);
-                        }
-                    }
-                });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.page > 1 && !self.searching, egui::Button::new("← prev"))
-                        .clicked()
-                    {
-                        self.do_search(self.page - 1);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.page < self.results.total_pages && !self.searching,
-                            egui::Button::new("next →"),
-                        )
-                        .clicked()
-                    {
-                        self.do_search(self.page + 1);
-                    }
-                });
+                if resp.hovered() {
+                    ui.painter().rect_filled(rect, CornerRadius::same(8), pal.hover);
+                }
+                let cover = Rect::from_min_size(rect.min + vec2(8.0, 5.0), vec2(34.0, 50.0));
+                self.paint_cover(ui, cover, &e, false);
+                let x = cover.right() + 14.0;
+                let right_w = 260.0;
+                let tw = (rect.right() - x - right_w).max(100.0);
+                let mut job = egui::text::LayoutJob::simple(e.title.clone(), egui::FontId::proportional(14.5), pal.fg, tw);
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                let g = ui.painter().layout_job(job);
+                ui.painter().galley(pos2(x, rect.top() + 11.0), g, pal.fg);
+                ui.painter().text(pos2(x, rect.top() + 33.0), egui::Align2::LEFT_TOP, &e.author, egui::FontId::proportional(12.5), pal.muted);
+                let rx = rect.right() - right_w;
+                ui.painter().text(pos2(rx, rect.center().y), egui::Align2::LEFT_CENTER, format!("{} · {}", e.format, library::fmt_size(e.size)), egui::FontId::proportional(12.0), pal.muted);
+                let status = if e.finished { "Finished".to_string() } else if e.fraction > 0.0 { format!("{:.0}%", e.fraction * 100.0) } else { "New".to_string() };
+                ui.painter().text(pos2(rx + 120.0, rect.center().y), egui::Align2::LEFT_CENTER, status, egui::FontId::proportional(12.0), if e.fraction > 0.0 && !e.finished { ACCENT } else { pal.muted });
+                ui.painter().text(pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, if e.last_read > 0 { store::relative_time(e.last_read) } else { String::new() }, egui::FontId::proportional(12.0), pal.muted);
+                if resp.clicked() {
+                    open = Some(e.path.clone());
+                }
+                resp.context_menu(|ui| self.book_menu(ui, &e));
             }
         });
+        if let Some(p) = open {
+            self.open_path(Path::new(&p));
+        }
     }
 
-    fn ui_details(&mut self, ui: &mut egui::Ui) {
-        let book = self.selected.clone().unwrap();
-        ui.heading(&book.title);
-        ui.label(book.author.clone());
-        ui.add_space(6.0);
-        egui::Grid::new("book").num_columns(2).show(ui, |ui| {
-            ui.label("Year:"); ui.monospace(&book.year); ui.end_row();
-            ui.label("Language:"); ui.monospace(&book.language); ui.end_row();
-            ui.label("Format:"); ui.monospace(&book.extension); ui.end_row();
-            ui.label("Pages:"); ui.monospace(&book.pages); ui.end_row();
-            ui.label("Size:"); ui.monospace(&book.size); ui.end_row();
-            ui.label("ID:"); ui.monospace(format!("{}:{}", book.id, book.hash)); ui.end_row();
-        });
-        ui.add_space(8.0);
-
-        match &self.details {
-            None => {
-                if self.fetching_details {
-                    ui.label("Loading details…");
-                }
-            }
-            Some(Err(e)) => {
-                ui.colored_label(egui::Color32::RED, e);
-            }
-            Some(Ok(d)) => {
-                if !d.description.is_empty() {
-                    ui.collapsing("Description", |ui| {
-                        ui.label(&d.description);
+    fn details_window(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(id) = self.details.clone() else { return };
+        let Some(e) = self.index.entries.iter().find(|e| e.id == id).cloned() else {
+            self.details = None;
+            return;
+        };
+        let mut open = true;
+        let data = store::BookData::load(&id);
+        egui::Window::new("Book details").open(&mut open).collapsible(false).resizable(false).default_width(560.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(150.0, 225.0), Sense::hover());
+                self.paint_cover(ui, r, &e, true);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(360.0);
+                    ui.label(RichText::new(&e.title).size(20.0).strong());
+                    ui.label(RichText::new(&e.author).color(pal.muted));
+                    ui.add_space(8.0);
+                    egui::Grid::new("meta").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+                        let mut row = |k: &str, v: String| {
+                            if !v.is_empty() {
+                                ui.label(RichText::new(k).color(pal.muted));
+                                ui.label(v);
+                                ui.end_row();
+                            }
+                        };
+                        row("Series", e.series.clone());
+                        row("Publisher", e.publisher.clone());
+                        row("Language", e.language.clone());
+                        row("Format", format!("{} · {}", e.format, library::fmt_size(e.size)));
+                        row("Progress", if e.finished { "Finished".into() } else { format!("{:.0}%", e.fraction * 100.0) });
+                        let mins = (data.seconds / 60.0).round() as i64;
+                        row("Time read", if mins >= 60 { format!("{} h {} min", mins / 60, mins % 60) } else { format!("{mins} min") });
+                        row("Days read", if data.daily.is_empty() { String::new() } else { data.daily.len().to_string() });
+                        row("Last opened", if e.last_read > 0 { store::relative_time(e.last_read) } else { "never".into() });
+                        row("Highlights", if data.annotations.is_empty() { String::new() } else { data.annotations.len().to_string() });
+                        row("Bookmarks", if data.bookmarks.is_empty() { String::new() } else { data.bookmarks.len().to_string() });
                     });
-                }
-                ui.add_space(8.0);
-                let busy = self.active_dl.is_some();
-                if ui
-                    .add_enabled(!busy, egui::Button::new("⬇ Download").min_size(egui::vec2(ui.available_width(), 28.0)))
-                    .clicked()
-                {
-                    self.do_download(d.clone());
-                }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui::primary_button(ui, if e.fraction > 0.0 { "Continue reading" } else { "Start reading" }).clicked() {
+                            self.open_path(Path::new(&e.path));
+                            self.details = None;
+                        }
+                        if ui.button("Show in folder").clicked() {
+                            crate::platform::reveal(Path::new(&e.path));
+                        }
+                    });
+                });
+            });
+            if !e.description.is_empty() {
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    ui.label(RichText::new(&e.description).size(13.5));
+                });
             }
-        }
-        ui.add_space(10.0);
-        if ui.button("close").clicked() {
-            self.selected = None;
+            ui.add_space(4.0);
+            ui.label(RichText::new(&e.path).size(11.0).color(pal.muted));
+        });
+        if !open {
             self.details = None;
         }
     }
-}
 
-fn order_label(order: &str) -> String {
-    match order {
-        "popular" => "popular".into(),
-        "date_created" => "newest".into(),
-        "date_updated" => "recently updated".into(),
-        "year" => "year".into(),
-        "titleA" => "title A–Z".into(),
-        _ => "best match".into(),
+    fn status_overlays(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if let Some(name) = &self.opening {
+            egui::Area::new("opening".into()).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -30.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).fill(pal.panel).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Opening {name}…"));
+                    });
+                });
+            });
+        }
+        if let Some(err) = self.error.clone() {
+            egui::Area::new("err".into()).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -30.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).fill(pal.panel).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::from_rgb(220, 70, 60), format!("Couldn't open book: {err}"));
+                        if ui.small_button("Dismiss").clicked() {
+                            self.error = None;
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(id) = self.confirm_delete.clone() {
+            let e = self.index.entries.iter().find(|e| e.id == id).cloned();
+            let mut keep = true;
+            egui::Window::new("Delete file?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+                if let Some(e) = &e {
+                    ui.label(format!("“{}” will be permanently deleted from disk:", e.title));
+                    ui.label(RichText::new(&e.path).size(11.5).color(pal.muted));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(Color32::from_rgb(210, 60, 50))).clicked() {
+                            let _ = std::fs::remove_file(&e.path);
+                            let _ = std::fs::remove_file(library::cover_path(&e.id));
+                            self.index.entries.retain(|x| x.id != e.id);
+                            self.settings.extra_files.retain(|f| f != &e.path);
+                            self.index.save();
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                } else {
+                    keep = false;
+                }
+            });
+            if !keep {
+                self.confirm_delete = None;
+            }
+        }
     }
-}
 
-#[cfg(unix)]
-fn open_file(path: &str) {
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-}
+    fn settings_window(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut rescan = false;
+        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(520.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() - 160.0).show(ui, |ui| {
+                ui.set_width(500.0);
+                ui::section_label(ui, "Appearance");
+                ui.horizontal(|ui| {
+                    ui.label("Theme");
+                    ui.selectable_value(&mut self.settings.ui_theme, UiTheme::System, "System");
+                    ui.selectable_value(&mut self.settings.ui_theme, UiTheme::Light, "Light");
+                    ui.selectable_value(&mut self.settings.ui_theme, UiTheme::Dark, "Dark");
+                });
 
-#[cfg(windows)]
-fn open_file(path: &str) {
-    let _ = std::process::Command::new("explorer").arg(path).spawn();
-}
+                ui::section_label(ui, "Library folders");
+                ui.horizontal(|ui| {
+                    ui.label("Downloads:");
+                    ui.add(egui::Label::new(RichText::new(&self.settings.download_dir).monospace().size(12.0)).truncate());
+                    if ui.small_button("Change…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_directory(&self.settings.download_dir).pick_folder() {
+                            self.settings.download_dir = d.to_string_lossy().into_owned();
+                            rescan = true;
+                        }
+                    }
+                });
+                let mut remove = None;
+                for (i, d) in self.settings.library_dirs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui::paint_icon(ui.painter(), Rect::from_min_size(ui.cursor().min, vec2(18.0, 18.0)), Icon::Folder, pal.muted);
+                        ui.add_space(22.0);
+                        ui.add(egui::Label::new(RichText::new(d).monospace().size(12.0)).truncate());
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.settings.library_dirs.remove(i);
+                    rescan = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Add folder…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                            let s = d.to_string_lossy().into_owned();
+                            if !self.settings.library_dirs.contains(&s) {
+                                self.settings.library_dirs.push(s);
+                            }
+                            rescan = true;
+                        }
+                    }
+                    if !self.settings.hidden_paths.is_empty() && ui.button(format!("Restore {} removed books", self.settings.hidden_paths.len())).clicked() {
+                        self.settings.hidden_paths.clear();
+                        rescan = true;
+                    }
+                });
+                ui.label(RichText::new("Folders are scanned recursively. Books opened from elsewhere are added automatically.").size(12.0).color(pal.muted));
 
-#[cfg(unix)]
-fn open_containing(path: &str) {
-    use std::os::unix::process::CommandExt;
-    let _ = std::process::Command::new("xdg-open")
-        .arg(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")))
-        .process_group(0)
-        .spawn();
-}
+                ui::section_label(ui, "Read aloud");
+                ui.horizontal(|ui| {
+                    ui.label("Speed");
+                    ui.add(egui::Slider::new(&mut self.settings.tts_rate, 0.5..=2.5).step_by(0.1).suffix("×"));
+                    ui.label(RichText::new(match crate::tts::available() {
+                        Some(e) => format!("engine: {e}"),
+                        None => "no speech engine found".into(),
+                    }).size(12.0).color(pal.muted));
+                });
 
-#[cfg(windows)]
-fn open_containing(path: &str) {
-    let _ = std::process::Command::new("explorer")
-        .arg(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")))
-        .spawn();
+                ui::section_label(ui, "Lookup & translation");
+                ui.horizontal(|ui| {
+                    ui.label("Translate to");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.translate_to).desired_width(70.0));
+                    ui.label(RichText::new("language code, e.g. en, de, ja").size(12.0).color(pal.muted));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Reading speed");
+                    ui.add(egui::Slider::new(&mut self.settings.reading_speed_cpm, 300.0..=4000.0).suffix(" chars/min"));
+                });
+                ui.label(RichText::new("Used for “time left” estimates; adapts automatically as you read.").size(12.0).color(pal.muted));
+
+                ui::section_label(ui, "Progress sync (KOReader-compatible)");
+                ui.checkbox(&mut self.settings.kosync.enabled, "Sync reading progress");
+                egui::Grid::new("ks").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+                    ui.label("Server");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.server).desired_width(300.0));
+                    ui.end_row();
+                    ui.label("Username");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.username).desired_width(200.0));
+                    ui.end_row();
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut self.kosync_password).password(true).desired_width(200.0).hint_text(if self.settings.kosync.userkey.is_empty() { "" } else { "(saved)" }));
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    let mk = |s: &mut App| {
+                        if !s.kosync_password.is_empty() {
+                            s.settings.kosync.userkey = crate::kosync::md5_hex(&s.kosync_password);
+                            s.kosync_password.clear();
+                        }
+                        (s.settings.kosync.clone(), s.settings.proxy_opt(), s.tx.clone(), s.ctx.clone())
+                    };
+                    if ui.button("Log in").clicked() {
+                        let (cfg, proxy, tx, ctx) = mk(self);
+                        self.kosync_status = "Checking…".into();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Msg::Kosync(crate::kosync::auth(&cfg, &proxy).map(|_| "Logged in ✓".to_string())));
+                            ctx.request_repaint();
+                        });
+                    }
+                    if ui.button("Register").clicked() {
+                        let (cfg, proxy, tx, ctx) = mk(self);
+                        self.kosync_status = "Registering…".into();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Msg::Kosync(crate::kosync::register(&cfg, &proxy).map(|_| "Account created ✓".to_string())));
+                            ctx.request_repaint();
+                        });
+                    }
+                    ui.label(&self.kosync_status);
+                });
+                ui.label(RichText::new("Progress is pulled when you open a book and pushed when you close it. Works with KOReader and other kosync clients.").size(12.0).color(pal.muted));
+
+                ui::section_label(ui, "Network");
+                ui.horizontal(|ui| {
+                    ui.label("Proxy");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.proxy).hint_text("socks5://127.0.0.1:9050").desired_width(260.0));
+                });
+
+                ui::section_label(ui, "About");
+                ui.label(RichText::new(format!("zlib-reader {} · data in {}", env!("CARGO_PKG_VERSION"), store::config_dir().display())).size(12.0).color(pal.muted));
+                ui.label(RichText::new("Shortcuts: ←/→ Space PgUp/PgDn turn pages · T contents · Ctrl+F search · Ctrl+B bookmark · F11 fullscreen · Ctrl +/− font size · Backspace back · Esc close").size(12.0).color(pal.muted));
+            });
+        });
+        if rescan {
+            self.rescan();
+        }
+        if !open {
+            self.settings_open = false;
+            self.settings.save();
+        }
+    }
 }

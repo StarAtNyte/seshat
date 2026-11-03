@@ -1,0 +1,484 @@
+//! Reflowable view: geometry, layout cache, painting, pointer interaction.
+
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Sense, Ui, Vec2};
+
+use super::layout::{Deco, DecoKind, SectionLayout, Typo};
+use super::{deco_color, Env, Reader};
+use crate::book::{BlockKind, Loc};
+use crate::store::{HlStyle, Layout, ReaderSettings};
+use crate::texload::Src;
+use crate::ui::{Palette, ACCENT};
+
+pub(super) struct Geo {
+    pub x0: f32,
+    pub col_w: f32,
+    pub gap: f32,
+    pub cols: usize,
+    pub top: f32,
+    pub page_h: f32,
+}
+
+impl Geo {
+    fn origin(&self, col: usize) -> Pos2 {
+        pos2(self.x0 + col as f32 * (self.col_w + self.gap), self.top)
+    }
+}
+
+impl Reader {
+    fn geometry(&self, rect: Rect, s: &ReaderSettings) -> Geo {
+        let header = if s.show_header { 40.0 } else { 20.0 };
+        let footer = if s.show_footer { 40.0 } else { 20.0 };
+        let margin = s.margin.min(rect.width() * 0.15).max(12.0);
+        let avail = rect.width() - 2.0 * margin;
+        let paginated = s.layout == Layout::Paginated;
+        let two = paginated
+            && match s.columns {
+                crate::store::Columns::One => false,
+                crate::store::Columns::Two => avail > 640.0,
+                crate::store::Columns::Auto => avail > 1050.0 && rect.width() > rect.height() * 1.1,
+            };
+        let gap = if two { (margin * 1.5).clamp(40.0, 120.0) } else { 0.0 };
+        let col_w = if two { ((avail - gap) / 2.0).min(s.max_width) } else { avail.min(s.max_width) };
+        let cols = if two { 2 } else { 1 };
+        let total = col_w * cols as f32 + gap;
+        let x0 = (rect.center().x - total / 2.0).round();
+        let top = rect.top() + header;
+        let page_h = (rect.bottom() - footer - top).max(80.0);
+        Geo { x0, col_w: col_w.max(120.0), gap, cols, top, page_h }
+    }
+
+    fn ensure_layout(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &Env, g: &Geo) {
+        let book = self.book.clone();
+        let Some(flow) = book.flow() else { return };
+        let si = self.loc.section.min(flow.sections.len() - 1);
+        let sec = &flow.sections[si];
+        // request images of this section (and the next one, as prefetch)
+        let mut known = 0usize;
+        for (k, idx) in sec.blocks.iter().filter_map(|b| if let BlockKind::Image(k) = &b.kind { Some((k, si)) } else { None }) {
+            let _ = idx;
+            self.tex.request(k, || flow.resources.get(k).cloned().map(Src::Res), 2048);
+            if !self.tex.is_pending(k) {
+                known += 1;
+            }
+        }
+        if let Some(next) = flow.sections.get(si + 1) {
+            for b in next.blocks.iter().take(30) {
+                if let BlockKind::Image(k) = &b.kind {
+                    self.tex.request(k, || flow.resources.get(k).cloned().map(Src::Res), 2048);
+                }
+            }
+        }
+        let typo = Typo {
+            size: s.font_size,
+            line_height: s.line_height,
+            para: s.para_spacing,
+            letter: s.letter_spacing,
+            justify: s.justify,
+            indent: s.indent,
+            override_book: s.override_book,
+            fg: pal.fg,
+            link: pal.link,
+            width: g.col_w,
+            page_h: g.page_h,
+            fake_italic: !env.installed.has_italic,
+            font_tag: format!("{}{}", env.installed.book_family, env.installed.cjk),
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (si, typo.key(), known, s.layout == Layout::Paginated).hash(&mut h);
+        let key = h.finish();
+        if self.layout.as_ref().is_some_and(|l| l.key == key) {
+            return;
+        }
+        let tex = &self.tex;
+        let lay = SectionLayout::build(ctx, si, sec, &typo, &|k| tex.get(k).map(|l| l.size), key);
+        self.step = g.cols;
+        if self.go_end {
+            self.go_end = false;
+            let last = lay.pages.len().saturating_sub(1);
+            self.page = last - last % self.step;
+            self.scroll_y = (lay.height - g.page_h).max(0.0);
+            let (b, o) = lay.page_start(self.page);
+            self.loc = Loc::new(si, b, o);
+        } else {
+            self.page = lay.page_for(self.loc.block, self.loc.offset);
+            self.page -= self.page % self.step;
+            if self.layout.as_ref().map(|l| l.section) != Some(si) || s.layout == Layout::Paginated {
+                self.scroll_y = (lay.y_of(self.loc.block, self.loc.offset) - 4.0).max(0.0);
+            }
+        }
+        self.layout = Some(lay);
+    }
+
+    pub(super) fn next_page(&mut self) {
+        if self.book.fixed().is_some() {
+            return self.fixed_next();
+        }
+        let Some(flow) = self.book.flow() else { return };
+        let n = flow.sections.len();
+        let Some(l) = &self.layout else { return };
+        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
+            return self.scroll_by(self.view_h * 0.9);
+        }
+        if self.page + self.step < l.pages.len() {
+            self.page += self.step;
+            let (b, o) = l.page_start(self.page);
+            self.loc = Loc::new(l.section, b, o);
+        } else if l.section + 1 < n {
+            self.loc = Loc::new(l.section + 1, 0, 0);
+            self.page = 0;
+        } else {
+            self.data.finished = true;
+        }
+        self.last_turn = Instant::now();
+        self.clear_selection();
+        self.dirty = true;
+    }
+
+    pub(super) fn prev_page(&mut self) {
+        if self.book.fixed().is_some() {
+            return self.fixed_prev();
+        }
+        let Some(l) = &self.layout else { return };
+        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled {
+            return self.scroll_by(-self.view_h * 0.9);
+        }
+        if self.page >= self.step {
+            self.page -= self.step;
+            let (b, o) = l.page_start(self.page);
+            self.loc = Loc::new(l.section, b, o);
+        } else if l.section > 0 {
+            self.loc = Loc::new(l.section - 1, 0, 0);
+            self.go_end = true;
+        }
+        self.last_turn = Instant::now();
+        self.clear_selection();
+        self.dirty = true;
+    }
+
+    pub(super) fn scroll_by(&mut self, dy: f32) {
+        if self.book.fixed().is_some() {
+            self.fx.scroll += dy;
+            return;
+        }
+        let Some(l) = &self.layout else { return };
+        let max = (l.height - self.view_h + 40.0).max(0.0);
+        let n = self.book.flow().map(|f| f.sections.len()).unwrap_or(1);
+        let target = self.scroll_y + dy;
+        if target > max + 1.0 {
+            if self.scroll_y >= max - 1.0 && l.section + 1 < n {
+                self.loc = Loc::new(l.section + 1, 0, 0);
+                self.scroll_y = 0.0;
+                self.dirty = true;
+                return;
+            }
+            self.scroll_y = max;
+        } else if target < 0.0 {
+            if self.scroll_y <= 1.0 && l.section > 0 {
+                self.loc = Loc::new(l.section - 1, 0, 0);
+                self.go_end = true;
+                self.dirty = true;
+                return;
+            }
+            self.scroll_y = 0.0;
+        } else {
+            self.scroll_y = target;
+        }
+        let u = l.unit_at_y(self.scroll_y);
+        if let Some(u) = l.units.get(u) {
+            self.loc = Loc::new(l.section, u.block, u.c0);
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn section_edge(&mut self, end: bool) {
+        if self.book.fixed().is_some() {
+            let n = self.book.fixed().map(|f| f.pages).unwrap_or(1);
+            self.fx.page = if end { n - 1 } else { 0 };
+            return;
+        }
+        if let Some(l) = &self.layout {
+            if end {
+                let last = l.pages.len().saturating_sub(1);
+                self.page = last - last % self.step.max(1);
+                self.scroll_y = (l.height - self.view_h).max(0.0);
+            } else {
+                self.page = 0;
+                self.scroll_y = 0.0;
+            }
+            let (b, o) = l.page_start(self.page);
+            self.loc = Loc::new(l.section, b, o);
+        }
+    }
+
+    /// Map a screen point to (column, column-local point, slice top, slice bottom).
+    fn locate(&self, g: &Geo, pos: Pos2, paginated: bool) -> Option<(usize, Vec2, f32, f32)> {
+        let l = self.layout.as_ref()?;
+        let col = if g.cols == 2 && pos.x > g.x0 + g.col_w + g.gap / 2.0 { 1 } else { 0 };
+        let o = g.origin(col);
+        if paginated {
+            let pg = l.pages.get(self.page + col)?;
+            Some((col, pos - o, pg.top, pg.bottom))
+        } else {
+            Some((0, pos - o, self.scroll_y, self.scroll_y + g.page_h))
+        }
+    }
+
+    fn hit(&self, g: &Geo, pos: Pos2, paginated: bool, clamp: bool) -> Option<(usize, usize)> {
+        let (_, local, top, bottom) = self.locate(g, pos, paginated)?;
+        self.layout.as_ref()?.hit(top, bottom, local, clamp)
+    }
+
+    fn decos(&self, pal: &Palette) -> Vec<Deco> {
+        let mut v = Vec::new();
+        let sec = self.loc.section;
+        let range = |v: &mut Vec<Deco>, s: Loc, e: Loc, kind: DecoKind| {
+            if s.section != sec {
+                return;
+            }
+            for b in s.block..=e.block {
+                let c0 = if b == s.block { s.offset } else { 0 };
+                let c1 = if b == e.block { e.offset } else { usize::MAX };
+                v.push(Deco { block: b, c0, c1, kind });
+            }
+        };
+        for a in &self.data.annotations {
+            let c = deco_color(a.color, pal.dark);
+            let kind = match a.style {
+                HlStyle::Highlight => DecoKind::Fill(c),
+                HlStyle::Underline => DecoKind::Underline(c.to_opaque()),
+            };
+            range(&mut v, a.start, a.end, kind);
+        }
+        if let Some(i) = self.search_cur {
+            if let Some(h) = self.search_hits.get(i) {
+                range(&mut v, h.loc, Loc::new(h.loc.section, h.loc.block, h.loc.offset + h.len), DecoKind::Fill(Color32::from_rgba_unmultiplied(255, 150, 0, 120)));
+            }
+        }
+        if let Some((l, e)) = self.tts_at {
+            range(&mut v, l, Loc::new(l.section, l.block, e), DecoKind::Fill(ACCENT.linear_multiply(0.22)));
+        }
+        if let Some(((b0, c0), (b1, c1))) = self.sel {
+            range(&mut v, Loc::new(sec, b0, c0), Loc::new(sec, b1, c1), DecoKind::Fill(ACCENT.linear_multiply(if pal.dark { 0.45 } else { 0.3 })));
+        }
+        v
+    }
+
+    pub(super) fn flow_view(&mut self, ui: &mut Ui, rect: Rect, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
+        self.last_layout = s.layout;
+        let paginated = s.layout == Layout::Paginated;
+        let g = self.geometry(rect, s);
+        self.view_h = g.page_h;
+        self.ensure_layout(ui.ctx(), s, pal, env, &g);
+        let Some(l) = &self.layout else { return };
+        if l.section != self.loc.section {
+            return;
+        }
+        if self.page >= l.pages.len() {
+            self.page = l.pages.len().saturating_sub(1);
+            self.page -= self.page % self.step.max(1);
+        }
+
+        // ----- input -----
+        let resp = ui.interact(rect, ui.id().with("page"), Sense::click_and_drag());
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        if resp.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            self.drag_anchor = origin.and_then(|p| self.hit(&g, p, paginated, false));
+            self.sel = None;
+            self.sel_popup = None;
+            self.hl_popup = None;
+            self.footnote = None;
+        }
+        if resp.dragged() {
+            if let (Some(a), Some(p)) = (self.drag_anchor, resp.interact_pointer_pos()) {
+                if let Some(h) = self.hit(&g, p, paginated, true) {
+                    let (s0, s1) = if h < a { (h, a) } else { (a, h) };
+                    self.sel = (s0 != s1).then_some((s0, s1));
+                }
+                // autoscroll while selecting in scrolled mode
+                if !paginated {
+                    if p.y > rect.bottom() - 30.0 {
+                        self.scroll_by(8.0);
+                    } else if p.y < rect.top() + 30.0 {
+                        self.scroll_by(-8.0);
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_anchor = None;
+            if self.sel.is_some() {
+                self.sel_popup = resp.interact_pointer_pos();
+            }
+        }
+        if resp.double_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if let Some((b, c)) = self.hit(&g, p, paginated, false) {
+                    let text = self.book.flow().and_then(|f| f.sections.get(self.loc.section)).and_then(|s| s.blocks.get(b)).map(|b| b.text()).unwrap_or_default();
+                    let (ws, we) = super::layout::word_at(&text, c);
+                    if we > ws {
+                        self.sel = Some(((b, ws), (b, we)));
+                        self.sel_popup = Some(p);
+                    }
+                }
+            }
+        } else if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.on_click(&g, p, rect, s, paginated);
+            }
+        }
+        if resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if self.sel.is_none() {
+                    if let Some((b, c)) = self.hit(&g, p, paginated, false) {
+                        let text = self.book.flow().and_then(|f| f.sections.get(self.loc.section)).and_then(|s| s.blocks.get(b)).map(|b| b.text()).unwrap_or_default();
+                        let (ws, we) = super::layout::word_at(&text, c);
+                        if we > ws {
+                            self.sel = Some(((b, ws), (b, we)));
+                        }
+                    }
+                }
+                if self.sel.is_some() {
+                    self.sel_popup = Some(p);
+                }
+            }
+        }
+        if hover.is_some_and(|p| rect.contains(p)) {
+            let (raw, smooth, cmd) = ui.input(|i| (i.raw_scroll_delta, i.smooth_scroll_delta, i.modifiers.command));
+            if cmd {
+                // ctrl+wheel = font size
+                if raw.y != 0.0 {
+                    self.bump_font(env, raw.y.signum());
+                }
+            } else if paginated {
+                if s.wheel_turns_page {
+                    self.wheel_acc += raw.y + raw.x;
+                    if self.last_turn.elapsed() > Duration::from_millis(180) {
+                        if self.wheel_acc <= -40.0 {
+                            self.wheel_acc = 0.0;
+                            self.next_page();
+                        } else if self.wheel_acc >= 40.0 {
+                            self.wheel_acc = 0.0;
+                            self.prev_page();
+                        }
+                    } else {
+                        self.wheel_acc = 0.0;
+                    }
+                }
+            } else if smooth.y != 0.0 {
+                self.scroll_by(-smooth.y);
+            }
+            // pointer cursor feedback
+            if let Some(p) = hover {
+                if let Some((_, local, top, _)) = self.locate(&g, p, paginated) {
+                    if let Some(l) = &self.layout {
+                        if l.over_text(top, local) {
+                            let link = self.hit(&g, p, paginated, false).and_then(|(b, c)| self.book.flow()?.sections.get(self.loc.section)?.blocks.get(b)?.link_at(c));
+                            ui.ctx().set_cursor_icon(if link.is_some() { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Text });
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- paint -----
+        let decos = self.decos(pal);
+        let Some(l) = &self.layout else { return };
+        if l.section != self.loc.section {
+            ui.ctx().request_repaint();
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let tex = &self.tex;
+        let texfn = |k: &str| tex.get(k).map(|t| t.tex.id());
+        let dim = s.dim_images && pal.dark;
+        if paginated {
+            for col in 0..g.cols {
+                if let Some(pg) = l.pages.get(self.page + col) {
+                    l.paint(&painter, g.origin(col), pg.top, pg.bottom, &texfn, &decos, pal.fg, dim);
+                }
+            }
+        } else {
+            l.paint(&painter, g.origin(0), self.scroll_y, self.scroll_y + g.page_h, &texfn, &decos, pal.fg, dim);
+        }
+
+        // running header / footer
+        let small = egui::FontId::proportional(12.5);
+        if s.show_header {
+            let t = self.chapter_title(self.loc);
+            let t: String = if t.chars().count() > 80 { t.chars().take(80).collect::<String>() + "…" } else { t };
+            painter.text(pos2(rect.center().x, rect.top() + 20.0), egui::Align2::CENTER_CENTER, t, small.clone(), pal.muted);
+        }
+        if s.show_footer {
+            let y = rect.bottom() - 20.0;
+            if let Some(flow) = self.book.flow() {
+                let pct = (flow.fraction(self.loc) * 100.0).round();
+                let step = self.step.max(1);
+                if paginated {
+                    for col in 0..g.cols {
+                        let pi = self.page + col;
+                        if pi < l.pages.len() {
+                            let o = g.origin(col);
+                            painter.text(pos2(o.x + g.col_w / 2.0, y), egui::Align2::CENTER_CENTER, format!("{} / {}", pi + 1, l.pages.len()), small.clone(), pal.muted);
+                        }
+                    }
+                }
+                painter.text(pos2(g.x0 + g.col_w * g.cols as f32 + g.gap, y), egui::Align2::RIGHT_CENTER, format!("{pct}%"), small.clone(), pal.muted);
+                let left = flow.section_chars_after(self.loc) as f32 / env.app.reading_speed_cpm.max(100.0);
+                let left_txt = if left < 1.0 { "less than a minute left in chapter".to_string() } else { format!("{} min left in chapter", left.round()) };
+                let _ = step;
+                painter.text(pos2(g.x0, y), egui::Align2::LEFT_CENTER, left_txt, small, pal.muted);
+            }
+        }
+        // bookmark ribbon
+        if self.bookmark_here().is_some() {
+            let x = g.x0 + g.col_w * g.cols as f32 + g.gap + 12.0;
+            let r = Rect::from_min_size(pos2(x.min(rect.right() - 26.0), rect.top()), vec2(14.0, 26.0));
+            painter.add(egui::Shape::convex_polygon(vec![r.left_top(), r.right_top(), r.right_bottom(), pos2(r.center().x, r.bottom() - 6.0), r.left_bottom()], Color32::from_rgb(220, 60, 60), egui::Stroke::NONE));
+        }
+    }
+
+    fn on_click(&mut self, g: &Geo, p: Pos2, rect: Rect, s: &ReaderSettings, paginated: bool) {
+        if self.sel_popup.is_some() || self.hl_popup.is_some() || self.footnote.is_some() || self.sel.is_some() {
+            self.clear_selection();
+            self.footnote = None;
+            return;
+        }
+        if let Some((b, c)) = self.hit(g, p, paginated, false) {
+            let sec = self.loc.section;
+            let here = Loc::new(sec, b, c);
+            if let Some(a) = self.data.annotations.iter().find(|a| a.start <= here && here < a.end) {
+                self.hl_popup = Some((a.id, p));
+                return;
+            }
+            let link = self.book.flow().and_then(|f| f.sections.get(sec)).and_then(|s| s.blocks.get(b)).and_then(|blk| {
+                let li = blk.link_at(c)?;
+                let mut pos = 0;
+                let mut text = String::new();
+                for sp in &blk.spans {
+                    let n = sp.text.chars().count();
+                    if sp.link == Some(li) && c >= pos && c < pos + n + 1 {
+                        text = sp.text.clone();
+                    }
+                    pos += n;
+                }
+                Some((li, text))
+            });
+            if let Some((li, text)) = link {
+                self.follow_link(li, p, &text);
+                return;
+            }
+        }
+        let fx = (p.x - rect.left()) / rect.width();
+        if s.tap_zones && fx < 0.28 {
+            self.prev_page();
+        } else if s.tap_zones && fx > 0.72 {
+            self.next_page();
+        } else {
+            self.chrome = !self.chrome;
+        }
+    }
+}
