@@ -1,16 +1,22 @@
-# zlib-lite
+# zlib-reader
 
-A lightweight native Z-Library desktop client — search and download books with your own UI, **no webview, no Chromium** (~15 MB binary vs the 872 MB Electron app).
+A lightweight native **ebook reader** with Z-Library search built in — find, download, and read books with your own UI, **no webview, no Chromium** (~15 MB binary vs the 872 MB Electron app).
 
 Built in Rust with [egui](https://github.com/emilk/egui); talks directly to the Z-Library EAPI.
 
 ## Features
 
-- 🔌 **Auto mirror discovery** — probes known EAPI mirrors at startup, first reachable wins (`GET /eapi/info/ok`)
-- 🔑 **Sign in** — email/password, or cookie import (`remix_userid` / `remix_userkey`) for accounts that can't use API password login
-- 🆕 **Create account** — registration with emailed confirmation code
-- 🔍 **Search** — title/author/ISBN; filters: exact, year range, format (EPUB/PDF/MOBI/…), language, sort order; paginated
-- ⬇️ **Download** — click a result, view details, download with progress bar into a folder of your choice (temp file + atomic rename, never truncates existing files)
+### Two search mechanisms
+
+- 📚 **Library search** — instantly filter your local collection by title/author (scans your download folder; EPUB metadata indexed in the background)
+- 🌐 **Z-Library search** — find new books online: title/author/ISBN; filters: exact, year range, format (EPUB/PDF/MOBI/…), language, sort order; paginated
+
+### Reader
+
+- 📖 **Built-in EPUB reader** — chapter navigation (⏮ ◀ ▶ + chapter dropdown), adjustable font size (A- / A+), remembers your reading position per book
+- ⬇️ **One-click download** — with progress bar; atomic file writes; "Read now" button on completed downloads
+- 🔌 **Auto mirror discovery** — probes known EAPI mirrors at startup, first reachable wins
+- 🔑 **Sign in / register** — email/password, cookie import fallback (`remix_userid` / `remix_userkey`), or create a new account with emailed confirmation code
 - 🕶 **Optional proxy** — SOCKS5/HTTP (e.g. Tor: `socks5://127.0.0.1:9050`)
 
 ## Build & run
@@ -21,7 +27,7 @@ cargo run --release
 
 Linux requires the usual WebKit/GTK-free GUI deps only (this app uses egui, so just X11/Wayland headers which most distros ship).
 
-Session and settings are stored in `~/.config/zlib-lite/`.
+Session and settings are stored in `~/.config/zlib-reader/`.
 
 ## How it works (protocol)
 
@@ -54,5 +60,5 @@ For personal use with your own Z-Library account. This project is not affiliated
 Keep the GitHub private repo up to date:
 
 ```sh
-./sync.sh          # commit + push (private repo, StarAtNyte/zlib-lite)
+./sync.sh          # commit + push (private repo, StarAtNyte/zlib-reader)
 ```

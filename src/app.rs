@@ -30,6 +30,7 @@ pub enum Msg {
         total: Option<u64>,
     },
     DlDone(Result<(String, String, u64), String>), // (title, path, size)
+    LibraryScanned(Vec<crate::library::LibraryEntry>),
 }
 
 // ---------- persisted state ----------
@@ -40,6 +41,10 @@ struct SavedSession {
     user_id: String,
     user_key: String,
     email: String,
+}
+
+pub fn config_dir_path() -> PathBuf {
+    config_dir()
 }
 
 fn config_dir() -> PathBuf {
@@ -116,10 +121,34 @@ enum RegStage {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+enum MainTab {
+    Library,
+    Online,
+}
+
+#[derive(PartialEq, Clone, Copy)]
 enum Screen {
     Connecting,
     Login,
     Search,
+}
+
+pub struct OpenBook {
+    pub path: String,
+    pub title: String,
+    pub author: String,
+    pub epub: Option<crate::epub::Epub>,
+    pub chapter: usize,
+    pub font_size: f32,
+}
+
+impl OpenBook {
+    pub fn total_chapters(&self) -> usize {
+        match &self.epub {
+            Some(e) => e.chapters.len(),
+            None => 1,
+        }
+    }
 }
 
 pub struct App {
@@ -171,6 +200,14 @@ pub struct App {
     dl_error: String,
 
     proxy: String,
+
+    // library + reader
+    main_tab: MainTab,
+    library: Vec<crate::library::LibraryEntry>,
+    library_query: String,
+    library_scanning: bool,
+    progress_store: crate::library::ProgressStore,
+    open_book: Option<OpenBook>,
 }
 
 impl App {
@@ -211,7 +248,14 @@ impl App {
             downloads: Vec::new(),
             dl_error: String::new(),
             proxy: String::new(),
+            main_tab: MainTab::Library,
+            library: Vec::new(),
+            library_query: String::new(),
+            library_scanning: false,
+            progress_store: crate::library::load_progress(),
+            open_book: None,
         };
+        app.scan_library();
         if app.session.is_some() {
             // still verify the saved session with a quick probe of its domain
             app.screen = Screen::Search;
@@ -352,12 +396,17 @@ impl App {
                 Msg::DlProgress { title, written, total } => {
                     self.active_dl = Some((title, written, total));
                 }
+                Msg::LibraryScanned(entries) => {
+                    self.library_scanning = false;
+                    self.library = entries;
+                }
                 Msg::DlDone(res) => {
                     self.active_dl = None;
                     match res {
                         Ok((title, path, size)) => {
                             self.dl_error.clear();
-                            self.downloads.insert(0, DownloadEntry { title, path, size });
+                            self.downloads.insert(0, DownloadEntry { title: title.clone(), path: path.clone(), size });
+                            self.scan_library();
                         }
                         Err(e) => self.dl_error = e,
                     }
@@ -527,14 +576,32 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(ob) = self.open_book.take() {
+            crate::library::set_progress(
+                &mut self.progress_store,
+                &ob.path,
+                crate::library::Progress { chapter: ob.chapter, scroll: 0.0 },
+            );
+        }
+        crate::library::save_progress(&self.progress_store);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
         ctx.request_repaint_after(Duration::from_millis(200));
 
+        if self.open_book.is_some() {
+            self.ui_reader(ctx);
+            return;
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("zlib-lite");
+                ui.heading("zlib-reader");
                 ui.separator();
+                ui.selectable_value(&mut self.main_tab, MainTab::Library, "📚 Library");
+                ui.selectable_value(&mut self.main_tab, MainTab::Online, "🌐 Z-Library");
                 match &self.session {
                     Some(s) => {
                         ui.label(format!("{}  •  {}", s.domain, if s.email.is_empty() { "logged in" } else { &s.email }));
@@ -571,10 +638,22 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .max_height(90.0)
                     .show(ui, |ui| {
-                        for dl in &self.downloads {
+                        let downloads = self.downloads.clone();
+                        for dl in &downloads {
                             ui.horizontal(|ui| {
                                 ui.strong(&dl.title);
                                 ui.monospace(format!("{} MB", dl.size / 1_048_576));
+                                let is_epub = dl.path.to_lowercase().ends_with(".epub");
+                                if ui.add_enabled(is_epub, egui::Button::new("📖 Read now")).clicked() {
+                                    self.open_book_from(crate::library::LibraryEntry {
+                                        path: dl.path.clone(),
+                                        title: dl.title.clone(),
+                                        author: String::new(),
+                                        format: "EPUB".into(),
+                                        size: dl.size,
+                                        progress: None,
+                                    });
+                                }
                                 if ui.small_button("open folder").clicked() {
                                     open_containing(&dl.path);
                                 }
@@ -600,10 +679,254 @@ impl eframe::App for App {
             }
         });
 
-        match self.screen {
-            Screen::Connecting => self.ui_connecting(ctx),
-            Screen::Login => self.ui_login(ctx),
-            Screen::Search => self.ui_search(ctx),
+        match self.main_tab {
+            MainTab::Library => self.ui_library(ctx),
+            MainTab::Online => match self.screen {
+                Screen::Connecting => self.ui_connecting(ctx),
+                Screen::Login => self.ui_login(ctx),
+                Screen::Search => self.ui_search(ctx),
+            },
+        }
+    }
+}
+
+impl App {
+    fn scan_library(&mut self) {
+        if self.library_scanning {
+            return;
+        }
+        self.library_scanning = true;
+        let tx = self.tx.clone();
+        let dir = self.download_dir.clone();
+        std::thread::spawn(move || {
+            let entries = crate::library::scan(&dir);
+            let _ = tx.send(Msg::LibraryScanned(entries));
+        });
+    }
+
+    fn ui_library(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let mut submit = false;
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.library_query)
+                        .hint_text("Search your library — title, author…")
+                        .desired_width(ui.available_width() - 150.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui.button("🔍").clicked() {
+                    submit = true;
+                }
+                let busy = self.library_scanning;
+                if ui.add_enabled(!busy, egui::Button::new(if busy { "rescanning…" } else { "rescan" })).clicked() {
+                    submit = true;
+                }
+                if submit {
+                    self.scan_library();
+                }
+            });
+            ui.add_space(6.0);
+
+            let filtered = crate::library::search(&self.library, &self.library_query);
+            if self.library.is_empty() && !self.library_scanning {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label("Your library is empty.");
+                    ui.small("Download books from the Z-Library tab, or place files in the folder shown at the bottom.");
+                });
+                return;
+            }
+            ui.label(format!(
+                "{} {}",
+                filtered.len(),
+                if filtered.len() == 1 { "book" } else { "books" }
+            ));
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let progress_store = self.progress_store.clone();
+                for entry in &filtered {
+                    ui.horizontal(|ui| {
+                        let read = crate::library::get_progress(&progress_store, &entry.path).is_some();
+                        let label = format!(
+                            "{} {} — {} [{}] {}{}",
+                            if read { "📖" } else { "📘" },
+                            entry.title,
+                            if entry.author.is_empty() { "unknown author" } else { &entry.author },
+                            entry.format,
+                            crate::library::fmt_size(entry.size),
+                            if read { " • in progress" } else { "" },
+                        );
+                        let row = egui::SelectableLabel::new(false, label);
+                        if ui.add(row).clicked() {
+                            self.open_book_from(entry.clone());
+                        }
+                        if ui.small_button("open file").clicked() {
+                            open_file(&entry.path);
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    fn open_book_from(&mut self, entry: crate::library::LibraryEntry) {
+        let path = std::path::PathBuf::from(&entry.path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        let (epub, title, author) = match ext.as_str() {
+            "epub" => match crate::epub::open(&path) {
+                Ok(book) => (Some(book), entry.title.clone(), entry.author.clone()),
+                Err(e) => {
+                    self.dl_error = format!("cannot open book: {e}");
+                    return;
+                }
+            },
+            _ => (None, entry.title.clone(), entry.author.clone()),
+        };
+        let saved = crate::library::get_progress(&self.progress_store, &entry.path);
+        let chapter = saved.map(|p| p.chapter).unwrap_or(0);
+        self.open_book = Some(OpenBook {
+            path: entry.path,
+            title,
+            author,
+            epub,
+            chapter,
+            font_size: 18.0,
+        });
+    }
+
+    fn ui_reader(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        egui::TopBottomPanel::top("reader-top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("← library").clicked() {
+                    close = true;
+                }
+                ui.separator();
+                let ob = self.open_book.as_ref().unwrap();
+                ui.strong(&ob.title);
+                if !ob.author.is_empty() {
+                    ui.label(format!("— {}", ob.author));
+                }
+                ui.separator();
+                ui.label(format!("{} / {}", ob.chapter + 1, ob.total_chapters()));
+                if ui.button("⏮").clicked() {
+                    if let Some(ob) = self.open_book.as_mut() {
+                        ob.chapter = 0;
+                    }
+                }
+                if ui.button("◀").clicked() {
+                    if let Some(ob) = self.open_book.as_mut() {
+                        if ob.chapter > 0 {
+                            ob.chapter -= 1;
+                        }
+                    }
+                }
+                if ui.button("▶").clicked() {
+                    if let Some(ob) = self.open_book.as_mut() {
+                        if ob.chapter + 1 < ob.total_chapters() {
+                            ob.chapter += 1;
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.button("A-").clicked() {
+                    if let Some(ob) = self.open_book.as_mut() {
+                        ob.font_size = (ob.font_size - 1.5).max(11.0);
+                    }
+                }
+                if ui.button("A+").clicked() {
+                    if let Some(ob) = self.open_book.as_mut() {
+                        ob.font_size = (ob.font_size + 1.5).min(32.0);
+                    }
+                }
+                // chapter dropdown
+                let ob = self.open_book.as_ref().unwrap();
+                if let Some(book) = &ob.epub {
+                    let cur = book.chapters.get(ob.chapter).map(|c| c.title.as_str()).unwrap_or("—");
+                    let chapters = book.chapters.clone();
+                    let current = ob.chapter;
+                    egui::ComboBox::from_id_salt("chapter")
+                        .selected_text(cur)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for (i, ch) in chapters.iter().enumerate() {
+                                if ui.selectable_label(i == current, &ch.title).clicked() {
+                                    if let Some(ob) = self.open_book.as_mut() {
+                                        ob.chapter = i;
+                                    }
+                                }
+                            }
+                        });
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let ob = self.open_book.as_ref().unwrap();
+            match &ob.epub {
+                Some(book) => {
+                    let heading_size = ob.font_size * 1.4;
+                    if let Some(ch) = book.chapters.get(ob.chapter) {
+                        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                            ui.add_space(12.0);
+                            for block in &ch.blocks {
+                                match block {
+                                    crate::epub::Block::Heading(t) => {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(t)
+                                                    .strong()
+                                                    .size(heading_size),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.add_space(6.0);
+                                    }
+                                    crate::epub::Block::Paragraph(t) => {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(t).size(ob.font_size),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.add_space(ob.font_size * 0.45);
+                                    }
+                                }
+                            }
+                            ui.add_space(40.0);
+                        });
+                    }
+                }
+                None => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.heading(&ob.title);
+                        ui.label("This format is not supported for in-app reading yet (PDF/MOBI).");
+                        ui.add_space(8.0);
+                        if ui.button("open with system viewer").clicked() {
+                            open_file(&ob.path);
+                        }
+                    });
+                }
+            }
+        });
+
+        if close {
+            let ob = self.open_book.take();
+            if let Some(ob) = ob {
+                crate::library::set_progress(
+                    &mut self.progress_store,
+                    &ob.path,
+                    crate::library::Progress { chapter: ob.chapter, scroll: 0.0 },
+                );
+                crate::library::save_progress(&self.progress_store);
+            }
         }
     }
 }
@@ -956,6 +1279,16 @@ fn order_label(order: &str) -> String {
         "titleA" => "title A–Z".into(),
         _ => "best match".into(),
     }
+}
+
+#[cfg(unix)]
+fn open_file(path: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+#[cfg(windows)]
+fn open_file(path: &str) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
 #[cfg(unix)]
