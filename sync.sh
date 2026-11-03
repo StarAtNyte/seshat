@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Sync zlib-lite to the private GitHub repo.
+# Commit and push to the GitHub repo.
 set -e
 cd "$(dirname "$0")"
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   git init
-  git remote add origin https://github.com/StarAtNyte/zlib-reader.git
+  git remote add origin https://github.com/StarAtNyte/seshat.git
   git branch -M main
 fi
 git add -A

@@ -30,7 +30,7 @@ pub fn md5_hex(s: &str) -> String {
 
 fn device_id() -> String {
     let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "desktop".into());
-    md5_hex(&format!("zlib-reader-{host}"))[..16].to_string()
+    md5_hex(&format!("seshat-{host}"))[..16].to_string()
 }
 
 fn req(cfg: &KoSync, proxy: &Option<String>, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
@@ -68,7 +68,7 @@ pub fn push(cfg: &KoSync, proxy: &Option<String>, document: &str, progress: &str
         "document": document,
         "progress": progress,
         "percentage": percentage,
-        "device": "zlib-reader",
+        "device": "Seshat",
         "device_id": device_id(),
     });
     let r = req(cfg, proxy, reqwest::Method::PUT, "/syncs/progress").json(&body).send().map_err(|e| e.to_string())?;

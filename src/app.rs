@@ -632,11 +632,9 @@ impl App {
             let drag = ui.interact(rect, egui::Id::new("lib-drag"), Sense::click_and_drag());
             ui::titlebar_behaviour(ctx, &drag);
             ui.horizontal_centered(|ui| {
-                // wordmark: a tiny open book + name
-                let (m, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                let c = m.center();
-                ui.painter().add(egui::Shape::convex_polygon(vec![c + vec2(0.0, -6.0), c + vec2(-10.0, -9.0), c + vec2(-10.0, 7.0), c + vec2(0.0, 10.0)], ACCENT, Stroke::NONE));
-                ui.painter().add(egui::Shape::convex_polygon(vec![c + vec2(0.0, -6.0), c + vec2(10.0, -9.0), c + vec2(10.0, 7.0), c + vec2(0.0, 10.0)], ui::LIME, Stroke::NONE));
+                // the Seshat mark + name
+                let (m, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                crate::logo::paint(ui.painter(), m);
                 ui.label(RichText::new(crate::APP_NAME).font(ui_b(18.0)));
                 ui.add_space(14.0);
                 let week: f64 = (0..7).map(|d| self.overview.daily.get(&store::date_string(store::now() - d * 86400)).copied().unwrap_or(0.0)).sum();
@@ -1837,7 +1835,7 @@ impl App {
                 });
 
                 ui::section_label(ui, "About");
-                ui.label(tag(format!("zlib-reader {} · {}", env!("CARGO_PKG_VERSION"), store::config_dir().display())).color(pal.muted));
+                ui.label(tag(format!("{} {} · {}", crate::APP_NAME, env!("CARGO_PKG_VERSION"), store::config_dir().display())).color(pal.muted));
                 ui.label(RichText::new("← → page · T toolbar · C contents · B bookmark · Ctrl+K search · F fullscreen · Ctrl ± size · Backspace back · Esc close").font(mono(10.5)).color(pal.muted));
             });
         });

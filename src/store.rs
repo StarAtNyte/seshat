@@ -10,21 +10,43 @@ use crate::book::Loc;
 
 // ---------- paths ----------
 
+fn copy_tree(from: &Path, to: &Path) {
+    let _ = std::fs::create_dir_all(to);
+    if let Ok(rd) = std::fs::read_dir(from) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                copy_tree(&p, &to.join(e.file_name()));
+            } else {
+                let _ = std::fs::copy(&p, to.join(e.file_name()));
+            }
+        }
+    }
+}
+
 pub fn config_dir() -> PathBuf {
-    let dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("zlib-reader");
-    // One-time migration from the old app name.
-    let old = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("zlib-lite");
-    if !dir.exists() && old.exists() {
-        let _ = std::fs::create_dir_all(&dir);
-        for f in ["session.json", "settings.json"] {
-            let _ = std::fs::copy(old.join(f), dir.join(f));
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = base.join("seshat");
+    // One-time migration from earlier names (zlib-reader, zlib-lite).
+    if !dir.exists() {
+        for old in ["zlib-reader", "zlib-lite"] {
+            let o = base.join(old);
+            if o.exists() {
+                copy_tree(&o, &dir);
+                break;
+            }
         }
     }
     dir
 }
 
 pub fn cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("zlib-reader")
+    let base = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("seshat");
+    if !dir.exists() && base.join("zlib-reader").exists() {
+        copy_tree(&base.join("zlib-reader"), &dir);
+    }
+    dir
 }
 
 pub fn covers_dir() -> PathBuf {

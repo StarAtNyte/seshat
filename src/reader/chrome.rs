@@ -17,11 +17,12 @@ impl Reader {
     pub fn viewport_builder(&self) -> egui::ViewportBuilder {
         egui::ViewportBuilder::default()
             .with_title(format!("{} — {}", self.book.meta.title, crate::APP_NAME))
-            .with_app_id(crate::APP_NAME)
+            .with_app_id("seshat")
             .with_inner_size([1240.0, 860.0])
             .with_min_inner_size([520.0, 420.0])
             .with_decorations(false)
             .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(crate::logo::icon_data(128)))
     }
 
     /// Apply a change to whichever settings this book uses (per-book or global).
@@ -96,6 +97,9 @@ impl Reader {
             if ui::icon_toggle(ui, Icon::Menu, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
                 self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                 self.toc_scroll = true;
+            }
+            if ui::icon_toggle(ui, Icon::Note, "Notebook (N)", self.notebook).clicked() {
+                self.notebook = !self.notebook;
             }
             if ui::icon_toggle(ui, Icon::Search, "Find in book (Ctrl+K)", self.side == Some(Side::Search)).clicked() {
                 self.side = Some(Side::Search);

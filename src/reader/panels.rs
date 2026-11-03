@@ -5,53 +5,152 @@ use eframe::egui::{self, vec2, Color32, CornerRadius, RichText, Sense, Stroke};
 use super::{Action, Env, Reader, Side};
 use crate::book::{Content, Loc};
 use crate::store::{self, Columns, Layout, ReaderSettings, Theme, THEMES};
-use crate::ui::{self, chip, icon_button, Icon, Palette, ACCENT};
+use crate::ui::{self, icon_button, Icon, Palette, ACCENT};
 
 pub(super) fn sidebar(r: &mut Reader, ctx: &egui::Context, side: Side, pal: &Palette, env: &mut Env) {
     egui::SidePanel::left("reader-side")
         .resizable(true)
-        .default_width(256.0)
-        .width_range(216.0..=380.0)
-        .frame(egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 12 }))
+        .default_width(264.0)
+        .width_range(220.0..=380.0)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 12 }))
         .show(ctx, |ui| {
+            // header: title/author flush-left with the lists, close flush-right
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(ui.available_width() - 40.0);
-                    ui.add(egui::Label::new(RichText::new(&r.book.meta.title).strong().size(16.0)).truncate());
+                    ui.set_width(ui.available_width() - 34.0);
+                    ui.add(egui::Label::new(RichText::new(&r.book.meta.title).font(ui::ui_b(16.0))).truncate());
                     if !r.book.meta.author.is_empty() {
-                        ui.add(egui::Label::new(RichText::new(&r.book.meta.author).color(pal.muted)).truncate());
+                        ui.add(egui::Label::new(RichText::new(&r.book.meta.author).font(ui::ui_m(12.5)).color(pal.muted)).truncate());
                     }
                 });
-                if icon_button(ui, Icon::Close, "Close sidebar").clicked() {
-                    r.side = None;
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (s, label) in [(Side::Toc, "Contents"), (Side::Notes, "Notes"), (Side::Bookmarks, "Bookmarks"), (Side::Search, "Search")] {
-                    let count = match s {
-                        Side::Notes => r.data.annotations.len(),
-                        Side::Bookmarks => r.data.bookmarks.len(),
-                        _ => 0,
-                    };
-                    let text = if count > 0 { format!("{label} {count}") } else { label.to_string() };
-                    if chip(ui, side == s, &text).clicked() {
-                        r.side = Some(s);
-                        if s == Side::Search {
-                            r.focus_search = true;
-                        }
-                        if s == Side::Toc {
-                            r.toc_scroll = true;
-                        }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if icon_button(ui, Icon::Close, "Close (C)").clicked() {
+                        r.side = None;
                     }
-                }
+                });
             });
-            ui.separator();
+            ui.add_space(12.0);
+            // four equal tabs with a sliding underline
+            let tabs = [(Side::Toc, "Contents", Icon::List), (Side::Notes, "Notes", Icon::Note), (Side::Bookmarks, "Marks", Icon::Bookmark), (Side::Search, "Find", Icon::Search)];
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+            let cw = row.width() / tabs.len() as f32;
+            let mut active_x = row.left();
+            for (i, (s, label, icon)) in tabs.iter().enumerate() {
+                let cell = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * cw, row.top()), vec2(cw, 46.0));
+                let resp = ui.interact(cell, ui.id().with(("tab", i)), Sense::click());
+                let on = side == *s;
+                if on {
+                    active_x = cell.left();
+                }
+                let col = if on { ACCENT } else if resp.hovered() { pal.fg } else { pal.muted };
+                ui::paint_icon(ui.painter(), egui::Rect::from_center_size(cell.center() - vec2(0.0, 8.0), vec2(16.0, 16.0)), *icon, col);
+                let count = match s {
+                    Side::Notes => r.data.annotations.len(),
+                    Side::Bookmarks => r.data.bookmarks.len(),
+                    Side::Search => r.search_hits.len(),
+                    _ => 0,
+                };
+                let text = if count > 0 { format!("{label} {count}") } else { label.to_string() };
+                ui.painter().text(cell.center() + vec2(0.0, 11.0), egui::Align2::CENTER_CENTER, text, ui::ui_m(11.5), col);
+                if resp.clicked() {
+                    r.side = Some(*s);
+                    r.focus_search = *s == Side::Search;
+                    r.toc_scroll = *s == Side::Toc;
+                }
+            }
+            ui.painter().hline(row.x_range(), row.bottom(), Stroke::new(1.0, pal.border));
+            let ax = ctx.animate_value_with_time(ui.id().with("tab-x"), active_x, 0.18);
+            ui.painter().hline(ax + 10.0..=ax + cw - 10.0, row.bottom(), Stroke::new(2.0, ACCENT));
+            ui.add_space(10.0);
             match side {
                 Side::Toc => toc(r, ui, pal),
                 Side::Notes => notes(r, ui, pal),
                 Side::Bookmarks => bookmarks(r, ui, pal),
                 Side::Search => search(r, ui, pal, env),
+            }
+        });
+}
+
+/// Right-hand notebook: this chapter's highlights and notes in reading order,
+/// plus a quick page note.
+pub(super) fn notebook(r: &mut Reader, ctx: &egui::Context, pal: &Palette) {
+    egui::SidePanel::right("reader-notebook")
+        .resizable(true)
+        .default_width(280.0)
+        .width_range(230.0..=400.0)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 12 }))
+        .show(ctx, |ui| {
+            let cur = cur_loc(r);
+            let chapter = r.chapter_title(cur);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width() - 34.0);
+                    ui.label(RichText::new("Notebook").font(ui::ui_b(16.0)));
+                    ui.add(egui::Label::new(RichText::new(&chapter).font(ui::ui_m(12.5)).color(pal.muted)).truncate());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if icon_button(ui, Icon::Close, "Close (N)").clicked() {
+                        r.notebook = false;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            // quick note pinned to the current page
+            let te = ui.add(egui::TextEdit::multiline(&mut r.quick_note).hint_text("Jot something about this page…").desired_rows(3).desired_width(f32::INFINITY));
+            let send = te.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Ctrl+Enter to save").font(ui::ui_m(11.5)).color(pal.muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if (ui::text_button(ui, "Save note", false).clicked() || send) && !r.quick_note.trim().is_empty() {
+                        r.add_page_note();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0, pal.border));
+            ui.add_space(10.0);
+            let mine: Vec<store::Annotation> = r.data.annotations.iter().filter(|a| a.start.section == cur.section).cloned().collect();
+            if mine.is_empty() {
+                ui.label(RichText::new("Nothing marked in this chapter yet. Select text to highlight, or press H for the highlighter.").font(ui::ui_m(12.5)).color(pal.muted));
+                return;
+            }
+            let mut jump = None;
+            let mut edit = None;
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                for a in &mine {
+                    let [cr, cg, cb] = a.color.rgb();
+                    let top = ui.cursor().top();
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            if !a.text.is_empty() {
+                                if ui.add(egui::Label::new(RichText::new(truncate(&a.text, 260)).family(egui::FontFamily::Name("book-i".into())).size(14.0)).sense(Sense::click())).clicked() {
+                                    jump = Some(a.start);
+                                }
+                            }
+                            if !a.note.is_empty() {
+                                ui.label(RichText::new(&a.note).font(ui::ui_m(13.0)).color(ACCENT));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(store::relative_time(a.created)).font(ui::ui_m(11.0)).color(pal.muted));
+                                if ui::text_button(ui, if a.note.is_empty() { "Add note" } else { "Edit" }, false).clicked() {
+                                    edit = Some((a.id, a.note.clone()));
+                                }
+                            });
+                        });
+                    });
+                    let bottom = ui.cursor().top();
+                    ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(ui.max_rect().left(), top + 2.0), egui::pos2(ui.max_rect().left() + 3.0, bottom - 6.0)), CornerRadius::same(1), Color32::from_rgb(cr, cg, cb));
+                    ui.add_space(8.0);
+                }
+            });
+            if let Some(l) = jump {
+                r.jump(l, true);
+            }
+            if edit.is_some() {
+                r.note_edit = edit;
             }
         });
 }

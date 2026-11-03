@@ -1,64 +1,223 @@
-# zlib-reader
+<p align="center">
+  <img src="assets/icons/seshat-256.png" width="112" alt="Seshat logo">
+</p>
 
-A lightweight native **ebook reader** with Z-Library search built in — find, download, and read books with your own UI, **no webview, no Chromium** (~15 MB binary vs the 872 MB Electron app).
+<h1 align="center">Seshat</h1>
 
-Built in Rust with [egui](https://github.com/emilk/egui); talks directly to the Z-Library EAPI.
+<p align="center">
+  A fast, native ebook reader for Linux, Windows and macOS.<br>
+  Named after the Egyptian goddess of writing, called the "Mistress of the House of Books".
+</p>
 
-## Features
+---
 
-### Two search mechanisms
+Seshat is an ebook reader first. It is built around one idea: opening a book
+should feel like opening a book. Your library is a set of shelves rather than
+a spreadsheet. Each book opens in its own window as a two-page spread, pages
+turn with a real (and optional) paper flip, and everything else stays out of
+the way until you reach for it.
 
-- 📚 **Library search** — instantly filter your local collection by title/author (scans your download folder; EPUB metadata indexed in the background)
-- 🌐 **Z-Library search** — find new books online: title/author/ISBN; filters: exact, year range, format (EPUB/PDF/MOBI/…), language, sort order; paginated
+It is a single native binary of about 20 MB, with no browser engine and no
+Electron. It starts in well under a second and turns pages instantly, even in
+very long books.
 
-### Reader
+If you also use Z-Library, there is an optional add-on that lets you search for
+books and pull them straight onto your shelves. It is off to the side: Seshat
+is not a Z-Library client with a reader attached, it is a reader that can talk
+to Z-Library if you want it to.
 
-- 📖 **Built-in EPUB reader** — chapter navigation (⏮ ◀ ▶ + chapter dropdown), adjustable font size (A- / A+), remembers your reading position per book
-- ⬇️ **One-click download** — with progress bar; atomic file writes; "Read now" button on completed downloads
-- 🔌 **Auto mirror discovery** — probes known EAPI mirrors at startup, first reachable wins
-- 🔑 **Sign in / register** — email/password, cookie import fallback (`remix_userid` / `remix_userkey`), or create a new account with emailed confirmation code
-- 🕶 **Optional proxy** — SOCKS5/HTTP (e.g. Tor: `socks5://127.0.0.1:9050`)
+## Download
 
-## Build & run
+Grab the latest build from the [Releases](../../releases) page.
+
+| Platform | File | Notes |
+|---|---|---|
+| Windows 10/11 | `Seshat-x.y.z-windows-x64-setup.exe` | Standard installer with Start menu entry and uninstaller |
+| Windows (portable) | `Seshat-x.y.z-windows-x64-portable.zip` | Unzip anywhere and run `seshat.exe` |
+| macOS, Apple Silicon | `Seshat-x.y.z-macos-arm64.dmg` | M1 and newer |
+| macOS, Intel | `Seshat-x.y.z-macos-x64.dmg` | |
+| Linux (Debian, Ubuntu, Mint, Pop!_OS) | `Seshat-x.y.z-linux-amd64.deb` | `sudo apt install ./Seshat-*.deb` |
+| Linux (any distribution) | `Seshat-x.y.z-linux-x86_64.AppImage` | `chmod +x` it, then run it |
+| Linux (manual) | `Seshat-x.y.z-linux-x86_64.tar.gz` | Plain binary with a desktop file and icon |
+
+A note on macOS: the builds are not notarised by Apple yet, so the first time
+you open Seshat, right-click the app and choose **Open**. After that it opens
+normally.
+
+## What it reads
+
+| Format | Support |
+|---|---|
+| EPUB 2 and 3 | Full: styles, images, footnotes, table of contents, internal links |
+| MOBI, AZW, AZW3 (KF8), PRC | Text, images, metadata and covers. DRM-protected files cannot be opened. |
+| FB2 and FB2.ZIP | Full, including embedded images and notes |
+| PDF | Rendered natively in pure Rust, with outline, search, zoom and two-page spreads |
+| CBZ comics | Fit page or fit width, spreads, and right-to-left order for manga |
+| TXT, Markdown, HTML | Chapters are detected automatically |
+
+## Reading
+
+**The page.** Books are laid out by Seshat's own typesetting engine. Text is
+justified by adjusting word spacing rather than letter spacing. Headings stay
+with the paragraph that follows them. Page breaks always fall between lines,
+never through them. A book's own styling (italics, small caps, centred
+headings) is respected, and you can override it.
+
+**The spread.** On a wide window the book opens as a two-page spread on a
+desk, with a gutter shadow at the spine. The stack of page edges on each side
+gets thicker or thinner as you read, so you can see where you are without
+looking at a number. Running heads and page numbers are set like a printed
+book.
+
+**Motion, if you like it.** The cover swings open when a book opens, and
+pages curl over the spine when you turn them. Both are rendered from the real
+text, not a canned animation. The Motion setting switches between Full, Simple
+(a quick fade) and Off. The first time a book opens, Seshat asks which you
+prefer.
+
+**Make it yours.** Seven themes (Paper, Light, Sepia, Gray, Dark, Nord, Black)
+plus a custom one. Any font installed on your system, with size, line spacing,
+paragraph spacing, letter spacing, margins and maximum line width. Single page,
+spread, or continuous scroll.
+
+**Everything a reader needs**
+
+- Contents, notes, bookmarks and full-text search in a sidebar that stays
+  closed until you open it
+- Highlights in five colours, as a highlight or an underline, with notes
+  attached
+- A highlighter mode: press `H` and every selection becomes a highlight
+  straight away
+- A Notebook panel on the right showing the current chapter's highlights and
+  notes in reading order, plus quick notes pinned to a page
+- Footnotes open in a small popover instead of throwing you to the back of the
+  book, and a Back button returns you to where you were
+- Look up a word in the dictionary or on Wikipedia, or translate a passage,
+  from the selection menu
+- Read aloud using your system's own voices, following along sentence by
+  sentence
+- Auto-advance, which turns pages on a timer or scrolls slowly
+- Go to any percentage or page
+- Reading time, days read, and a reading-speed estimate that learns from you,
+  so "12 min left in chapter" is actually close
+- Export your highlights and notes to Markdown
+
+**Sync.** Seshat speaks the KOReader sync protocol, so your progress follows
+you between Seshat, KOReader and other compatible readers. You can use the
+public server or your own.
+
+## The library
+
+- Point Seshat at one or more folders (it picks up `~/Books` automatically) or
+  drop files and folders onto the window. New and changed files are indexed in
+  the background and nothing is parsed twice.
+- Covers are shown at their real proportions in an asymmetric grid, with a
+  plain index view if you prefer a list.
+- Shelve your books by genre, author, status, format or folder. Each shelf is
+  a row you can slide through, a strip at the top jumps to any shelf, and
+  "See all" opens a single shelf on its own, so a shelf with 500 books
+  doesn't bury the rest.
+- A "currently reading" spread, recently opened books, and a right-hand column
+  with your progress, the past week of reading and your latest notes.
+- Notes and Bookmarks views that gather everything you've marked across every
+  book.
+
+## Keyboard
+
+| Key | Action |
+|---|---|
+| `←` `→`, `Space`, `PgUp` `PgDn` | Previous / next page |
+| `Home` `End` | Start / end of chapter |
+| `T` | Show or hide the toolbar |
+| `C` | Contents sidebar |
+| `N` | Notebook |
+| `B` | Bookmark this page |
+| `H` | Highlighter mode |
+| `A` | Auto-advance |
+| `Ctrl+K` or `Ctrl+F` | Search in the book |
+| `F` or `F11` | Fullscreen |
+| `Ctrl +` / `Ctrl −` | Bigger / smaller text |
+| `Backspace` | Back to where you were before a jump |
+| `Esc` | Close whatever is open, then return to the library |
+| `Ctrl+O` | Import books (library) |
+| `Ctrl+K` | Focus search (library) |
+
+## The Z-Library add-on
+
+The add-on lives under **Sources** in the sidebar and can be switched off
+entirely in Settings.
+
+When it is connected, typing in the library search quietly shows matching
+books from Z-Library underneath your own, in a slim row. Click one to see its
+details and download it. Downloads land in your library with the catalogue's
+cover and metadata attached, which helps with PDFs whose embedded titles are
+often useless. For books you already have, "Fetch cover from Z-Library" in a
+book's menu does the same retroactively.
+
+Signing in works with email and password, with session cookies if your account
+requires them, or by creating a new account. Seshat looks for a reachable
+mirror automatically, and you can set a SOCKS or HTTP proxy (Tor works).
+
+Please use it only with your own account, and respect copyright and the laws
+where you live. Seshat is not affiliated with Z-Library.
+
+## Your data
+
+Everything stays on your machine unless you turn on sync or use a lookup.
+
+| What | Where |
+|---|---|
+| Settings, library index, progress, highlights | `~/.config/seshat` (Linux), `~/Library/Application Support/seshat` (macOS), `%APPDATA%\seshat` (Windows) |
+| Cover thumbnails | your OS cache directory, under `seshat` |
+
+Book files are never modified. The dictionary, Wikipedia and translation
+lookups send the selected text to those services only when you ask for a
+lookup.
+
+## Building from source
+
+You need a recent stable Rust toolchain.
 
 ```sh
+git clone https://github.com/StarAtNyte/seshat
+cd seshat
 cargo run --release
 ```
 
-Linux requires the usual WebKit/GTK-free GUI deps only (this app uses egui, so just X11/Wayland headers which most distros ship).
-
-Session and settings are stored in `~/.config/zlib-reader/`.
-
-## How it works (protocol)
-
-The official Z-Library desktop app (Electron 30.5.1, v3.2.1) was statically reverse-engineered
-(REA + direct source inspection of `app.asar`) and cross-checked against the
-[heartleo/zlib](https://github.com/heartleo/zlib) CLI. The desktop app is a thin webview wrapper
-around the Z-Library site plus this JSON EAPI, which we use directly:
-
-| Purpose | Endpoint |
-|---|---|
-| Mirror health check | `GET /eapi/info/ok` |
-| Login | `POST /eapi/user/login` (form: `email`, `password`) → `user.id`, `user.remix_userkey` |
-| Register | `POST /eapi/user/registration` (form: `email`, `password`, `name`) |
-| Confirm email code | `POST /eapi/user/email/confirmation` (…, `code`) → session credentials |
-| Resend code | `POST /eapi/user/email/confirmation/resend` |
-| Search | `POST /eapi/book/search` (form: `message`, `page`, `limit`, `e`, `yearFrom`, `yearTo`, `languages[]`, `extensions[]`, `order`) |
-| Book details | `GET /eapi/book/{id}/{hash}` |
-| Download link | `GET /eapi/book/{id}/{hash}/file` → `file.downloadLink` |
-
-Auth cookies: `remix_userid` + `remix_userkey` (set server-side via the web UI, or returned by EAPI login).
-Mirrors share account sessions; EAPI-capable mirrors (verified live: `z-lib.gd`, `1lib.sk`,
-`z-library.sk`) serve the API, while `z-lib.ws` / `z-lib.mx` are web-UI-only mirrors of the same service.
-
-## Disclaimer
-
-For personal use with your own Z-Library account. This project is not affiliated with Z-Library. Respect copyright and your local laws.
-
-## Sync
-
-Keep the GitHub private repo up to date:
+On Linux you also need the usual GUI development packages:
 
 ```sh
-./sync.sh          # commit + push (private repo, StarAtNyte/zlib-reader)
+sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev
 ```
+
+`seshat --info book.epub` prints what Seshat makes of a book (title, author,
+sections and timing), which is handy when a file misbehaves.
+`seshat --make-icons dir/` regenerates the icon set from the vector logo.
+
+Releases are built by GitHub Actions: pushing a tag such as `v0.3.0` produces
+every package listed above.
+
+## How it is put together
+
+| Module | What it does |
+|---|---|
+| `book/` | Format parsers (EPUB, MOBI/KF8, FB2, PDF, CBZ, TXT/HTML), a forgiving HTML tokenizer and a small CSS subset, all converted into one document model |
+| `reader/layout.rs` | The typesetting engine: blocks to lines to pages, word-space justification, hit testing for selection |
+| `reader/` | The reading window: the spread, motion, chrome, sidebars, search, highlights, read-aloud |
+| `library.rs` | Parallel, incremental indexing with cached metadata and covers |
+| `online.rs`, `api.rs` | The Z-Library add-on |
+| `kosync.rs` | KOReader-compatible progress sync |
+| `logo.rs` | The Seshat mark, drawn live in the app and rasterised for the icons |
+
+## Credits
+
+Built with [egui](https://github.com/emilk/egui). PDFs are rendered by
+[hayro](https://github.com/LaurenzV/hayro). The interface is set in
+[Bricolage Grotesque](https://github.com/ateliertriay/bricolage) and
+IBM Plex Mono, both under the SIL Open Font License (see `assets/fonts`).
+Feature inspiration comes from [Readest](https://github.com/readest/readest)
+and KOReader.
+
+## License
+
+MIT

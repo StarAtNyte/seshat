@@ -502,6 +502,20 @@ impl Reader {
         self.mark_dirty();
     }
 
+    /// A note pinned to the current page (no highlighted text).
+    pub(super) fn add_page_note(&mut self) {
+        let note = std::mem::take(&mut self.quick_note).trim().to_string();
+        let loc = match &self.book.content {
+            Content::Flow(_) => self.loc,
+            Content::Fixed(_) => Loc::new(self.fx.page, 0, 0),
+        };
+        let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64).max(self.data.annotations.iter().map(|a| a.id + 1).max().unwrap_or(1));
+        let a = Annotation { id, start: loc, end: loc, color: HlColor::Blue, style: HlStyle::Underline, note, text: String::new(), chapter: self.chapter_title(loc), created: store::now() };
+        self.data.annotations.push(a);
+        self.data.annotations.sort_by_key(|a| a.start);
+        self.mark_dirty();
+    }
+
     fn add_annotation(&mut self, color: HlColor, with_note: bool) {
         let Some(((b0, c0), (b1, c1))) = self.sel else { return };
         let text = self.selection_text().unwrap_or_default();
@@ -741,6 +755,9 @@ impl Reader {
             if let Some(side) = self.side {
                 panels::sidebar(self, ctx, side, &pal, env);
             }
+            if self.notebook {
+                panels::notebook(self, ctx, &pal);
+            }
         }
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::desk(&pal))).show(ctx, |ui| {
@@ -858,11 +875,11 @@ impl Reader {
                 }
                 Key::B | Key::D => self.toggle_bookmark(),
                 Key::T => self.tools = !self.tools,
-                Key::C | Key::N => {
-                    let want = if k == Key::C { Side::Toc } else { Side::Notes };
-                    self.side = if self.side == Some(want) { None } else { Some(want) };
+                Key::C => {
+                    self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                     self.toc_scroll = true;
                 }
+                Key::N => self.notebook = !self.notebook,
                 Key::F11 | Key::F => self.toggle_fullscreen(ctx),
                 Key::H if self.book.flow().is_some() => {
                     self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };

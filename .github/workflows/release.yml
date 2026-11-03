@@ -1,0 +1,146 @@
+name: Release
+
+# Builds installable packages for Linux, Windows and macOS.
+# Push a tag like `v0.3.0` to publish a GitHub Release with all of them,
+# or run it manually from the Actions tab to just get the artifacts.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libfuse2 file
+      - name: Build
+        run: cargo build --release --locked || cargo build --release
+      - name: Version
+        id: v
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Package .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+          mkdir -p dist
+          cp target/debian/*.deb "dist/Seshat-${{ steps.v.outputs.version }}-linux-amd64.deb"
+      - name: Package AppImage
+        run: |
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/seshat AppDir/usr/bin/
+          cp packaging/linux/seshat.desktop AppDir/usr/share/applications/
+          cp packaging/linux/seshat.desktop AppDir/
+          cp assets/icons/seshat-256.png AppDir/usr/share/icons/hicolor/256x256/apps/seshat.png
+          cp assets/icons/seshat-256.png AppDir/seshat.png
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/seshat" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir "dist/Seshat-${{ steps.v.outputs.version }}-linux-x86_64.AppImage"
+      - name: Package tarball
+        run: |
+          mkdir -p seshat && cp target/release/seshat packaging/linux/seshat.desktop assets/icons/seshat-256.png README.md seshat/
+          tar czf "dist/Seshat-${{ steps.v.outputs.version }}-linux-x86_64.tar.gz" seshat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Version
+        id: v
+        shell: bash
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Installer (.exe)
+        shell: pwsh
+        env:
+          SESHAT_VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\seshat.iss
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path Seshat | Out-Null
+          Copy-Item target\release\seshat.exe Seshat\
+          Copy-Item README.md Seshat\
+          Compress-Archive -Path Seshat -DestinationPath "dist\Seshat-${{ steps.v.outputs.version }}-windows-x64-portable.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Version
+        id: v
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: App bundle + dmg
+        run: |
+          V=${{ steps.v.outputs.version }}
+          APP=Seshat.app
+          mkdir -p $APP/Contents/MacOS $APP/Contents/Resources
+          cp target/release/seshat $APP/Contents/MacOS/
+          sed "s/VERSION/$V/g" packaging/macos/Info.plist > $APP/Contents/Info.plist
+          mkdir seshat.iconset
+          for s in 16 32 128 256 512; do
+            cp assets/icons/seshat-$s.png seshat.iconset/icon_${s}x${s}.png
+            d=$((s*2)); cp assets/icons/seshat-$d.png seshat.iconset/icon_${s}x${s}@2x.png 2>/dev/null || true
+          done
+          iconutil -c icns seshat.iconset -o $APP/Contents/Resources/seshat.icns
+          codesign --force --deep -s - $APP || true
+          mkdir -p dist dmg && cp -R $APP dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname Seshat -srcfolder dmg -ov -format UDZO "dist/Seshat-$V-macos-${{ matrix.arch }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*
+
+  publish:
+    needs: [linux, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -707,32 +707,61 @@ impl Reader {
             (g.sheet(0).left(), (self.page, g.origin(0), g.sheet(0)), None, (1.0 - k) * pi / 2.0)
         };
         let w = g.sheet(0).width();
-        let cy = g.sheet(0).center().y;
-        let show_front = theta < pi / 2.0;
-        let (page, origin, sheet) = if show_front { front } else { back.unwrap_or(front) };
-        let sign = if show_front { 1.0 } else { -1.0 };
-        let (c, s) = (theta.cos(), theta.sin());
-        let warp = |p: Pos2| -> Pos2 {
-            let rel = p.x - hinge;
-            let x = hinge + sign * rel * c;
-            let persp = 1.0 + 0.09 * s * (rel.abs() / w);
-            pos2(x, cy + (p.y - cy) * persp)
+        let sheet0 = front.2;
+        let cy = sheet0.center().y;
+        let half_h = sheet0.height() / 2.0;
+        // which side of the hinge the leaf starts on
+        let s0 = if sheet0.center().x >= hinge { 1.0 } else { -1.0 };
+        // paper, not board: the free edge trails the hinge (strongest mid-turn)
+        let bend = 0.75 * (pi * k).sin();
+        let flutter = (pi * k).sin() * (1.0 + 0.35 * (k * pi * 3.0).sin());
+        let local = |u: f32| theta - bend * u.powf(1.5);
+        let along = |a: f32| -> f32 {
+            let n = 12;
+            let step = a / n as f32;
+            (0..n).map(|i| local((step * (i as f32 + 0.5)) / w).cos() * step).sum()
         };
+        let warp = |p: Pos2| -> (Pos2, f32) {
+            let a = (p.x - hinge).abs();
+            let u = (a / w).min(1.2);
+            let th = local(u);
+            let x = hinge + s0 * along(a);
+            let lift = 1.0 + 0.1 * th.sin() * u;
+            let droop = 6.0 * flutter * u * u * ((p.y - cy) / half_h + 0.6);
+            (pos2(x, cy + (p.y - cy) * lift + droop), th)
+        };
+        let mid = local(0.5);
+        let show_front = mid < pi / 2.0;
+        let (page, origin, sheet) = if show_front { front } else { back.unwrap_or(front) };
         // shadow the leaf throws onto the spread
-        let reach = (w * c.abs()).max(12.0);
-        let side = if (t.dir > 0) == show_front { 1.0 } else { -1.0 };
-        let sh_rect = if side > 0.0 { Rect::from_min_max(pos2(hinge, sheet.top()), pos2(hinge + reach + 30.0 * s, sheet.bottom())) } else { Rect::from_min_max(pos2(hinge - reach - 30.0 * s, sheet.top()), pos2(hinge, sheet.bottom())) };
-        painter.rect_filled(sh_rect, CornerRadius::ZERO, Color32::from_black_alpha((40.0 * s) as u8));
-        // the paper of the leaf
-        let shade = 1.0 - 0.22 * s;
-        let paper = Color32::from_rgb((pal.bg.r() as f32 * shade) as u8, (pal.bg.g() as f32 * shade) as u8, (pal.bg.b() as f32 * shade) as u8);
-        let corners = [sheet.left_top(), sheet.right_top(), sheet.right_bottom(), sheet.left_bottom()].map(warp);
-        painter.add(egui::Shape::convex_polygon(corners.to_vec(), paper, Stroke::new(1.0, Color32::from_black_alpha(30))));
-        // the page's own text, bent with the leaf
+        let edge_x = hinge + s0 * along(w);
+        let (sx0, sx1) = if edge_x > hinge { (hinge, edge_x + 26.0 * theta.sin()) } else { (edge_x - 26.0 * theta.sin(), hinge) };
+        painter.rect_filled(Rect::from_min_max(pos2(sx0, sheet.top()), pos2(sx1, sheet.bottom())), CornerRadius::ZERO, Color32::from_black_alpha((36.0 * theta.sin()) as u8));
+        // the paper itself, as a strip so it can curve
+        let mut paper = egui::Mesh::default();
+        let cols = 24;
+        for i in 0..=cols {
+            let a = w * i as f32 / cols as f32;
+            let x0 = hinge + if sheet.center().x >= hinge { a } else { -a };
+            let (pt, th) = warp(pos2(x0, sheet.top()));
+            let (pb, _) = warp(pos2(x0, sheet.bottom()));
+            let shade = 1.0 - 0.28 * th.sin().abs();
+            let c = Color32::from_rgb((pal.bg.r() as f32 * shade) as u8, (pal.bg.g() as f32 * shade) as u8, (pal.bg.b() as f32 * shade) as u8);
+            paper.colored_vertex(pt, c);
+            paper.colored_vertex(pb, c);
+            if i > 0 {
+                let j = (i * 2) as u32;
+                paper.add_triangle(j - 2, j - 1, j);
+                paper.add_triangle(j - 1, j + 1, j);
+            }
+        }
+        painter.add(egui::Shape::mesh(paper));
+        // the page's own text, bent with the paper
         for mut m in self.page_meshes(ctx, page, origin, pal.fg, dim) {
             for v in &mut m.vertices {
-                v.pos = warp(v.pos);
-                v.color = v.color.linear_multiply(shade);
+                let (p, th) = warp(v.pos);
+                v.pos = p;
+                v.color = v.color.linear_multiply(1.0 - 0.28 * th.sin().abs());
             }
             painter.add(egui::Shape::mesh(m));
         }

@@ -26,7 +26,7 @@ pub struct Answer {
     pub url: Option<String>,
 }
 
-const UA: &str = concat!("zlib-reader/", env!("CARGO_PKG_VERSION"));
+const UA: &str = concat!("Seshat/", env!("CARGO_PKG_VERSION"));
 
 fn client(proxy: &Option<String>) -> reqwest::blocking::Client {
     let mut b = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15)).user_agent(UA);
