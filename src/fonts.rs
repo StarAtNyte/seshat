@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
-static SG_R: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Regular.ttf");
-static SG_M: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf");
-static SG_B: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf");
+static SG_R: &[u8] = include_bytes!("../assets/fonts/Bricolage-Regular.ttf");
+static SG_M: &[u8] = include_bytes!("../assets/fonts/Bricolage-Medium.ttf");
+static SG_B: &[u8] = include_bytes!("../assets/fonts/Bricolage-Display.ttf");
 static PLEX_R: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
 static PLEX_M: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Medium.ttf");
 

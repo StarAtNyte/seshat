@@ -672,7 +672,7 @@ impl App {
                     if (shown - e.fraction).abs() > 0.001 {
                         ui.ctx().request_repaint();
                     }
-                    ui.label(RichText::new(format!("{:.0}%", shown * 100.0)).font(ui_b(72.0)).color(ACCENT));
+                    ui.label(RichText::new(format!("{:.0}%", shown * 100.0)).font(ui_b(52.0)).color(ACCENT));
                     ui.add(egui::Label::new(RichText::new(&e.title).font(ui_m(14.0))).truncate());
                     let r = ui.available_rect_before_wrap();
                     let bar = Rect::from_min_size(r.min + vec2(0.0, 6.0), vec2(r.width(), 2.0));
@@ -804,7 +804,7 @@ impl App {
             _ => "The Library",
         };
         ui.horizontal(|ui| {
-            ui.label(display(title, 46.0));
+            ui.label(display(title, 34.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
                 ui.label(tag(format!("{:03} objects / {}", self.index.entries.len(), store::date_string(store::now()))).color(pal.muted));
             });
@@ -965,7 +965,7 @@ impl App {
                     ui.add_space(8.0);
                     if mode == 1 {
                         if *big != last_big {
-                            ui.label(RichText::new(big).font(ui_b(110.0)).color(ACCENT).line_height(Some(100.0)));
+                            ui.label(RichText::new(big).font(ui_b(72.0)).color(ACCENT).line_height(Some(70.0)));
                         }
                         ui.label(RichText::new(key).font(ui_m(15.0)));
                     } else {
@@ -1009,7 +1009,7 @@ impl App {
         self.paint_cover(&painter, cover, &cur);
         let x = cover.right() + 40.0;
         let tw = (row.right() - x).max(120.0);
-        let mut job = egui::text::LayoutJob::single_section(cur.title.clone(), egui::TextFormat { font_id: ui_b(56.0), color: pal.fg, line_height: Some(54.0), extra_letter_spacing: -1.8, ..Default::default() });
+        let mut job = egui::text::LayoutJob::single_section(cur.title.clone(), egui::TextFormat { font_id: ui_b(40.0), color: pal.fg, line_height: Some(42.0), extra_letter_spacing: -0.6, ..Default::default() });
         job.wrap = egui::text::TextWrapping { max_width: tw, max_rows: 3, overflow_character: Some('…'), ..Default::default() };
         let g = ui.painter().layout_job(job);
         let th = g.size().y;
@@ -1192,7 +1192,7 @@ impl App {
 
     fn empty_state(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.add_space(60.0);
-        ui.label(display("Empty shelves.", 72.0));
+        ui.label(display("Empty shelves.", 48.0));
         ui.add_space(6.0);
         ui.label(RichText::new("EPUB · MOBI · AZW3 · FB2 · PDF · CBZ · TXT").font(mono(12.0)).color(pal.muted));
         ui.add_space(24.0);
@@ -1277,7 +1277,7 @@ impl App {
             b.dedup();
             b.len()
         };
-        ui.label(display("Notes", 46.0));
+        ui.label(display("Notes", 34.0));
         ui.label(tag(format!("{:03} highlights across {:03} books", self.overview.notes.len(), books)).color(pal.muted));
         ui.add_space(8.0);
         ui::rule(ui);
@@ -1336,7 +1336,7 @@ impl App {
     }
 
     fn bookmarks_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.label(display("Bookmarks", 46.0));
+        ui.label(display("Bookmarks", 34.0));
         ui.label(tag(format!("{:03} marked pages", self.overview.bookmarks.len())).color(pal.muted));
         ui.add_space(8.0);
         ui::rule(ui);
