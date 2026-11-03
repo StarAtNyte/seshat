@@ -152,6 +152,8 @@ pub struct Reader {
     page_anim: bool,
     notebook: bool,
     quick_note: String,
+    /// Toolbar pinned open (otherwise it slides in on demand).
+    tools: bool,
 }
 
 impl Reader {
@@ -241,9 +243,8 @@ impl Reader {
             page_anim: true,
             notebook: false,
             quick_note: String::new(),
+            tools: false,
         };
-        r.side = Some(Side::Toc);
-        r.toc_scroll = true;
         r.data.last_read = store::now();
         r.clamp_loc();
         if app.kosync.enabled && !app.kosync.username.is_empty() {
@@ -735,7 +736,6 @@ impl Reader {
 
         if !self.fullscreen {
             self.title_bar(ctx, &pal, &mut actions);
-            self.toolbar(ctx, &s, &pal, env);
             if let Some(side) = self.side {
                 panels::sidebar(self, ctx, side, &pal, env);
             }
@@ -749,9 +749,7 @@ impl Reader {
             }
         });
 
-        if self.fullscreen {
-            self.floating_toolbar(ctx, &s, &pal, env);
-        }
+        self.floating_toolbar(ctx, &s, &pal, env);
         let screen = ctx.screen_rect();
         let near_bottom = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y > screen.bottom() - 64.0);
         if near_bottom {
@@ -856,7 +854,7 @@ impl Reader {
                     self.focus_search = true;
                 }
                 Key::B | Key::D => self.toggle_bookmark(),
-                Key::T => self.chrome = !self.chrome,
+                Key::T => self.tools = !self.tools,
                 Key::C | Key::N => {
                     let want = if k == Key::C { Side::Toc } else { Side::Notes };
                     self.side = if self.side == Some(want) { None } else { Some(want) };

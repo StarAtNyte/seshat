@@ -172,7 +172,7 @@ impl Reader {
                     self.settings_open = !self.settings_open;
                 }
                 // go to: percent or page
-                let r = ui.add(egui::TextEdit::singleline(&mut self.goto_text).hint_text(if flow { "go to %" } else { "page" }).desired_width(64.0).margin(vec2(8.0, 5.0)));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.goto_text).id(egui::Id::new("goto")).hint_text(if flow { "go to %" } else { "page" }).desired_width(64.0).margin(vec2(8.0, 5.0)));
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(v) = self.goto_text.trim().trim_end_matches('%').parse::<f32>() {
                         let target = match &self.book.content {
@@ -223,27 +223,29 @@ impl Reader {
         });
     }
 
-    pub(super) fn toolbar(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
-        let desk = ui::desk(pal);
-        egui::TopBottomPanel::top("r-tools").exact_height(44.0).show_separator_line(false).frame(egui::Frame::new().fill(desk).inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 0 })).show(ctx, |ui| {
-            self.toolbar_contents(ui, ctx, s, pal, env);
-        });
-    }
-
-    /// In fullscreen the toolbar floats in only when the pointer nears the top.
+    /// The toolbar floats over the book (no reflow) and slides in on demand:
+    /// pointer near the top, T, a click in the page centre, or while a panel is open.
     pub(super) fn floating_toolbar(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
-        let near = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < 60.0);
-        let t = ctx.animate_bool_with_time(egui::Id::new("float-tools"), near || self.chrome, 0.18);
+        let top = if self.fullscreen { 0.0 } else { 48.0 };
+        let left = ctx.available_rect().left();
+        let near = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < top + 56.0 && p.x >= left);
+        let held = ctx.memory(|m| m.focused().is_some_and(|f| f == egui::Id::new("goto")));
+        let want = near || self.tools || self.settings_open || held;
+        let t = ctx.animate_bool_with_time(egui::Id::new("float-tools"), want, 0.2);
         if t < 0.01 {
             return;
         }
-        let w = ctx.screen_rect().width();
-        egui::Area::new("float-tools".into()).fixed_pos(pos2(0.0, -44.0 * (1.0 - t))).order(egui::Order::Foreground).show(ctx, |ui| {
+        let w = ctx.screen_rect().width() - left;
+        egui::Area::new("float-tools".into()).fixed_pos(pos2(left, top - 44.0 * (1.0 - super::ease(t)))).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_clip_rect(egui::Rect::from_min_max(pos2(left, top), pos2(left + w, top + 46.0)));
+            ui.multiply_opacity(t);
             egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
                 ui.set_width(w - 24.0);
                 ui.set_height(44.0);
                 self.toolbar_contents(ui, ctx, s, pal, env);
             });
+            let r = ui.min_rect();
+            ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0, pal.border));
         });
     }
 

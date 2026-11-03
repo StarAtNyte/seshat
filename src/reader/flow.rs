@@ -475,14 +475,14 @@ impl Reader {
         self.paint_book(&painter, &g, pal, frac);
         // opening: the cover swings away toward the spine
         let now = std::time::Instant::now();
-        let open_t = self.opened_at.map(|t| (now - t).as_secs_f32() / 0.75).unwrap_or(0.0);
+        let open_t = self.opened_at.map(|t| (now - t).as_secs_f32() / 0.95).unwrap_or(0.0);
         let turn_t = self.turn.map(|(t, _)| (now - t).as_secs_f32() / 0.26).unwrap_or(1.0);
         if open_t < 1.0 || turn_t < 1.0 {
             ui.ctx().request_repaint();
         }
         let mut text_painter = painter.clone();
         if open_t < 1.0 {
-            text_painter.multiply_opacity(super::ease((open_t - 0.35) / 0.65));
+            text_painter.multiply_opacity(super::ease((open_t - 0.3) / 0.6));
         } else if turn_t < 1.0 {
             text_painter.multiply_opacity(0.35 + 0.65 * super::ease(turn_t));
         }
@@ -582,21 +582,42 @@ impl Reader {
             self.turn = None;
         }
 
-        // the cover swinging open
+        // the cover swinging open: a hinged board rotating 180° about the spine
         if open_t < 1.0 {
-            let e = super::ease(open_t.min(1.0) / 0.8);
+            let k = open_t.clamp(0.0, 1.0);
+            let e = k * k * (3.0 - 2.0 * k); // smoothstep: slow start, slow landing
+            let theta = e * std::f32::consts::PI;
             let target = g.sheet(g.cols - 1);
             let hinge = g.spine.unwrap_or(target.left());
-            let w = target.width() * (1.0 - e);
-            if w > 1.0 {
-                let r = Rect::from_min_max(pos2(hinge, target.top()), pos2(hinge + w, target.bottom()));
-                match self.tex.get("__cover").map(|t| t.tex.id()) {
-                    Some(id) => {
-                        painter.image(id, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    None => ui::paint_placeholder_cover(&painter, r, &self.book.meta.title, &self.book.meta.author),
-                }
-                painter.rect_filled(r, CornerRadius::ZERO, Color32::from_black_alpha((90.0 * e) as u8));
+            let (top, bot) = (target.top(), target.bottom());
+            let w = target.width();
+            let fx = hinge + w * theta.cos();
+            let lift = theta.sin() * target.height() * 0.07; // the free edge comes toward you
+            let front = theta < std::f32::consts::FRAC_PI_2;
+            let shade = (theta.sin() * 0.35 + if front { 0.0 } else { 0.1 }).min(0.5);
+            let tint = Color32::from_gray((255.0 * (1.0 - shade)) as u8);
+            let quad = [pos2(hinge, top), pos2(fx, top - lift), pos2(fx, bot + lift), pos2(hinge, bot)];
+            let cover = if front { self.tex.get("__cover").map(|t| t.tex.id()) } else { None };
+            let mut m = match cover {
+                Some(id) => egui::Mesh::with_texture(id),
+                None => egui::Mesh::default(),
+            };
+            let board = if front { ui::INK } else { ui::mix(pal.bg, pal.fg, 0.1) };
+            let uvs = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
+            for (p, uv) in quad.iter().zip(uvs) {
+                m.vertices.push(egui::epaint::Vertex { pos: *p, uv: if cover.is_some() { uv } else { egui::epaint::WHITE_UV }, color: if cover.is_some() { tint } else { board.linear_multiply(1.0 - shade) } });
+            }
+            m.add_triangle(0, 1, 2);
+            m.add_triangle(0, 2, 3);
+            // shadow the board casts on the page it is leaving
+            if front {
+                let sw = (fx - hinge).abs() * 0.25 + 10.0;
+                painter.rect_filled(Rect::from_min_max(pos2(fx.min(hinge), top), pos2((fx + sw).max(hinge), bot)), CornerRadius::ZERO, Color32::from_black_alpha((50.0 * theta.sin()) as u8));
+            }
+            painter.add(m);
+            if cover.is_none() && front && (fx - hinge) > 60.0 {
+                let r = Rect::from_min_max(pos2(hinge, top), pos2(fx, bot));
+                painter.with_clip_rect(r).text(r.left_top() + vec2(24.0, 40.0), egui::Align2::LEFT_TOP, &self.book.meta.title, ui::ui_b(28.0), ui::PAPER);
             }
         }
     }
@@ -638,7 +659,7 @@ impl Reader {
         } else if s.tap_zones && fx > 0.72 {
             self.next_page();
         } else {
-            self.chrome = !self.chrome;
+            self.tools = !self.tools;
         }
     }
 }

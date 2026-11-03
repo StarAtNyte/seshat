@@ -10,9 +10,9 @@ use crate::ui::{self, chip, icon_button, Icon, Palette, ACCENT};
 pub(super) fn sidebar(r: &mut Reader, ctx: &egui::Context, side: Side, pal: &Palette, env: &mut Env) {
     egui::SidePanel::left("reader-side")
         .resizable(true)
-        .default_width(330.0)
-        .width_range(240.0..=560.0)
-        .frame(egui::Frame::new().fill(pal.panel).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, pal.border)))
+        .default_width(256.0)
+        .width_range(216.0..=380.0)
+        .frame(egui::Frame::new().fill(ui::desk(pal)).inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 12 }))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
