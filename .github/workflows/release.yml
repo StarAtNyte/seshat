@@ -93,20 +93,20 @@ jobs:
           path: dist/*
 
   macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-14
-            arch: arm64
-          - runner: macos-13
-            arch: x64
-    runs-on: ${{ matrix.runner }}
+    # One universal app (Apple Silicon + Intel) built on an arm64 runner.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release
+      - name: Build both architectures
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/seshat target/aarch64-apple-darwin/release/seshat target/x86_64-apple-darwin/release/seshat
       - name: Version
         id: v
         run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
@@ -125,10 +125,10 @@ jobs:
           iconutil -c icns seshat.iconset -o $APP/Contents/Resources/seshat.icns
           codesign --force --deep -s - $APP || true
           mkdir -p dist dmg && cp -R $APP dmg/ && ln -s /Applications dmg/Applications
-          hdiutil create -volname Seshat -srcfolder dmg -ov -format UDZO "dist/Seshat-$V-macos-${{ matrix.arch }}.dmg"
+          hdiutil create -volname Seshat -srcfolder dmg -ov -format UDZO "dist/Seshat-$V-macos-universal.dmg"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos
           path: dist/*
 
   publish:

@@ -34,8 +34,7 @@ Grab the latest build from the [Releases](../../releases) page.
 |---|---|---|
 | Windows 10/11 | `Seshat-x.y.z-windows-x64-setup.exe` | Standard installer with Start menu entry and uninstaller |
 | Windows (portable) | `Seshat-x.y.z-windows-x64-portable.zip` | Unzip anywhere and run `seshat.exe` |
-| macOS, Apple Silicon | `Seshat-x.y.z-macos-arm64.dmg` | M1 and newer |
-| macOS, Intel | `Seshat-x.y.z-macos-x64.dmg` | |
+| macOS 11+ | `Seshat-x.y.z-macos-universal.dmg` | One app for both Apple Silicon and Intel Macs |
 | Linux (Debian, Ubuntu, Mint, Pop!_OS) | `Seshat-x.y.z-linux-amd64.deb` | `sudo apt install ./Seshat-*.deb` |
 | Linux (any distribution) | `Seshat-x.y.z-linux-x86_64.AppImage` | `chmod +x` it, then run it |
 | Linux (manual) | `Seshat-x.y.z-linux-x86_64.tar.gz` | Plain binary with a desktop file and icon |
