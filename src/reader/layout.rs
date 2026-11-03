@@ -127,7 +127,12 @@ fn family(st: Style) -> FontFamily {
 
 fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (LayoutJob, f32, bool) {
     let base = t.size * scale_for(&block.kind) * if block.note { 0.88 } else { 1.0 };
-    let lh = base * if block.kind == BlockKind::Pre { 1.3 } else { t.line_height };
+    // headings set solid on their own size; body uses the reader's leading
+    let lh = base * match block.kind {
+        BlockKind::Pre => 1.3,
+        BlockKind::Heading(_) => 1.25,
+        _ => t.line_height,
+    };
     let mut indent_px = (block.indent * t.size).min(avail * 0.3);
     if let BlockKind::ListItem(d) = block.kind {
         indent_px += (d as f32 - 1.0) * 1.4 * t.size + 0.4 * t.size;
@@ -157,7 +162,7 @@ fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (Layout
         let size = (base * rel).max(6.0);
         let color = if sp.link.is_some() { t.link } else { t.fg };
         let mut f = TextFormat::simple(FontId::new(size, family(sp.style)), color);
-        f.line_height = Some(lh);
+        f.line_height = Some(lh.max(size * 1.2));
         f.extra_letter_spacing = t.letter;
         f.italics = sp.style.has(Style::ITALIC) && t.fake_italic && !sp.style.has(Style::MONO);
         if sp.style.has(Style::UNDERLINE) {
@@ -402,7 +407,8 @@ impl SectionLayout {
                             }
                         }
                     }
-                    p.galley(gpos, galley.clone(), fg);
+                    // re-fetch through egui's cache: survives font-atlas rebuilds
+                    p.galley(gpos, p.layout_job((*galley.job).clone()), fg);
                 }
                 Item::Image { key, size, x } => {
                     let r = Rect::from_min_size(pos2(origin.x + x, by), *size);

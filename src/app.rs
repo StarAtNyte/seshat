@@ -529,7 +529,18 @@ impl eframe::App for App {
                 let n = ((started.elapsed().as_millis() as i64 - 2500) / 700).max(-1);
                 if n >= 0 && (n as usize) < steps.len() && self.debug_keys_sent <= n as usize {
                     self.debug_keys_sent = n as usize + 1;
-                    if let Some(k) = egui::Key::from_name(steps[n as usize]) {
+                    let step = steps[n as usize];
+                    if let Some(rest) = step.strip_prefix("click:") {
+                        let v: Vec<f32> = rest.split('x').filter_map(|x| x.parse().ok()).collect();
+                        if v.len() == 2 {
+                            let pos = pos2(v[0], v[1]);
+                            ctx.input_mut(|inp| {
+                                inp.events.push(egui::Event::PointerMoved(pos));
+                                inp.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+                                inp.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+                            });
+                        }
+                    } else if let Some(k) = egui::Key::from_name(step) {
                         ctx.input_mut(|inp| inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }));
                     }
                 }

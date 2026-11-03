@@ -350,7 +350,9 @@ impl Reader {
         self.motion = s.motion;
         if self.opened_at.is_none() {
             let _ = self.cover_tex();
-            if self.tex.get("__cover").is_some() || self.book.meta.cover.is_none() || self.tex.state("__cover").is_some_and(|s| matches!(s, crate::texload::State::Failed)) {
+            // never let a slow cover decode hold the text back for long
+            let waited = self.turn_mark.0.elapsed() > std::time::Duration::from_millis(350);
+            if waited || self.tex.get("__cover").is_some() || self.book.meta.cover.is_none() || self.tex.state("__cover").is_some_and(|s| matches!(s, crate::texload::State::Failed)) {
                 self.opened_at = Some(std::time::Instant::now());
             } else {
                 ui.ctx().request_repaint();
@@ -670,7 +672,7 @@ impl Reader {
             }
             let by = origin.y + b.y - top;
             match &b.item {
-                super::layout::Item::Text { galley, ax } => shapes.push(egui::Shape::galley(pos2(origin.x + ax, by), galley.clone(), fg)),
+                super::layout::Item::Text { galley, ax } => shapes.push(egui::Shape::galley(pos2(origin.x + ax, by), ctx.fonts(|f| f.layout_job((*galley.job).clone())), fg)),
                 super::layout::Item::Image { key, size, x } => {
                     if let Some(t) = self.tex.get(key) {
                         let tint = if dim { Color32::from_gray(225) } else { Color32::WHITE };

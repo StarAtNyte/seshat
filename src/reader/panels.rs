@@ -176,12 +176,14 @@ fn toc(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
             let active = cur == Some(i);
             let w = ui.available_width();
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+            // the pill reaches into the margin so the text stays flush with the header
+            let pill = rect.expand2(vec2(8.0, 0.0));
             if active {
-                ui.painter().rect_filled(rect, CornerRadius::same(6), ACCENT.linear_multiply(0.14));
+                ui.painter().rect_filled(pill, CornerRadius::same(6), ACCENT.linear_multiply(0.14));
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, CornerRadius::same(6), pal.hover);
+                ui.painter().rect_filled(pill, CornerRadius::same(6), pal.hover);
             }
-            let indent = 10.0 + e.depth as f32 * 16.0;
+            let indent = e.depth as f32 * 16.0;
             let font = egui::FontId::proportional(if e.depth == 0 { 14.0 } else { 13.5 });
             let color = if active { ACCENT } else if e.depth == 0 { pal.fg } else { pal.muted.lerp_to_gamma(pal.fg, 0.4) };
             let galley = ui.painter().layout(e.title.clone(), font, color, w - indent - 50.0);
@@ -189,9 +191,9 @@ fn toc(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
             ui.painter().galley(rect.left_center() + vec2(indent, -g.size().y / 2.0), g, color);
             if let Content::Flow(f) = &book.content {
                 let pct = (f.fraction(e.loc) * 100.0).round();
-                ui.painter().text(rect.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, format!("{pct}%"), egui::FontId::proportional(11.0), pal.muted);
+                ui.painter().text(rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{pct}%"), egui::FontId::proportional(11.0), pal.muted);
             } else {
-                ui.painter().text(rect.right_center() - vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, format!("{}", e.loc.section + 1), egui::FontId::proportional(11.0), pal.muted);
+                ui.painter().text(rect.right_center(), egui::Align2::RIGHT_CENTER, format!("{}", e.loc.section + 1), egui::FontId::proportional(11.0), pal.muted);
             }
             if active && scroll_now {
                 resp.scroll_to_me(Some(egui::Align::Center));
