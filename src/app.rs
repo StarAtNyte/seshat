@@ -428,6 +428,19 @@ impl App {
     /// `ZR_SHOT=out.png` (debug aid): save a screenshot once startup settles, then quit.
     /// `ZR_KEYS=Right,type:woolf,click:400x300` injects input first; `ZR_WAIT` ms delay.
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
+        // reader-window captures may surface on the root's input
+        if let Ok(rp) = std::env::var("ZR_SHOT_READER") {
+            let shot = ctx.input(|i| i.raw.events.iter().find_map(|e| if let egui::Event::Screenshot { image, viewport_id, .. } = e { (*viewport_id != egui::ViewportId::ROOT).then(|| image.clone()) } else { None }));
+            if let Some(img) = shot {
+                let [w, h] = img.size;
+                let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, bytes) {
+                    let _ = buf.save(&rp);
+                }
+                std::process::exit(0);
+            }
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         let Ok(path) = std::env::var("ZR_SHOT") else { return };
         let started = *self.debug_start.get_or_insert_with(Instant::now);
         let t = started.elapsed();
@@ -508,6 +521,26 @@ impl eframe::App for App {
         self.sync_fonts(ctx);
         self.persist_settings();
 
+        // debug aid: ZR_READER_IN_ROOT=1 renders the first book in the main window (capturable)
+        if std::env::var("ZR_READER_IN_ROOT").is_ok() && !self.readers.is_empty() {
+            if let Ok(keys) = std::env::var("ZR_READER_KEYS") {
+                let started = *self.debug_start.get_or_insert_with(Instant::now);
+                let steps: Vec<&str> = keys.split(',').filter(|k| !k.is_empty()).collect();
+                let n = ((started.elapsed().as_millis() as i64 - 2500) / 700).max(-1);
+                if n >= 0 && (n as usize) < steps.len() && self.debug_keys_sent <= n as usize {
+                    self.debug_keys_sent = n as usize + 1;
+                    if let Some(k) = egui::Key::from_name(steps[n as usize]) {
+                        ctx.input_mut(|inp| inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }));
+                    }
+                }
+            }
+            let r = &mut self.readers[0];
+            let s = r.effective(&self.settings.reader);
+            ui::style(ctx, &ui::palette(&s));
+            let mut env = Env { app: &mut self.settings, families: &self.families, installed: &self.installed };
+            let _ = r.ui(ctx, &mut env);
+            return;
+        }
         let pal = self.library_palette(ctx);
         self.apply_style(ctx, &pal);
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
@@ -587,6 +620,12 @@ impl App {
                     // debug aid: ZR_SHOT_READER=out.png captures this window
                     if let Ok(path) = std::env::var("ZR_SHOT_READER") {
                         let started = *debug_start.get_or_insert_with(Instant::now);
+                        if let Ok(tf) = std::env::var("ZR_TRACE_FILE") {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(tf) {
+                                let _ = writeln!(f, "reader frame {:?} req={}", started.elapsed(), shot_req);
+                            }
+                        }
                         vctx.request_repaint_after(Duration::from_millis(50));
                         if let Ok(keys) = std::env::var("ZR_READER_KEYS") {
                             let steps: Vec<&str> = keys.split(',').filter(|k| !k.is_empty()).collect();

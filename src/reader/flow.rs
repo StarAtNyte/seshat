@@ -740,8 +740,8 @@ impl Reader {
             let u = (a / w).min(1.2);
             let th = local(u);
             let x = hinge + s0 * along(a);
-            let lift = 1.0 + 0.1 * th.sin() * u;
-            let droop = 6.0 * flutter * u * u * ((p.y - cy) / half_h + 0.6);
+            let lift = 1.0 + 0.035 * th.sin() * u;
+            let droop = 2.5 * flutter * u * u * ((p.y - cy) / half_h);
             (pos2(x, cy + (p.y - cy) * lift + droop), th)
         };
         let mid = local(0.5);
@@ -761,7 +761,7 @@ impl Reader {
             let x0 = hinge + if sheet.center().x >= hinge { a } else { -a };
             let (pt, th) = warp(pos2(x0, sheet.top()));
             let (pb, _) = warp(pos2(x0, sheet.bottom()));
-            let shade = 1.0 - 0.28 * th.sin().abs();
+            let shade = 1.0 - 0.12 * th.sin().abs();
             let c = Color32::from_rgb((pal.bg.r() as f32 * shade) as u8, (pal.bg.g() as f32 * shade) as u8, (pal.bg.b() as f32 * shade) as u8);
             paper.colored_vertex(pt, c);
             paper.colored_vertex(pb, c);
@@ -777,7 +777,7 @@ impl Reader {
             for v in &mut m.vertices {
                 let (p, th) = warp(v.pos);
                 v.pos = p;
-                v.color = v.color.linear_multiply(1.0 - 0.28 * th.sin().abs());
+                v.color = v.color.linear_multiply(1.0 - 0.12 * th.sin().abs());
             }
             painter.add(egui::Shape::mesh(m));
         }

@@ -107,6 +107,8 @@ impl Reader {
     /// Navigation, layout, type size, theme.
     fn tools_left(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
         let flow = self.book.flow().is_some();
+        let w = ctx.screen_rect().width();
+        let (compact, tight) = (w < 1500.0, w < 1180.0);
         if ui::icon_toggle(ui, Icon::Menu, "Contents, notes, bookmarks (C)", self.side.is_some()).clicked() {
             self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
             self.toc_scroll = true;
@@ -129,7 +131,8 @@ impl Reader {
                 (_, Columns::One) => 0,
                 _ => 1,
             };
-            if let Some(i) = ui::segmented(ui, "layout", &["Page", "Spread", "Scroll"], sel) {
+            let picked = if tight { None } else { ui::segmented(ui, "layout", &["Page", "Spread", "Scroll"], sel) };
+            if let Some(i) = picked {
                 self.set(env, |s| match i {
                     0 => {
                         s.layout = Layout::Paginated;
@@ -146,7 +149,9 @@ impl Reader {
             if text_button(ui, "A−", false).on_hover_text("Smaller text (Ctrl −)").clicked() {
                 self.set(env, |s| s.font_size = (s.font_size - 1.0).max(10.0));
             }
-            ui.label(RichText::new(format!("{:.0}", s.font_size)).font(ui_m(13.0)).color(pal.muted));
+            if !compact {
+                ui.label(RichText::new(format!("{:.0}", s.font_size)).font(ui_m(13.0)).color(pal.muted));
+            }
             if text_button(ui, "A+", false).on_hover_text("Larger text (Ctrl +)").clicked() {
                 self.set(env, |s| s.font_size = (s.font_size + 1.0).min(48.0));
             }
@@ -165,6 +170,9 @@ impl Reader {
             if text_button(ui, "RTL", self.fx.rtl).on_hover_text("Right-to-left page order (manga)").clicked() {
                 self.fx.rtl = !self.fx.rtl;
             }
+        }
+        if tight {
+            return;
         }
         sep(ui, pal);
         // theme: one swatch; every theme in a small popover
@@ -200,6 +208,8 @@ impl Reader {
     /// Reading modes and the rest (laid out right-to-left).
     fn tools_right(&mut self, ui: &mut egui::Ui, s: &ReaderSettings, pal: &Palette, env: &mut Env) {
         let flow = self.book.flow().is_some();
+        let w = ui.ctx().screen_rect().width();
+        let (compact, tight) = (w < 1500.0, w < 1180.0);
         if text_button(ui, "Aa", self.settings_open).on_hover_text("All reading settings").clicked() {
             self.settings_open = !self.settings_open;
             if self.settings_open {
@@ -207,7 +217,7 @@ impl Reader {
             }
         }
         // page-turn motion, right where you'd look for it
-        let label = ["Flip: Full", "Flip: Simple", "Flip: Off"][s.motion.min(2) as usize];
+        let label = if compact { "Flip" } else { ["Flip: Full", "Flip: Simple", "Flip: Off"][s.motion.min(2) as usize] };
         let r = text_button(ui, label, false).on_hover_text("Page-turn motion");
         let pid = ui.make_persistent_id("motion-pop");
         if r.clicked() {
@@ -224,11 +234,11 @@ impl Reader {
             }
         });
         sep(ui, pal);
-        if text_button(ui, "Auto", self.auto).on_hover_text(if flow && s.layout == Layout::Scrolled { "Auto-scroll (A)" } else { "Turn pages automatically (A)" }).clicked() {
+        if !compact && text_button(ui, "Auto", self.auto).on_hover_text(if flow && s.layout == Layout::Scrolled { "Auto-scroll (A)" } else { "Turn pages automatically (A)" }).clicked() {
             self.auto = !self.auto;
             self.auto_last = std::time::Instant::now();
         }
-        if flow {
+        if flow && !tight {
             let playing = self.speaker.is_some();
             if ui::icon_toggle(ui, Icon::Speaker, "Read aloud", playing).clicked() {
                 if playing {
