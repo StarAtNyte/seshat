@@ -125,7 +125,7 @@ fn family(st: Style) -> FontFamily {
     FontFamily::Name(name.into())
 }
 
-fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (LayoutJob, f32) {
+fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (LayoutJob, f32, bool) {
     let base = t.size * scale_for(&block.kind) * if block.note { 0.88 } else { 1.0 };
     let lh = base * if block.kind == BlockKind::Pre { 1.3 } else { t.line_height };
     let mut indent_px = (block.indent * t.size).min(avail * 0.3);
@@ -175,7 +175,8 @@ fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (Layout
     }
     let w = (avail - indent_px).max(40.0);
     job.wrap = TextWrapping { max_width: w, ..Default::default() };
-    job.justify = align == Align::Justify;
+    // egui's built-in justify letter-spaces loose lines; we justify by word spacing instead.
+    job.justify = false;
     let ax = match align {
         Align::Center => {
             job.halign = EAlign::Center;
@@ -187,7 +188,79 @@ fn job_for(block: &Block, prev: Option<&Block>, t: &Typo, avail: f32) -> (Layout
         }
         _ => indent_px,
     };
-    (job, ax)
+    (job, ax, align == Align::Justify)
+}
+
+/// Re-layout a paragraph so every line but the last fills the measure, with
+/// the slack distributed over the inter-word spaces of that line.
+fn justify(fonts: &egui::text::Fonts, job: LayoutJob, g: Arc<Galley>) -> Arc<Galley> {
+    let w = job.wrap.max_width;
+    if g.rows.len() < 2 {
+        return g;
+    }
+    // char index → extra leading space before it
+    let mut inserts: Vec<(usize, f32)> = Vec::new();
+    let mut start = 0usize;
+    let n = g.rows.len();
+    for (ri, row) in g.rows.iter().enumerate() {
+        let cc = row.char_count_including_newline();
+        let last_line = ri + 1 == n || row.ends_with_newline;
+        if !last_line {
+            let glyphs = &row.glyphs;
+            let end = glyphs.iter().rposition(|gl| !gl.chr.is_whitespace());
+            if let Some(end) = end {
+                let first = glyphs.iter().position(|gl| !gl.chr.is_whitespace()).unwrap_or(0);
+                let spaces: Vec<usize> = (first..end).filter(|&j| glyphs[j].chr == ' ' && j + 1 <= end && glyphs[j + 1].chr != ' ').collect();
+                let slack = w - glyphs[end].max_x() - 0.75;
+                if !spaces.is_empty() && slack > 0.0 && slack < w * 0.5 {
+                    let per = slack / spaces.len() as f32;
+                    for j in spaces {
+                        inserts.push((start + j + 1, per));
+                    }
+                }
+            }
+        }
+        start += cc;
+    }
+    if inserts.is_empty() {
+        return g;
+    }
+    // rebuild the job with leading space before the chosen words
+    let text = job.text.clone();
+    let char_byte: Vec<usize> = text.char_indices().map(|(b, _)| b).chain(std::iter::once(text.len())).collect();
+    let mut cuts: Vec<(usize, f32)> = inserts.iter().filter_map(|&(c, e)| char_byte.get(c).map(|&b| (b, e))).collect();
+    cuts.sort_by_key(|c| c.0);
+    let mut nj = LayoutJob { text: String::new(), sections: Vec::new(), ..job.clone() };
+    let mut ci = 0;
+    for sec in &job.sections {
+        let mut pos = sec.byte_range.start;
+        let mut lead = sec.leading_space;
+        while ci < cuts.len() && cuts[ci].0 <= pos {
+            if cuts[ci].0 == pos {
+                lead += cuts[ci].1;
+            }
+            ci += 1;
+        }
+        loop {
+            let next = cuts.get(ci).filter(|c| c.0 < sec.byte_range.end).copied();
+            let end = next.map(|c| c.0).unwrap_or(sec.byte_range.end);
+            nj.append(&text[pos..end], lead, sec.format.clone());
+            match next {
+                Some((b, e)) => {
+                    pos = b;
+                    lead = e;
+                    ci += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    let ng = fonts.layout_job(nj);
+    if ng.rows.len() == g.rows.len() && ng.rows.iter().zip(g.rows.iter()).all(|(a, b)| a.char_count_including_newline() == b.char_count_including_newline()) {
+        ng
+    } else {
+        g
+    }
 }
 
 fn spacing(kind: &BlockKind, t: &Typo) -> (f32, f32) {
@@ -235,11 +308,12 @@ impl SectionLayout {
                         LBlock { y, h, item: Item::Rule }
                     }
                     _ => {
-                        let (job, ax) = job_for(b, prev, t, t.width);
+                        let (job, ax, just) = job_for(b, prev, t, t.width);
                         if job.text.is_empty() {
                             LBlock { y, h: 0.0, item: Item::Empty }
                         } else {
-                            let g = fonts.layout_job(job);
+                            let g = fonts.layout_job(job.clone());
+                            let g = if just { justify(fonts, job, g) } else { g };
                             let mut c = 0;
                             let heading = matches!(b.kind, BlockKind::Heading(_));
                             let n = g.rows.len();
