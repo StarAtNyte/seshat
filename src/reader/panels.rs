@@ -419,120 +419,171 @@ fn search(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette, _env: &mut Env) {
 
 // ---------- settings ----------
 
+/// Reading settings as a calm right-hand drawer with four tabs.
 pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bool, env: &mut Env, actions: &mut Vec<Action>) {
     let per_book = r.data.settings.is_some();
     let mut s: ReaderSettings = r.effective(&env.app.reader);
     let before = s.clone();
+    let pal = ui::palette(&s);
     let fixed = r.book.fixed().is_some();
-    egui::Window::new("Reading settings")
-        .open(open)
-        .collapsible(false)
+    egui::SidePanel::right("reader-settings")
         .resizable(false)
-        .anchor(egui::Align2::RIGHT_TOP, vec2(-12.0, 56.0))
-        .default_width(340.0)
+        .exact_width(336.0)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().fill(ui::desk(&pal)).inner_margin(egui::Margin { left: 20, right: 20, top: 16, bottom: 16 }))
         .show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() - 140.0).show(ui, |ui| {
-                ui.set_width(330.0);
-                ui::section_label(ui, "Theme");
-                ui.horizontal_wrapped(|ui| {
-                    for t in THEMES {
-                        let p = ui::palette_for(*t, s.custom_bg, s.custom_fg);
-                        let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-                        ui.painter().rect_filled(rect, CornerRadius::same(18), p.bg);
-                        let sel = s.theme == *t;
-                        ui.painter().rect_stroke(rect, CornerRadius::same(18), Stroke::new(if sel { 2.5 } else { 1.0 }, if sel { ACCENT } else { p.border.lerp_to_gamma(Color32::GRAY, 0.5) }), egui::StrokeKind::Inside);
-                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Aa", egui::FontId::new(13.0, egui::FontFamily::Name("book".into())), p.fg);
-                        if resp.on_hover_text(t.name()).clicked() {
-                            s.theme = *t;
-                        }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Reading settings").font(ui::ui_b(17.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, Icon::Close, "Close").clicked() {
+                        *open = false;
                     }
                 });
-                if s.theme == Theme::Custom {
-                    ui.horizontal(|ui| {
-                        ui.label("Background");
-                        ui.color_edit_button_srgb(&mut s.custom_bg);
-                        ui.label("Text");
-                        ui.color_edit_button_srgb(&mut s.custom_fg);
-                    });
+            });
+            ui.add_space(14.0);
+            // tabs
+            let tabs = ["Text", "Layout", "Theme", "More"];
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+            let cw = row.width() / tabs.len() as f32;
+            for (i, t) in tabs.iter().enumerate() {
+                let cell = egui::Rect::from_min_size(egui::pos2(row.left() + i as f32 * cw, row.top()), vec2(cw, 34.0));
+                let resp = ui.interact(cell, ui.id().with(("stab", i)), Sense::click());
+                let on = r.settings_tab as usize == i;
+                ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, *t, ui::ui_m(13.5), if on { ACCENT } else if resp.hovered() { pal.fg } else { pal.muted });
+                if resp.clicked() {
+                    r.settings_tab = i as u8;
                 }
-                if !fixed {
-                    ui::section_label(ui, "Font");
-                    let current = if s.font.is_empty() { format!("Default ({})", env.installed.book_family) } else { s.font.clone() };
-                    egui::ComboBox::from_id_salt("font").selected_text(current).width(300.0).height(360.0).show_ui(ui, |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut r.font_filter).hint_text("Filter fonts…"));
-                        if ui.selectable_label(s.font.is_empty(), "Default serif").clicked() {
-                            s.font.clear();
+            }
+            ui.painter().hline(row.x_range(), row.bottom(), Stroke::new(1.0, pal.border));
+            let ax = ctx.animate_value_with_time(ui.id().with("stab-x"), row.left() + r.settings_tab as f32 * cw, 0.18);
+            ui.painter().hline(ax + 12.0..=ax + cw - 12.0, row.bottom(), Stroke::new(2.0, ACCENT));
+            ui.add_space(18.0);
+
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                match r.settings_tab {
+                    0 if !fixed => {
+                        group(ui, &pal, "Typeface");
+                        let current = if s.font.is_empty() { format!("Default · {}", env.installed.book_family) } else { s.font.clone() };
+                        egui::ComboBox::from_id_salt("font").selected_text(current).width(ui.available_width()).height(360.0).show_ui(ui, |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut r.font_filter).hint_text("Filter fonts…"));
+                            if ui.selectable_label(s.font.is_empty(), "Default serif").clicked() {
+                                s.font.clear();
+                            }
+                            let f = r.font_filter.to_lowercase();
+                            for fam in env.families.iter().filter(|x| f.is_empty() || x.to_lowercase().contains(&f)).take(400) {
+                                if ui.selectable_label(&s.font == fam, fam.as_str()).clicked() {
+                                    s.font = fam.clone();
+                                }
+                            }
+                            if env.families.is_empty() {
+                                ui.label("Scanning system fonts…");
+                            }
+                        });
+                        ui.label(RichText::new("The quick brown fox jumps over the lazy dog.").family(egui::FontFamily::Name("book".into())).size(s.font_size.min(22.0)));
+                        group(ui, &pal, "Size & spacing");
+                        row_slider(ui, &pal, "Size", &mut s.font_size, 12.0..=44.0, 0.5, "");
+                        row_slider(ui, &pal, "Line height", &mut s.line_height, 1.0..=2.4, 0.05, "");
+                        row_slider(ui, &pal, "Paragraphs", &mut s.para_spacing, 0.0..=2.0, 0.1, " em");
+                        row_slider(ui, &pal, "Letters", &mut s.letter_spacing, -1.0..=3.0, 0.1, " px");
+                        group(ui, &pal, "Paragraphs");
+                        ui.checkbox(&mut s.justify, "Justify text");
+                        ui.checkbox(&mut s.indent, "Indent first lines");
+                        ui.checkbox(&mut s.override_book, "Ignore the book's own formatting");
+                    }
+                    0 | 1 if fixed => {
+                        group(ui, &pal, "Page");
+                        if let Some(i) = ui::segmented(ui, "s-zoom", &["Fit page", "Fit width"], r.fx.zoom as usize) {
+                            r.fx.zoom = i as u8;
                         }
-                        let f = r.font_filter.to_lowercase();
-                        for fam in env.families.iter().filter(|x| f.is_empty() || x.to_lowercase().contains(&f)).take(400) {
-                            if ui.selectable_label(&s.font == fam, egui::RichText::new(fam)).clicked() {
-                                s.font = fam.clone();
+                        row_slider(ui, &pal, "Zoom", &mut r.fx.scale, 0.3..=5.0, 0.05, "×");
+                        ui.checkbox(&mut r.fx.rtl, "Right-to-left page order (manga)");
+                    }
+                    1 => {
+                        group(ui, &pal, "View");
+                        let sel = match (s.layout, s.columns) {
+                            (Layout::Scrolled, _) => 2,
+                            (_, Columns::One) => 0,
+                            _ => 1,
+                        };
+                        if let Some(i) = ui::segmented(ui, "s-layout", &["Single page", "Spread", "Scroll"], sel) {
+                            match i {
+                                0 => {
+                                    s.layout = Layout::Paginated;
+                                    s.columns = Columns::One;
+                                }
+                                1 => {
+                                    s.layout = Layout::Paginated;
+                                    s.columns = Columns::Two;
+                                }
+                                _ => s.layout = Layout::Scrolled,
                             }
                         }
-                        if env.families.is_empty() {
-                            ui.label("Scanning system fonts…");
-                        }
-                    });
-                    slider(ui, "Size", &mut s.font_size, 12.0..=44.0, 0.5, "");
-                    slider(ui, "Line spacing", &mut s.line_height, 1.0..=2.4, 0.05, "");
-                    slider(ui, "Paragraph spacing", &mut s.para_spacing, 0.0..=2.0, 0.1, " em");
-                    slider(ui, "Letter spacing", &mut s.letter_spacing, -1.0..=3.0, 0.1, " px");
-                    ui.checkbox(&mut s.justify, "Justify text");
-                    ui.checkbox(&mut s.indent, "Indent paragraphs");
-                    ui.checkbox(&mut s.override_book, "Override book formatting").on_hover_text("Ignore the book's own font sizes and paragraph alignment");
-
-                    ui::section_label(ui, "Layout");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut s.layout, Layout::Paginated, "Pages");
-                        ui.selectable_value(&mut s.layout, Layout::Scrolled, "Scroll");
-                        ui.separator();
-                        ui.add_enabled_ui(s.layout == Layout::Paginated, |ui| {
-                            ui.selectable_value(&mut s.columns, Columns::Auto, "Auto");
-                            ui.selectable_value(&mut s.columns, Columns::One, "1 col");
-                            ui.selectable_value(&mut s.columns, Columns::Two, "2 col");
+                        group(ui, &pal, "Page");
+                        row_slider(ui, &pal, "Margins", &mut s.margin, 0.0..=200.0, 2.0, " px");
+                        row_slider(ui, &pal, "Line width", &mut s.max_width, 360.0..=1800.0, 10.0, " px");
+                        group(ui, &pal, "Around the text");
+                        ui.checkbox(&mut s.show_header, "Running heads (book and chapter)");
+                        ui.checkbox(&mut s.show_footer, "Page numbers and time left");
+                    }
+                    2 => {
+                        group(ui, &pal, "Theme");
+                        let w = (ui.available_width() - 30.0) / 4.0;
+                        egui::Grid::new("themes").spacing(vec2(10.0, 10.0)).show(ui, |ui| {
+                            for (i, t) in THEMES.iter().enumerate() {
+                                let p = ui::palette_for(*t, s.custom_bg, s.custom_fg);
+                                let (rr, resp) = ui.allocate_exact_size(vec2(w, 64.0), Sense::click());
+                                let on = s.theme == *t;
+                                let k = ctx.animate_bool_with_time(resp.id, resp.hovered() || on, 0.12);
+                                ui.painter().rect_filled(rr.shrink(2.0 - 2.0 * k), CornerRadius::same(8), p.bg);
+                                ui.painter().rect_stroke(rr.shrink(2.0 - 2.0 * k), CornerRadius::same(8), Stroke::new(if on { 2.0 } else { 1.0 }, if on { ACCENT } else { pal.border }), egui::StrokeKind::Inside);
+                                ui.painter().text(rr.center() - vec2(0.0, 7.0), egui::Align2::CENTER_CENTER, "Aa", egui::FontId::new(16.0, egui::FontFamily::Name("book".into())), p.fg);
+                                ui.painter().text(rr.center() + vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, t.name(), ui::ui_m(10.5), p.muted);
+                                if resp.clicked() {
+                                    s.theme = *t;
+                                }
+                                if i % 4 == 3 {
+                                    ui.end_row();
+                                }
+                            }
                         });
-                    });
-                    slider(ui, "Margins", &mut s.margin, 0.0..=200.0, 2.0, " px");
-                    slider(ui, "Max line width", &mut s.max_width, 360.0..=1800.0, 10.0, " px");
-                    ui.checkbox(&mut s.show_header, "Show chapter title");
-                    ui.checkbox(&mut s.show_footer, "Show progress footer");
-                    ui.checkbox(&mut s.wheel_turns_page, "Mouse wheel turns pages");
-                } else {
-                    ui::section_label(ui, "Page");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut r.fx.zoom, 0, "Fit page");
-                        ui.selectable_value(&mut r.fx.zoom, 1, "Fit width");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Zoom {:.0}%", r.fx.scale.max(0.01) * 100.0));
-                        if icon_button(ui, Icon::ZoomOut, "Zoom out").clicked() {
-                            r.fx.scale = (r.fx.scale / 1.15).max(0.3);
+                        if s.theme == Theme::Custom {
+                            group(ui, &pal, "Custom colours");
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Paper").color(pal.muted));
+                                ui.color_edit_button_srgb(&mut s.custom_bg);
+                                ui.add_space(16.0);
+                                ui.label(RichText::new("Ink").color(pal.muted));
+                                ui.color_edit_button_srgb(&mut s.custom_fg);
+                            });
                         }
-                        if icon_button(ui, Icon::ZoomIn, "Zoom in").clicked() {
-                            r.fx.scale = (r.fx.scale * 1.15).min(5.0);
+                        group(ui, &pal, "Images");
+                        ui.checkbox(&mut s.dim_images, "Dim images in dark themes");
+                    }
+                    _ => {
+                        group(ui, &pal, "Motion");
+                        if let Some(i) = ui::segmented(ui, "s-motion", &["Full", "Simple", "Off"], s.motion as usize) {
+                            s.motion = i as u8;
                         }
-                        if ui.small_button("Reset").clicked() {
-                            r.fx.scale = 1.0;
+                        ui.label(RichText::new(["The cover opens and pages curl over the spine.", "Pages cross-fade quickly.", "Pages change instantly."][s.motion.min(2) as usize]).font(ui::ui_m(12.0)).color(pal.muted));
+                        group(ui, &pal, "Turning pages");
+                        ui.checkbox(&mut s.tap_zones, "Click the page edges to turn");
+                        ui.checkbox(&mut s.wheel_turns_page, "Mouse wheel turns pages");
+                        group(ui, &pal, "Auto-advance (A)");
+                        row_slider(ui, &pal, "Seconds/page", &mut s.auto_secs, 5.0..=120.0, 1.0, " s");
+                        row_slider(ui, &pal, "Scroll speed", &mut s.auto_px, 5.0..=200.0, 1.0, " px/s");
+                        group(ui, &pal, "Applies to");
+                        let mut pb = per_book as usize;
+                        if let Some(i) = ui::segmented(ui, "s-scope", &["All books", "This book"], pb) {
+                            pb = i;
+                            r.data.settings = if pb == 1 { Some(s.clone()) } else { None };
+                            r.dirty = true;
                         }
-                    });
-                    ui.checkbox(&mut r.fx.rtl, "Right-to-left (manga)");
-                }
-                ui::section_label(ui, "Motion");
-                if let Some(i) = ui::segmented(ui, "motion", &["Full", "Simple", "Off"], s.motion as usize) {
-                    s.motion = i as u8;
-                }
-                ui.checkbox(&mut s.tap_zones, "Click page edges to turn pages");
-                ui.checkbox(&mut s.dim_images, "Dim images in dark themes");
-
-                ui.separator();
-                let mut pb = per_book;
-                if ui.checkbox(&mut pb, "Use these settings for this book only").changed() {
-                    r.data.settings = if pb { Some(s.clone()) } else { None };
-                    r.dirty = true;
-                }
-                if ui.button("Reset to defaults").clicked() {
-                    let fresh = ReaderSettings { theme: s.theme, ..Default::default() };
-                    s = fresh;
+                        ui.add_space(8.0);
+                        if ui::text_button(ui, "Reset to defaults", false).clicked() {
+                            s = ReaderSettings { theme: s.theme, ..Default::default() };
+                        }
+                    }
                 }
             });
         });
@@ -549,10 +600,15 @@ pub(super) fn settings_window(r: &mut Reader, ctx: &egui::Context, open: &mut bo
     }
 }
 
-fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, step: f64, suffix: &str) {
+fn group(ui: &mut egui::Ui, pal: &Palette, title: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(title).font(ui::ui_m(12.0)).color(pal.muted));
+}
+
+fn row_slider(ui: &mut egui::Ui, pal: &Palette, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, step: f64, suffix: &str) {
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(118.0, 20.0), egui::Label::new(label));
-        ui.spacing_mut().slider_width = 140.0;
+        ui.add_sized(vec2(96.0, 22.0), egui::Label::new(RichText::new(label).color(pal.fg)));
+        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
         ui.add(egui::Slider::new(v, range).step_by(step).suffix(suffix));
     });
 }

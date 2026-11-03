@@ -156,6 +156,7 @@ pub struct Reader {
     quick_note: String,
     /// Toolbar pinned open (otherwise it slides in on demand).
     tools: bool,
+    settings_tab: u8,
 }
 
 impl Reader {
@@ -248,6 +249,7 @@ impl Reader {
             notebook: false,
             quick_note: String::new(),
             tools: false,
+            settings_tab: 0,
         };
         r.data.last_read = store::now();
         r.clamp_loc();
@@ -757,7 +759,11 @@ impl Reader {
             if let Some(side) = self.side {
                 panels::sidebar(self, ctx, side, &pal, env);
             }
-            if self.notebook {
+            if self.settings_open {
+                let mut open = true;
+                panels::settings_window(self, ctx, &mut open, env, &mut actions);
+                self.settings_open = open;
+            } else if self.notebook {
                 panels::notebook(self, ctx, &pal);
             }
         }
@@ -781,11 +787,6 @@ impl Reader {
         }
         if self.speaker.is_some() || !self.tts_error.is_empty() {
             self.tts_bar(ctx, &pal, env);
-        }
-        if self.settings_open {
-            let mut open = true;
-            panels::settings_window(self, ctx, &mut open, env, &mut actions);
-            self.settings_open = open;
         }
         self.popups(ctx, &pal, env);
         self.motion_hint_bar(ctx, &pal, env);
