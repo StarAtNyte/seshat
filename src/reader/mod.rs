@@ -174,6 +174,12 @@ pub struct Reader {
     auto: bool,
     auto_last: Instant,
     opened_at: Option<Instant>,
+    /// The book shown closed: front cover before the first page, back cover after the last.
+    cover: Cover,
+    /// Cover swinging open or shut: (start, true = toward closed, which board).
+    cover_anim: Option<(Instant, bool, Cover)>,
+    /// Where the book was when it was closed at the back (a jump elsewhere reopens it).
+    back_at: Option<Loc>,
     turn: Option<Turn>,
     motion: u8,
     motion_hint: bool,
@@ -277,6 +283,9 @@ impl Reader {
             auto: false,
             auto_last: Instant::now(),
             opened_at: None,
+            cover: Cover::Open,
+            cover_anim: None,
+            back_at: None,
             turn: None,
             motion: 0,
             motion_hint: false,
@@ -1460,56 +1469,99 @@ impl Reader {
             let l = self.lookup.as_ref().unwrap();
             let title = l.kind.title();
             let mut retry = false;
-            egui::Window::new(title).open(&mut open).collapsible(false).resizable(true).default_width(420.0).default_height(320.0).anchor(Align2::RIGHT_BOTTOM, vec2(-16.0, -70.0)).show(ctx, |ui| {
-                let l = self.lookup.as_ref().unwrap();
-                match &l.res {
-                    None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(trf!("Looking up “{word}”…", word = l.query.chars().take(40).collect::<String>()));
-                        });
-                    }
-                    Some(Err(e)) => {
-                        ui.label(e);
-                        if ui.button(tr("Retry")).clicked() {
-                            retry = true;
-                        }
-                    }
-                    Some(Ok(a)) => {
-                        ui.label(RichText::new(&a.heading).strong().size(17.0));
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                            ui.label(RichText::new(&a.body).size(14.0));
-                        });
-                        ui.horizontal(|ui| {
-                            if let Some(u) = &a.url {
-                                if ui.link(tr("Open in browser")).clicked() {
-                                    crate::platform::open_url(u);
-                                }
-                            }
-                            if ui.small_button(tr("Copy")).clicked() {
-                                ui.ctx().copy_text(format!("{}\n{}", a.heading, a.body));
-                            }
-                        });
-                    }
-                }
-                if l.kind == lookup::Kind::Translate {
-                    ui.separator();
+            let pal = ui::palette(&self.effective(&env.app.reader));
+            egui::Window::new(title)
+                .id(egui::Id::new("lookup-win"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size(vec2(400.0, 0.0))
+                .frame(egui::Frame::new().fill(pal.bg).stroke(egui::Stroke::new(1.0, pal.border)).corner_radius(12).inner_margin(egui::Margin::same(20)).shadow(egui::epaint::Shadow { offset: [0, 6], blur: 24, spread: 0, color: Color32::from_black_alpha(40) }))
+                .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -76.0))
+                .show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let l = self.lookup.as_ref().unwrap();
+                    // header: source, then the looked-up term; close on the right
                     ui.horizontal(|ui| {
-                        ui.label(tr("Target language:"));
-                        let mut t = env.app.translate_to.clone();
-                        egui::ComboBox::from_id_salt("tl").selected_text(&t).width(90.0).show_ui(ui, |ui| {
-                            for code in ["en", "es", "fr", "de", "it", "pt", "ru", "zh-CN", "ja", "ko", "ar", "hi", "tr", "nl", "pl", "uk", "vi", "id"] {
-                                ui.selectable_value(&mut t, code.to_string(), code);
+                        ui.label(RichText::new(title).font(ui::ui_m(12.0)).color(pal.muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui::icon_button(ui, ui::Icon::Close, tr("Close")).clicked() {
+                                open = false;
                             }
                         });
-                        if t != env.app.translate_to {
-                            env.app.translate_to = t;
-                            retry = true;
-                        }
                     });
-                }
-            });
+                    match &l.res {
+                        None => {
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(trf!("Looking up “{word}”…", word = l.query.chars().take(40).collect::<String>())).font(ui::ui_m(13.5)).color(pal.fg));
+                            });
+                            ui.add_space(4.0);
+                        }
+                        Some(Err(e)) => {
+                            ui.add_space(10.0);
+                            ui.add(egui::Label::new(RichText::new(e).font(ui::ui_m(13.5)).color(pal.fg)).wrap());
+                            ui.add_space(14.0);
+                            if ui::text_button(ui, tr("Retry"), false).clicked() {
+                                retry = true;
+                            }
+                        }
+                        Some(Ok(a)) => {
+                            ui.add_space(4.0);
+                            ui.add(egui::Label::new(RichText::new(&a.heading).font(ui::ui_b(20.0)).color(pal.fg)).wrap());
+                            ui.add_space(12.0);
+                            ui::rule(ui);
+                            ui.add_space(12.0);
+                            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let mut first = true;
+                                for para in a.body.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+                                    if !first {
+                                        ui.add_space(10.0);
+                                    }
+                                    first = false;
+                                    ui.add(egui::Label::new(RichText::new(para).family(egui::FontFamily::Name("book".into())).size(15.0).line_height(Some(22.0)).color(pal.fg)).wrap());
+                                }
+                            });
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                if let Some(u) = &a.url {
+                                    if ui::text_button(ui, tr("Open in browser"), false).clicked() {
+                                        crate::platform::open_url(u);
+                                    }
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui::text_button(ui, tr("Copy"), false).clicked() {
+                                        ui.ctx().copy_text(format!("{}\n{}", a.heading, a.body));
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    if l.kind == lookup::Kind::Translate {
+                        ui.add_space(14.0);
+                        ui::rule(ui);
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(tr("Target language:")).font(ui::ui_m(13.0)).color(pal.muted));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let mut t = env.app.translate_to.clone();
+                                egui::ComboBox::from_id_salt("tl").selected_text(&t).width(110.0).show_ui(ui, |ui| {
+                                    for code in ["en", "es", "fr", "de", "it", "pt", "ru", "zh-CN", "ja", "ko", "ar", "hi", "tr", "nl", "pl", "uk", "vi", "id"] {
+                                        ui.selectable_value(&mut t, code.to_string(), code);
+                                    }
+                                });
+                                if t != env.app.translate_to {
+                                    env.app.translate_to = t;
+                                    retry = true;
+                                }
+                            });
+                        });
+                    }
+                });
             if retry {
                 if let Some(l) = self.lookup.take() {
                     self.start_lookup(l.kind, l.query, env.app);
@@ -1569,6 +1621,13 @@ pub fn deco_color(c: HlColor, dark: bool) -> Color32 {
 #[allow(dead_code)]
 fn _unused(_: Rect) {
     let _ = ACCENT;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cover {
+    Open,
+    Front,
+    Back,
 }
 
 #[derive(Clone, Copy)]

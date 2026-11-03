@@ -239,6 +239,9 @@ pub fn start(book: Arc<Book>, from: Loc, rate: f32, engine: Engine, on: impl Fn(
 
 fn start_system(book: Arc<Book>, from: Loc, rate: f32, on: impl Fn(Event) + Send + 'static) -> Option<Speaker> {
     let engine = available()?;
+    // speak in the book's language (English when unknown), never the desktop
+    // locale's: an English book read with another language's rules is gibberish
+    let lang = crate::voice::lang2(&book.meta.language).unwrap_or_else(|| "en".into());
     let stop = Arc::new(AtomicBool::new(false));
     let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let (stop2, child2) = (stop.clone(), child.clone());
@@ -307,13 +310,17 @@ fn start_system(book: Arc<Book>, from: Loc, rate: f32, on: impl Fn(Event) + Send
                     match engine {
                         "spd-say" => {
                             let r = ((rate - 1.0) * 60.0).round().clamp(-100.0, 100.0) as i32;
-                            cmd.args(["-w", "-r", &r.to_string(), "--"]);
+                            // bare "en" can land on the first English listed (Caribbean)
+                            let l = if lang == "en" { "en-US".to_string() } else { lang.clone() };
+                            cmd.args(["-w", "-r", &r.to_string(), "-l", &l, "--"]);
                         }
                         "say" => {
                             cmd.args(["-r", &((175.0 * rate) as i32).to_string(), "--"]);
                         }
                         _ => {
-                            cmd.args(["-s", &((170.0 * rate) as i32).to_string(), "--"]);
+                            // espeak: "en-us" reads English far more naturally than plain "en"
+                            let voice = if lang == "en" { "en-us".to_string() } else { lang.clone() };
+                            cmd.args(["-v", &voice, "-s", &((170.0 * rate) as i32).to_string(), "--"]);
                         }
                     }
                     cmd.arg(&sentence).stdout(Stdio::null()).stderr(Stdio::null());

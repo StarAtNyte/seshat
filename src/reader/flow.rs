@@ -9,11 +9,27 @@ use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Pos2, Rect, Sense, S
 use super::layout::{Deco, DecoKind, SectionLayout, Typo};
 #[allow(unused_imports)]
 use super::layout::Item;
-use super::{deco_color, Env, Reader};
+use super::{deco_color, Cover, Env, Reader};
 use crate::book::{BlockKind, Loc};
 use crate::store::{HlStyle, Layout, ReaderSettings};
 use crate::texload::Src;
 use crate::ui::{self, Palette, ACCENT};
+
+/// A cover board's placement (see `Reader::cover_geo`).
+pub(super) struct CoverGeo {
+    /// The closed book, centred on the desk.
+    closed: Rect,
+    /// The open book's pages (shadows stay on them).
+    pages: Rect,
+    hinge: f32,
+    bw: f32,
+    top: f32,
+    bot: f32,
+    /// +1 left-to-right, -1 right-to-left books.
+    d: f32,
+    /// Closed position minus open position (x).
+    off: f32,
+}
 
 pub(super) struct Geo {
     /// Paper sheets (one per visible page; scrolled mode = one tall sheet).
@@ -194,9 +210,25 @@ impl Reader {
         }
         let Some(flow) = self.book.flow() else { return };
         let n = flow.sections.len();
+        match self.cover {
+            Cover::Front => return self.set_cover(Cover::Open, Cover::Front),
+            Cover::Back => return,
+            Cover::Open => {}
+        }
         let Some(l) = &self.layout else { return };
         if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical {
+            let max = (l.height - self.view_h + 40.0).max(0.0);
+            if l.section + 1 >= n && self.scroll_y >= max - 1.0 {
+                self.data.finished = true;
+                return self.set_cover(Cover::Back, Cover::Back);
+            }
             return self.scroll_by(self.view_h * 0.9);
+        }
+        if self.page + self.step >= l.pages.len() && l.section + 1 >= n {
+            // past the last page: the back cover closes over the book
+            self.data.finished = true;
+            self.dirty = true;
+            return self.set_cover(Cover::Back, Cover::Back);
         }
         if self.motion < 2 {
             self.turn = Some(super::Turn { at: Instant::now(), dir: 1, from: self.page, section: l.section });
@@ -220,8 +252,18 @@ impl Reader {
         if self.book.fixed().is_some() {
             return self.fixed_prev();
         }
+        match self.cover {
+            Cover::Back => return self.set_cover(Cover::Open, Cover::Back),
+            Cover::Front => return,
+            Cover::Open => {}
+        }
         let Some(l) = &self.layout else { return };
-        if self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical {
+        let scrolled = self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical;
+        // before the first page: the front cover closes
+        if l.section == 0 && self.book.flow().is_some() && if scrolled { self.scroll_y <= 1.0 } else { self.page < self.step.max(1) } {
+            return self.set_cover(Cover::Front, Cover::Front);
+        }
+        if scrolled {
             return self.scroll_by(-self.view_h * 0.9);
         }
         if self.motion < 2 && (self.page > 0 || l.section > 0) {
@@ -238,6 +280,20 @@ impl Reader {
         self.last_turn = Instant::now();
         self.clear_selection();
         self.dirty = true;
+    }
+
+    /// Show the book open or closed at one cover, animating the board
+    /// (`side`) unless page motion is off.
+    fn set_cover(&mut self, to: Cover, side: Cover) {
+        if to == self.cover {
+            return;
+        }
+        self.cover = to;
+        self.back_at = (to == Cover::Back).then_some(self.loc);
+        self.cover_anim = (self.motion < 2).then(|| (Instant::now(), to != Cover::Open, side));
+        self.turn = None;
+        self.last_turn = Instant::now();
+        self.clear_selection();
     }
 
     pub(super) fn scroll_by(&mut self, dy: f32) {
@@ -370,13 +426,73 @@ impl Reader {
         self.motion = s.motion;
         if self.opened_at.is_none() {
             let _ = self.cover_tex();
-            // never let a slow cover decode hold the text back for long
-            let waited = self.turn_mark.0.elapsed() > std::time::Duration::from_millis(350);
-            if waited || self.tex.get("__cover").is_some() || self.book.meta.cover.is_none() || self.tex.state("__cover").is_some_and(|s| matches!(s, crate::texload::State::Failed)) {
-                self.opened_at = Some(std::time::Instant::now());
-            } else {
-                ui.ctx().request_repaint();
+            // no opening animation: a book at its very start rests on its closed
+            // front cover until the first page turn; anywhere else opens as is
+            self.opened_at = Some(Instant::now());
+            if self.loc == Loc::new(0, 0, 0) {
+                self.cover = Cover::Front;
             }
+            // debug aid: ZR_SIDE=toc|notes|marks|find|notebook|settings opens a panel for captures
+            #[cfg(debug_assertions)]
+            if let Ok(p) = std::env::var("ZR_SIDE") {
+                use super::Side;
+                match p.as_str() {
+                    "toc" => self.side = Some(Side::Toc),
+                    "notes" => self.side = Some(Side::Notes),
+                    "marks" => self.side = Some(Side::Bookmarks),
+                    "find" => self.side = Some(Side::Search),
+                    "notebook" => self.notebook = true,
+                    _ => self.settings_open = true,
+                }
+                if let Ok(t) = std::env::var("ZR_SETTINGS_TAB") {
+                    self.settings_tab = t.parse().unwrap_or(0);
+                }
+                if let Ok(q) = std::env::var("ZR_FIND") {
+                    self.search_q = q;
+                    self.run_search();
+                }
+            }
+        }
+        // a jump elsewhere (contents, search, progress) opens a closed book
+        if (self.cover == Cover::Front && self.loc != Loc::new(0, 0, 0)) || (self.cover == Cover::Back && self.back_at != Some(self.loc)) {
+            self.cover = Cover::Open;
+            self.cover_anim = None;
+        }
+        // how closed the book is (1 = shut on `side`), and whether pages show
+        let now = Instant::now();
+        let full = self.motion == 0;
+        let (side, c) = match self.cover_anim {
+            Some((at, closing, side)) => {
+                #[allow(unused_mut)]
+                let mut t = ((now - at).as_secs_f32() / if full { 1.0 } else { 0.25 }).min(1.0);
+                // debug aid: ZR_COVER_T=0.5 freezes a cover animation for captures
+                #[cfg(debug_assertions)]
+                if let Some(f) = std::env::var("ZR_COVER_T").ok().and_then(|v| v.parse::<f32>().ok()) {
+                    t = f;
+                }
+                if t >= 1.0 {
+                    self.cover_anim = None;
+                }
+                ui.ctx().request_repaint();
+                (side, if closing { t } else { 1.0 - t })
+            }
+            None => (self.cover, if self.cover == Cover::Open { 0.0 } else { 1.0 }),
+        };
+        let cg = self.cover_geo(&g, side);
+        let ps = if cg.off.abs() > 1.0 { 0.3 } else { 0.0 };
+        // full motion: (swing progress 0 = board on its open side, slide progress)
+        let (k, slide) = if side == Cover::Front {
+            let u = 1.0 - c;
+            if ps > 0.0 { (((u - ps) / (1.0 - ps)).clamp(0.0, 1.0), 1.0 - super::ease(u / ps)) } else { (u, 0.0) }
+        } else if ps > 0.0 {
+            ((c / (1.0 - ps)).clamp(0.0, 1.0), super::ease((c - (1.0 - ps)) / ps))
+        } else {
+            (c, 0.0)
+        };
+        let pages_visible = c < 1.0 && if !full || side == Cover::Open { true } else if side == Cover::Front { k > 0.0 } else { k < 1.0 };
+        if !pages_visible {
+            self.closed_view(ui, rect, &cg, side, pal, cg.closed.translate(vec2(cg.off * (if full { slide } else { 1.0 }) - cg.off, 0.0)));
+            return;
         }
         let Some(l) = &self.layout else { return };
         if l.section != self.loc.section {
@@ -512,12 +628,12 @@ impl Reader {
             ui.ctx().request_repaint();
             return;
         }
-        let painter = ui.painter_at(rect);
+        let mut painter = ui.painter_at(rect);
+        if !full && c > 0.0 {
+            painter.multiply_opacity(1.0 - c);
+        }
         let frac = self.fraction();
         self.paint_book(&painter, &g, pal, frac);
-        // opening: the cover swings away toward the spine
-        let now = std::time::Instant::now();
-        let open_t = if self.motion == 0 { self.opened_at.map(|t| (now - t).as_secs_f32() / 0.95).unwrap_or(0.0) } else { 1.0 };
         let prev_ok = |t: &super::Turn| self.prev_layout.as_ref().is_some_and(|p| p.section == t.section);
         let turn = self.turn.filter(|t| paginated && ((t.section == l.section && t.from != self.page) || (t.section != l.section && prev_ok(t))));
         let cross = turn.is_some_and(|t| t.section != l.section);
@@ -525,13 +641,11 @@ impl Reader {
         let turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
         // the 3D leaf is built for left-to-right books; rtl books use the sweep
         let flip3d = self.motion == 0 && turn_t < 1.0 && !rtl;
-        if open_t < 1.0 || turn_t < 1.0 {
+        if turn_t < 1.0 {
             ui.ctx().request_repaint();
         }
         let mut text_painter = painter.clone();
-        if open_t < 1.0 {
-            text_painter.multiply_opacity(super::ease((open_t - 0.3) / 0.6));
-        } else if turn_t < 1.0 && !flip3d {
+        if turn_t < 1.0 && !flip3d {
             text_painter.multiply_opacity(0.35 + 0.65 * super::ease(turn_t));
         }
         let tex = &self.tex;
@@ -655,43 +769,155 @@ impl Reader {
             self.turn = None;
         }
 
-        // the cover swinging open: a hinged board rotating 180° about the spine
-        if open_t < 1.0 {
-            let k = open_t.clamp(0.0, 1.0);
-            let e = k * k * (3.0 - 2.0 * k); // smoothstep: slow start, slow landing
-            let theta = e * std::f32::consts::PI;
-            let target = g.sheet(g.cols - 1);
-            let hinge = g.spine.unwrap_or(target.left());
-            let (top, bot) = (target.top(), target.bottom());
-            let w = target.width();
-            let fx = hinge + w * theta.cos();
-            let lift = theta.sin() * target.height() * 0.07; // the free edge comes toward you
-            let front = theta < std::f32::consts::FRAC_PI_2;
-            let shade = (theta.sin() * 0.35 + if front { 0.0 } else { 0.1 }).min(0.5);
-            let tint = Color32::from_gray((255.0 * (1.0 - shade)) as u8);
-            let quad = [pos2(hinge, top), pos2(fx, top - lift), pos2(fx, bot + lift), pos2(hinge, bot)];
-            let cover = if front { self.tex.get("__cover").map(|t| t.tex.id()) } else { None };
-            let mut m = match cover {
-                Some(id) => egui::Mesh::with_texture(id),
-                None => egui::Mesh::default(),
-            };
-            let board = if front { ui::INK } else { ui::mix(pal.bg, pal.fg, 0.1) };
-            let uvs = [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)];
-            for (p, uv) in quad.iter().zip(uvs) {
-                m.vertices.push(egui::epaint::Vertex { pos: *p, uv: if cover.is_some() { uv } else { egui::epaint::WHITE_UV }, color: if cover.is_some() { tint } else { board.linear_multiply(1.0 - shade) } });
+        // a cover board on its way open or shut, over the pages
+        if c > 0.0 {
+            let top = ui.painter_at(rect);
+            if full {
+                let e = k * k * (3.0 - 2.0 * k); // smoothstep: slow start, slow landing
+                self.paint_swing(&top, &cg, side, e * std::f32::consts::PI, pal);
+            } else {
+                let mut p = top;
+                p.multiply_opacity(c);
+                self.paint_closed(&p, cg.closed, side, pal, cg.d);
             }
-            m.add_triangle(0, 1, 2);
-            m.add_triangle(0, 2, 3);
-            // shadow the board casts on the page it is leaving
-            if front {
-                let sw = (fx - hinge).abs() * 0.25 + 10.0;
-                painter.rect_filled(Rect::from_min_max(pos2(fx.min(hinge), top), pos2((fx + sw).max(hinge), bot)), CornerRadius::ZERO, Color32::from_black_alpha((50.0 * theta.sin()) as u8));
+        }
+    }
+
+    /// Where a cover board sits: closed (centred, alone) and open (hinged at
+    /// the spine, or at the sheet's edge for single pages).
+    fn cover_geo(&self, g: &Geo, side: Cover) -> CoverGeo {
+        let all = g.sheets.iter().fold(g.sheets[0], |a, r| a.union(*r));
+        let (top, bot) = (all.top(), all.bottom());
+        let bw = g.sheet(0).width().min((bot - top) * 0.8);
+        let cx = all.center().x;
+        let d = if self.book.meta.rtl { -1.0 } else { 1.0 };
+        // front: the board lies on the forward side of its hinge; back: behind it
+        let hinge = match (g.spine, side) {
+            (Some(x), _) => x,
+            (None, Cover::Back) => cx + d * bw / 2.0,
+            (None, _) => cx - d * bw / 2.0,
+        };
+        let open_c = if side == Cover::Back { hinge - d * bw / 2.0 } else { hinge + d * bw / 2.0 };
+        CoverGeo { closed: Rect::from_min_max(pos2(cx - bw / 2.0, top), pos2(cx + bw / 2.0, bot)), pages: all, hinge, bw, top, bot, d, off: cx - open_c }
+    }
+
+    /// The closed book on the desk: click or scroll to turn the cover.
+    fn closed_view(&mut self, ui: &mut Ui, rect: Rect, cg: &CoverGeo, side: Cover, pal: &Palette, board: Rect) {
+        let resp = ui.interact(rect, ui.id().with("closed"), Sense::click());
+        if self.cover_anim.is_none() {
+            let wheel = if resp.hovered() { ui.input(|i| i.raw_scroll_delta.y + i.raw_scroll_delta.x) } else { 0.0 };
+            let ready = self.last_turn.elapsed() > Duration::from_millis(300);
+            let on_board = resp.interact_pointer_pos().is_some_and(|p| board.expand(8.0).contains(p));
+            if (resp.clicked() && on_board) || (ready && wheel < -20.0 && side == Cover::Front) || (ready && wheel > 20.0 && side == Cover::Back) {
+                if side == Cover::Front {
+                    self.next_page();
+                } else {
+                    self.prev_page();
+                }
             }
-            painter.add(m);
-            if cover.is_none() && front && (fx - hinge) > 60.0 {
-                let r = Rect::from_min_max(pos2(hinge, top), pos2(fx, bot));
-                painter.with_clip_rect(r).text(r.left_top() + vec2(24.0, 40.0), egui::Align2::LEFT_TOP, &self.book.meta.title, ui::ui_b(28.0), ui::PAPER);
+            if resp.hovered() && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| board.contains(p)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
+        }
+        self.paint_closed(&ui.painter_at(rect), board, side, pal, cg.d);
+    }
+
+    /// A closed hardcover seen from above: board, thickness, hinge groove.
+    fn paint_closed(&self, painter: &egui::Painter, r: Rect, side: Cover, pal: &Palette, d: f32) {
+        // spine on the left of an LTR front cover, on the right of its back cover
+        let spine_left = (side != Cover::Back) == (d > 0.0);
+        let inward = if spine_left { 1.0 } else { -1.0 };
+        for (o, a) in [(3.0, 26u8), (8.0, 13), (14.0, 6)] {
+            painter.rect_filled(r.translate(vec2(o * 0.3 * inward, o)).expand(o * 0.5), CornerRadius::same(6), Color32::from_black_alpha(if pal.dark { a * 3 } else { a }));
+        }
+        // thickness: the far board and the page block peeking out at the fore edge and foot
+        let ink = ui::INK;
+        painter.rect_filled(r.translate(vec2(5.0 * inward, 6.0)), CornerRadius::same(4), ui::mix(ink, Color32::BLACK, 0.35));
+        let block = Rect::from_min_max(r.min + vec2(if spine_left { 6.0 } else { 3.0 }, 4.0), r.max + vec2(if spine_left { 3.0 } else { -6.0 }, 3.0));
+        painter.rect_filled(block, CornerRadius::same(1), ui::mix(ui::PAPER, Color32::BLACK, 0.12));
+        for i in 0..3 {
+            let y = block.bottom() - 0.8 - i as f32;
+            painter.hline(block.x_range(), y, Stroke::new(0.6, ui::mix(ui::PAPER, Color32::BLACK, 0.25 + 0.1 * i as f32)));
+        }
+        // the board itself
+        let cover = if side == Cover::Front { self.tex.get("__cover").map(|t| t.tex.id()) } else { None };
+        match (side, cover) {
+            (Cover::Front, Some(id)) => {
+                painter.rect_filled(r, CornerRadius::same(3), ink);
+                painter.image(id, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            (Cover::Front, None) => ui::paint_placeholder_cover(painter, r, &crate::book::script::visual(&self.book.meta.title), &self.book.meta.author),
+            _ => {
+                painter.rect_filled(r, CornerRadius::same(3), self.board_color());
+                let c = r.center();
+                painter.text(pos2(c.x, r.bottom() - r.height() * 0.16), egui::Align2::CENTER_CENTER, ui::fit_painter(painter, &crate::book::script::visual(&self.book.meta.title), ui::ui_b(15.0), r.width() - 60.0), ui::ui_b(15.0), self.board_ink());
+                if !self.book.meta.author.is_empty() {
+                    painter.text(pos2(c.x, r.bottom() - r.height() * 0.16 + 22.0), egui::Align2::CENTER_CENTER, &self.book.meta.author, ui::ui_m(12.0), ui::mix(self.board_ink(), self.board_color(), 0.4));
+                }
+            }
+        }
+        // rounded spine: shading into the hinge, then the pressed groove
+        let sx = if spine_left { r.left() } else { r.right() };
+        let mut m = egui::Mesh::default();
+        let (x0, x1) = (sx, sx + inward * 26.0);
+        let (c0, c1) = (Color32::from_black_alpha(90), Color32::TRANSPARENT);
+        m.colored_vertex(pos2(x0, r.top()), c0);
+        m.colored_vertex(pos2(x1, r.top()), c1);
+        m.colored_vertex(pos2(x1, r.bottom()), c1);
+        m.colored_vertex(pos2(x0, r.bottom()), c0);
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(0, 2, 3);
+        painter.add(m);
+        let gx = sx + inward * 15.0;
+        painter.vline(gx, r.y_range(), Stroke::new(1.5, Color32::from_black_alpha(70)));
+        painter.vline(gx + inward * 1.5, r.y_range(), Stroke::new(1.0, Color32::from_white_alpha(28)));
+        painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_black_alpha(50)), egui::StrokeKind::Inside);
+    }
+
+    /// Colour of the binding: the generated cover's, or ink behind a cover image.
+    fn board_color(&self) -> Color32 {
+        if self.book.meta.cover.is_some() { ui::INK } else { ui::placeholder_colors(&crate::book::script::visual(&self.book.meta.title)).0 }
+    }
+
+    fn board_ink(&self) -> Color32 {
+        if self.book.meta.cover.is_some() { ui::PAPER } else { ui::placeholder_colors(&crate::book::script::visual(&self.book.meta.title)).1 }
+    }
+
+    /// A cover board rotating `theta` (0..π) about its hinge, from its open
+    /// side (front: the forward side) across the spine.
+    fn paint_swing(&self, painter: &egui::Painter, cg: &CoverGeo, side: Cover, theta: f32, pal: &Palette) {
+        let (hinge, top, bot, d) = (cg.hinge, cg.top, cg.bot, cg.d);
+        // front boards start lying forward of the hinge; back boards end lying behind it
+        let fx = hinge + d * cg.bw * theta.cos();
+        let lift = theta.sin() * (bot - top) * 0.07; // the free edge comes toward you
+        let half = theta < std::f32::consts::FRAC_PI_2;
+        let outside = if side == Cover::Front { half } else { !half };
+        let shade = (theta.sin() * 0.35).min(0.5);
+        let tint = Color32::from_gray((255.0 * (1.0 - shade)) as u8);
+        let cover = if outside && side == Cover::Front { self.tex.get("__cover").map(|t| t.tex.id()) } else { None };
+        // shadow the board casts on the pages beneath it
+        let sw = (fx - hinge).abs() * 0.25 + 10.0;
+        let (a, b) = if fx > hinge { (hinge, fx + sw) } else { (fx - sw, hinge) };
+        painter.with_clip_rect(cg.pages).rect_filled(Rect::from_min_max(pos2(a, top), pos2(b, bot)), CornerRadius::ZERO, Color32::from_black_alpha((30.0 * theta.sin()) as u8));
+        let quad = [pos2(hinge, top), pos2(fx, top - lift), pos2(fx, bot + lift), pos2(hinge, bot)];
+        let mut m = match cover {
+            Some(id) => egui::Mesh::with_texture(id),
+            None => egui::Mesh::default(),
+        };
+        let board = if outside { self.board_color() } else { ui::mix(pal.bg, pal.fg, 0.1) };
+        // texture u runs from the spine edge of the cover to its fore edge
+        let uvs = if d > 0.0 { [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)] } else { [pos2(1.0, 0.0), pos2(0.0, 0.0), pos2(0.0, 1.0), pos2(1.0, 1.0)] };
+        for (p, uv) in quad.iter().zip(uvs) {
+            m.vertices.push(egui::epaint::Vertex { pos: *p, uv: if cover.is_some() { uv } else { egui::epaint::WHITE_UV }, color: if cover.is_some() { tint } else { ui::mix(board, Color32::BLACK, shade) } });
+        }
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(0, 2, 3);
+        painter.add(m);
+        // board edge: a thin dark line on the free edge gives it thickness
+        painter.line_segment([quad[1], quad[2]], Stroke::new(2.0, Color32::from_black_alpha((60.0 + 60.0 * theta.sin()) as u8)));
+        if cover.is_none() && outside && side == Cover::Front && (fx - hinge).abs() > 60.0 {
+            let r = Rect::from_two_pos(pos2(hinge, top), pos2(fx, bot));
+            painter.with_clip_rect(r).text(r.left_top() + vec2(24.0, 40.0), egui::Align2::LEFT_TOP, crate::book::script::visual(&self.book.meta.title), ui::ui_b(28.0), self.board_ink());
         }
     }
 

@@ -110,6 +110,7 @@ fn main() -> eframe::Result<()> {
             .with_title(APP_NAME)
             .with_app_id("seshat")
             .with_inner_size([1200.0, 800.0])
+            .with_maximized(true)
             .with_min_inner_size([560.0, 420.0])
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(logo::icon_data(128)))

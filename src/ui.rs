@@ -414,6 +414,23 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, active: bool) -> Response
 
 /// `text` shortened with an ellipsis so it fits `max_w` points in `font`
 /// (translated labels can run longer than the English they replace).
+/// `fit` for code that only has a painter.
+pub fn fit_painter(painter: &egui::Painter, text: &str, font: FontId, max_w: f32) -> String {
+    let w = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
+    if w(text) <= max_w {
+        return text.to_string();
+    }
+    let mut cut: Vec<char> = text.chars().collect();
+    while !cut.is_empty() {
+        cut.pop();
+        let t: String = cut.iter().collect::<String>() + "…";
+        if w(&t) <= max_w {
+            return t;
+        }
+    }
+    String::new()
+}
+
 pub fn fit(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
     let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
     if width(text) <= max_w {
@@ -508,11 +525,16 @@ const COVER_TINTS: &[([u8; 3], [u8; 3])] = &[
 ];
 
 /// Playful geometric cover for books without one: a tint, one shape, the title.
-pub fn paint_placeholder_cover(painter: &egui::Painter, rect: Rect, title: &str, author: &str) {
+/// Board and ink colours of a title's generated cover.
+pub fn placeholder_colors(title: &str) -> (Color32, Color32) {
     let h = title.bytes().fold(5381u32, |a, b| a.wrapping_mul(33) ^ b as u32);
     let (bgc, fgc) = COVER_TINTS[(h % COVER_TINTS.len() as u32) as usize];
-    let bg = Color32::from_rgb(bgc[0], bgc[1], bgc[2]);
-    let fg = Color32::from_rgb(fgc[0], fgc[1], fgc[2]);
+    (Color32::from_rgb(bgc[0], bgc[1], bgc[2]), Color32::from_rgb(fgc[0], fgc[1], fgc[2]))
+}
+
+pub fn paint_placeholder_cover(painter: &egui::Painter, rect: Rect, title: &str, author: &str) {
+    let h = title.bytes().fold(5381u32, |a, b| a.wrapping_mul(33) ^ b as u32);
+    let (bg, fg) = placeholder_colors(title);
     painter.rect_filled(rect, CornerRadius::same(3), bg);
     let w = rect.width();
     let shape_c = fg.linear_multiply(0.16);
@@ -678,4 +700,101 @@ pub fn segmented(ui: &mut Ui, id: &str, labels: &[&str], selected: usize) -> Opt
         }
     }
     clicked
+}
+
+// ── Settings form: one label column, one control column, even rhythm ──────
+
+/// Width of the label column in settings forms.
+pub const FORM_LABEL_W: f32 = 168.0;
+/// Standard width of a text field, combo box or slider in settings forms.
+pub const FORM_CTRL_W: f32 = 300.0;
+const FORM_ROW_H: f32 = 32.0;
+const FORM_ROW_GAP: f32 = 8.0;
+
+/// Section header: title, optional one-line description, then a rule.
+pub fn form_section(ui: &mut Ui, title: &str, about: Option<&str>, first: bool) {
+    if !first {
+        ui.add_space(28.0);
+    }
+    let c = ui.visuals().text_color();
+    ui.label(RichText::new(title).font(ui_b(15.0)).color(c));
+    if let Some(a) = about {
+        ui.add_space(2.0);
+        ui.add(egui::Label::new(RichText::new(a).size(12.5).color(ui.visuals().weak_text_color())).wrap());
+    }
+    ui.add_space(8.0);
+    rule(ui);
+    ui.add_space(12.0);
+}
+
+/// One form row: muted label in the fixed label column, controls after it,
+/// everything vertically centred on a common row height.
+pub fn form_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    // narrow places (a reader's drawer): label above its controls
+    if form_narrow(ui) {
+        if !label.is_empty() {
+            ui.label(RichText::new(label).font(ui_m(12.5)).color(ui.visuals().weak_text_color()));
+            ui.add_space(4.0);
+        }
+        let r = ui
+            .allocate_ui_with_layout(vec2(ui.available_width(), FORM_ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_height(FORM_ROW_H);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(80.0);
+                add(ui)
+            })
+            .inner;
+        ui.add_space(FORM_ROW_GAP + 4.0);
+        return r;
+    }
+    let r = ui
+        .allocate_ui_with_layout(vec2(ui.available_width(), FORM_ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_height(FORM_ROW_H);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().slider_width = FORM_CTRL_W - 60.0;
+            let (rect, _) = ui.allocate_exact_size(vec2(FORM_LABEL_W - 10.0, FORM_ROW_H), Sense::hover());
+            if !label.is_empty() {
+                let text = fit(ui, label, ui_m(13.0), rect.width() - 8.0);
+                ui.painter().text(pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, text, ui_m(13.0), ui.visuals().weak_text_color());
+            }
+            add(ui)
+        })
+        .inner;
+    ui.add_space(FORM_ROW_GAP);
+    r
+}
+
+/// Explanatory text aligned with the control column.
+/// Too narrow for a label column beside the controls.
+pub fn form_narrow(ui: &Ui) -> bool {
+    ui.available_width() < FORM_LABEL_W + FORM_CTRL_W
+}
+
+/// Width for a combo box or field: the standard, or what fits.
+pub fn form_ctrl_w(ui: &Ui) -> f32 {
+    if form_narrow(ui) { (ui.available_width() - 130.0).max(120.0) } else { FORM_CTRL_W - 60.0 }
+}
+
+pub fn form_note(ui: &mut Ui, text: &str) {
+    let indent = if form_narrow(ui) { 0.0 } else { FORM_LABEL_W };
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.add(egui::Label::new(RichText::new(text).size(12.5).color(ui.visuals().weak_text_color())).wrap());
+    });
+    ui.add_space(FORM_ROW_GAP + 2.0);
+}
+
+/// Settings navigation item (same look as the library sidebar rows).
+pub fn form_nav(ui: &mut Ui, label: &str, active: bool, fg: Color32, hover: Color32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    if active {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), ACCENT.linear_multiply(0.10));
+    } else if t > 0.01 {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), hover.linear_multiply(t));
+    }
+    let col = if active { ACCENT } else { fg };
+    let text = fit(ui, label, ui_m(14.0), rect.width() - 24.0);
+    ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), egui::Align2::LEFT_CENTER, text, ui_m(14.0), col);
+    resp.clicked()
 }

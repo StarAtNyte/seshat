@@ -72,6 +72,7 @@ impl Reader {
             .with_title(format!("{} — {}", self.book.meta.title, crate::APP_NAME))
             .with_app_id("seshat")
             .with_inner_size([1280.0, 860.0])
+            .with_maximized(true)
             .with_min_inner_size([560.0, 420.0])
             .with_decorations(false)
             .with_drag_and_drop(true)
@@ -107,7 +108,41 @@ impl Reader {
             let rect = ui.max_rect();
             let drag = ui.interact(rect, ui.id().with("drag"), Sense::click_and_drag());
             ui::titlebar_behaviour(ctx, &drag);
-            ui.horizontal_centered(|ui| {
+            // three zones: identity on the left, reading tools centred on the
+            // window, everything else on the right; widths from the last frame
+            let bar = rect;
+            let (mid_id, right_id) = (ui.id().with("mid-w"), ui.id().with("right-w"));
+            let mid_w: f32 = ctx.data(|d| d.get_temp(mid_id)).unwrap_or(420.0);
+            let right_w: f32 = ctx.data(|d| d.get_temp(right_id)).unwrap_or(420.0);
+            let gap = 16.0;
+            let mid_left = (bar.center().x - mid_w / 2.0).min(bar.right() - right_w - gap - mid_w).max(bar.left() + 180.0);
+            let row = |r: Rect, l: egui::Layout| egui::UiBuilder::new().max_rect(r).layout(l);
+            let lr = egui::Layout::left_to_right(egui::Align::Center);
+            // right zone
+            let used = ui.scope_builder(row(bar, egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if ui::window_controls(ui, pal.fg) {
+                    actions.push(Action::Close);
+                }
+                ui.add_space(6.0);
+                let pct = (self.fraction() * 100.0).round();
+                ui.label(RichText::new(format!("{pct}%")).font(ui_b(14.0)).color(ACCENT));
+                sep(ui, pal);
+                if ui::icon_toggle(ui, Icon::Fullscreen, tr("Fullscreen (F)"), self.fullscreen).clicked() {
+                    self.toggle_fullscreen(ctx);
+                }
+                self.tools_right(ui, s, pal, env);
+                ui.min_rect().width()
+            }).inner;
+            // middle zone
+            let mid_rect = Rect::from_min_max(pos2(mid_left, bar.top()), pos2((bar.right() - used - gap).max(mid_left + 40.0), bar.bottom()));
+            let mid_used = ui.scope_builder(row(mid_rect, lr), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                self.tools_left(ui, ctx, s, pal, env);
+                ui.min_rect().width()
+            }).inner;
+            // left zone: back, panel, cover, title (takes what is left)
+            ui.scope_builder(row(Rect::from_min_max(bar.min, pos2(mid_left - gap, bar.bottom())), lr), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 if ui::icon_button(ui, Icon::Back, tr("Library (Esc)")).clicked() {
                     actions.push(Action::Close);
@@ -116,7 +151,15 @@ impl Reader {
                     self.side = if self.side.is_some() { None } else { Some(Side::Toc) };
                     self.toc_scroll = true;
                 }
-                ui.add_space(6.0);
+                // search opens the sidebar's Find tab, so it lives beside the sidebar toggle
+                if ui::icon_toggle(ui, Icon::Search, tr("Find in book (Ctrl+K)"), self.side == Some(Side::Search)).clicked() {
+                    self.side = Some(Side::Search);
+                    self.focus_search = true;
+                }
+                if !self.history.is_empty() && ui::icon_button(ui, Icon::Undo, tr("Back to where you were (Backspace)")).clicked() {
+                    self.back();
+                }
+                ui.add_space(8.0);
                 let (cr, _) = ui.allocate_exact_size(vec2(22.0, 32.0), Sense::hover());
                 match self.cover_tex() {
                     Some(id) => {
@@ -124,35 +167,29 @@ impl Reader {
                     }
                     None => ui::paint_placeholder_cover(ui.painter(), cr, &crate::book::script::visual(&self.book.meta.title), ""),
                 }
-                ui.add_space(6.0);
-                let title_w = (ui.available_width() - 840.0 * crate::i18n::width_factor()).clamp(90.0, 260.0);
+                ui.add_space(8.0);
+                let title_w = ui.available_width().clamp(40.0, 340.0);
                 ui.allocate_ui(vec2(title_w, BAR_H), |ui| {
                     ui.set_width(title_w);
+                    let chapter = self.chapter_title(self.cur());
+                    let sub = if chapter.is_empty() || chapter == self.book.meta.title { self.book.meta.author.clone() } else { chapter };
                     ui.vertical(|ui| {
-                        ui.add_space(9.0);
+                        // one line: centred on the bar; two lines: centred as a pair
+                        ui.add_space(if sub.trim().is_empty() { (BAR_H - 18.0) / 2.0 } else { 9.0 });
                         ui.add(egui::Label::new(RichText::new(crate::book::script::visual(&self.book.meta.title)).font(ui_b(14.5))).truncate());
-                        let chapter = self.chapter_title(self.cur());
-                        let sub = if chapter.is_empty() || chapter == self.book.meta.title { self.book.meta.author.clone() } else { chapter };
-                        ui.add(egui::Label::new(RichText::new(crate::book::script::visual(&sub)).font(ui_m(11.5)).color(pal.muted)).truncate());
+                        if !sub.trim().is_empty() {
+                            ui.add(egui::Label::new(RichText::new(crate::book::script::visual(&sub)).font(ui_m(11.5)).color(pal.muted)).truncate());
+                        }
                     });
                 });
-                sep(ui, pal);
-                self.tools_left(ui, ctx, s, pal, env);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if ui::window_controls(ui, pal.fg) {
-                        actions.push(Action::Close);
-                    }
-                    ui.add_space(6.0);
-                    let pct = (self.fraction() * 100.0).round();
-                    ui.label(RichText::new(format!("{pct}%")).font(ui_b(14.0)).color(ACCENT));
-                    sep(ui, pal);
-                    if ui::icon_toggle(ui, Icon::Fullscreen, tr("Fullscreen (F)"), self.fullscreen).clicked() {
-                        self.toggle_fullscreen(ctx);
-                    }
-                    self.tools_right(ui, s, pal, env);
-                });
             });
+            if (mid_used - mid_w).abs() > 0.5 || (used - right_w).abs() > 0.5 {
+                ctx.data_mut(|d| {
+                    d.insert_temp(mid_id, mid_used);
+                    d.insert_temp(right_id, used);
+                });
+                ctx.request_repaint();
+            }
             let f = ctx.animate_value_with_time(ui.id().with("prog"), self.fraction(), 0.35);
             ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, pal.border));
             ui.painter().line_segment([pos2(rect.left(), rect.bottom() - 1.0), pos2(rect.left() + rect.width() * f, rect.bottom() - 1.0)], Stroke::new(3.0, ACCENT));
@@ -164,14 +201,6 @@ impl Reader {
         let flow = self.book.flow().is_some();
         let w = ctx.screen_rect().width();
         let (compact, tight) = (w < 1500.0 * crate::i18n::width_factor(), w < 1180.0 * crate::i18n::width_factor());
-        if ui::icon_toggle(ui, Icon::Search, tr("Find in book (Ctrl+K)"), self.side == Some(Side::Search)).clicked() {
-            self.side = Some(Side::Search);
-            self.focus_search = true;
-        }
-        if !self.history.is_empty() && ui::icon_button(ui, Icon::Undo, tr("Back to where you were (Backspace)")).clicked() {
-            self.back();
-        }
-        sep(ui, pal);
         if flow {
             let sel = match (s.layout, s.columns) {
                 (Layout::Scrolled, _) => 2,

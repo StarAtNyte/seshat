@@ -1,6 +1,6 @@
 [package]
 name = "seshat-voice"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Seshat's optional natural-voice helper: Kokoro text-to-speech, run offline on the CPU"
 license = "MIT"

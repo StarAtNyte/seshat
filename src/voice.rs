@@ -213,6 +213,15 @@ pub struct Progress {
 }
 
 /// A running (or finished) install, polled by the settings page.
+/// Install progress and the last message, shared by every settings view
+/// (the library's Settings window and each reader's drawer).
+pub struct UiState {
+    pub install: Option<Install>,
+    pub msg: String,
+}
+
+pub static UI_STATE: Mutex<UiState> = Mutex::new(UiState { install: None, msg: String::new() });
+
 pub struct Install {
     state: Arc<Mutex<Progress>>,
 }

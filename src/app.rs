@@ -151,8 +151,6 @@ pub struct App {
     debug_keys_sent: usize,
     debug_shot_requested: bool,
     /// Natural-voice download in progress (or just finished / failed).
-    voice_install: Option<crate::voice::Install>,
-    voice_msg: String,
     userlib: UserLib,
     dups: Vec<library::DupGroup>,
     last_watch: Instant,
@@ -167,115 +165,122 @@ pub struct App {
 impl App {
     /// Read-aloud settings: system voice or the downloadable natural voices
     /// (Kokoro for English, Piper voices for other languages).
-    fn voice_settings(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+    /// Read-aloud settings: engine, speed, natural voices (download, preview, remove).
+    pub(crate) fn voice_settings(ui: &mut egui::Ui, settings: &mut crate::store::AppSettings, pal: &Palette) {
+        let mut guard = crate::voice::UI_STATE.lock().unwrap();
+        let st = &mut *guard;
         use crate::voice::{self, Stage};
+        use ui::{form_note, form_row, form_section, FORM_CTRL_W};
+        let _ = pal;
         let kokoro = voice::installed();
         let pipers = voice::installed_piper();
         let any_natural = kokoro || (!pipers.is_empty() && voice::helper().is_some());
         let system = crate::tts::available();
-        ui.horizontal(|ui| {
-            ui.label(tag(tr("Voice")).color(pal.muted));
-            ui.radio_value(&mut self.settings.tts_natural, false, tr("System"));
+        form_row(ui, tr("Voice"), |ui| {
+            if text_button(ui, tr("System"), !settings.tts_natural || !any_natural).clicked() {
+                settings.tts_natural = false;
+            }
             ui.add_enabled_ui(any_natural, |ui| {
-                ui.radio_value(&mut self.settings.tts_natural, true, tr("Natural"))
+                if text_button(ui, tr("Natural"), settings.tts_natural && any_natural)
                     .on_hover_text(tr("Kokoro for English books, and your downloaded voices for other languages. Books in other languages use the system voice."))
-                    .on_disabled_hover_text(tr("Download a natural voice below first."));
+                    .on_disabled_hover_text(tr("Download a natural voice below first."))
+                    .clicked()
+                {
+                    settings.tts_natural = true;
+                }
             });
         });
-        if !self.settings.tts_natural || !any_natural {
-            ui.label(tag(match system {
+        if !settings.tts_natural || !any_natural {
+            form_note(ui, &match system {
                 Some(e) => trf!("System engine: {name}", name = e),
                 None if cfg!(target_os = "linux") => tr("No system speech engine found. Install speech-dispatcher or espeak-ng, or use the natural voice.").into(),
                 None => tr("No system speech engine found.").into(),
-            }).color(pal.muted));
+            });
         }
-        ui.horizontal(|ui| {
-            ui.label(tag(tr("Speed")).color(pal.muted));
-            ui.add(egui::Slider::new(&mut self.settings.tts_rate, 0.5..=2.5).step_by(0.1).suffix("×"));
-        });
+        form_row(ui, tr("Speed"), |ui| ui.add(egui::Slider::new(&mut settings.tts_rate, 0.5..=2.5).step_by(0.1).fixed_decimals(1).suffix("×")));
 
-        let progress = self.voice_install.as_ref().map(|i| i.progress());
+        form_section(ui, tr("Natural voices"), Some(tr("Lifelike voices that run offline on this computer. Each is an optional download.")), false);
+        let progress = st.install.as_ref().map(|i| i.progress());
         match progress {
             Some(p) if matches!(p.stage, Stage::Helper | Stage::Model) => {
                 let what = if p.stage == Stage::Helper { tr("Downloading the voice engine") } else { tr("Downloading the voice") };
                 let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-                ui.label(RichText::new(format!("{what}… {:.0} of {:.0} MB", p.done as f64 / 1e6, p.total as f64 / 1e6)).size(12.5));
-                ui.add(egui::ProgressBar::new(frac).desired_width(320.0));
+                form_row(ui, what, |ui| ui.add(egui::ProgressBar::new(frac).desired_width(ui::form_ctrl_w(ui) + 60.0)));
+                form_note(ui, &format!("{:.0} of {:.0} MB", p.done as f64 / 1e6, p.total as f64 / 1e6));
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
                 return;
             }
             Some(p) => {
-                self.voice_install = None;
+                st.install = None;
                 match p.stage {
                     Stage::Done => {
-                        self.settings.tts_natural = true;
-                        self.voice_msg = tr("Voice installed.").into();
+                        settings.tts_natural = true;
+                        st.msg = tr("Voice installed.").into();
                     }
-                    Stage::Failed(e) => self.voice_msg = e,
+                    Stage::Failed(e) => st.msg = e,
                     _ => {}
                 }
             }
             None => {}
         }
-        let start = |app: &mut Self, ui: &egui::Ui, spec: String| {
-            app.voice_msg.clear();
-            app.voice_install = Some(voice::Install::start(ui.ctx().clone(), spec));
+        let start = |st: &mut voice::UiState, ui: &egui::Ui, spec: String| {
+            st.msg.clear();
+            st.install = Some(voice::Install::start(ui.ctx().clone(), spec));
         };
 
         // English: Kokoro
         if kokoro {
-            ui.horizontal(|ui| {
-                ui.label(tag(tr("English")).color(pal.muted));
-                let mut v = self.settings.tts_voice;
-                egui::ComboBox::from_id_salt("kokoro-voice").selected_text(voice::voice_label(v)).width(190.0).show_ui(ui, |ui| {
+            form_row(ui, tr("English"), |ui| {
+                let mut v = settings.tts_voice;
+                egui::ComboBox::from_id_salt("kokoro-voice").selected_text(voice::voice_label(v)).width(ui::form_ctrl_w(ui)).show_ui(ui, |ui| {
                     for (id, _, _) in voice::VOICES {
                         ui.selectable_value(&mut v, *id, voice::voice_label(*id));
                     }
                 });
-                if v != self.settings.tts_voice {
-                    self.settings.tts_voice = v;
-                    let _ = crate::tts::preview(v, None, self.settings.tts_rate);
+                if v != settings.tts_voice {
+                    settings.tts_voice = v;
+                    let _ = crate::tts::preview(v, None, settings.tts_rate);
                 }
                 if text_button(ui, tr("Preview"), false).clicked() {
-                    if let Err(e) = crate::tts::preview(self.settings.tts_voice, None, self.settings.tts_rate) {
-                        self.voice_msg = e;
+                    if let Err(e) = crate::tts::preview(settings.tts_voice, None, settings.tts_rate) {
+                        st.msg = e;
                     }
                 }
                 if text_button(ui, tr("Remove"), false).on_hover_text(trf!("Deletes the English natural voice (about {mb} MB) from this computer.", mb = voice::DISK_MB)).clicked() {
                     voice::remove();
-                    self.voice_msg = tr("English natural voice removed.").into();
+                    st.msg = tr("English natural voice removed.").into();
                 }
             });
         } else if voice::needs_update() {
-            ui.label(RichText::new(tr("The natural voices need a small update for this version of Seshat (about 30 MB).")).size(12.5).color(pal.muted));
-            if text_button(ui, tr("Update natural voices"), false).clicked() {
-                let spec = if voice::kokoro_on_disk() { "kokoro".to_string() } else { format!("piper:{}", pipers[0].2) };
-                start(self, ui, spec);
-            }
+            form_row(ui, tr("Update"), |ui| {
+                if text_button(ui, tr("Update natural voices"), false).clicked() {
+                    let spec = if voice::kokoro_on_disk() { "kokoro".to_string() } else { format!("piper:{}", pipers[0].2) };
+                    start(st, ui, spec);
+                }
+            });
+            form_note(ui, tr("The natural voices need a small update for this version of Seshat (about 30 MB)."));
             return;
         } else {
-            ui.label(RichText::new(trf!("Natural voice: a lifelike English voice (Kokoro) that runs offline on your computer. It is an optional download of about {mb} MB.",
-                mb = voice::DOWNLOAD_MB
-            )).size(12.5).color(pal.muted));
-            if text_button(ui, &trf!("Download English natural voice ({mb} MB)", mb = voice::DOWNLOAD_MB), false).clicked() {
-                start(self, ui, "kokoro".into());
-            }
+            form_row(ui, tr("English"), |ui| {
+                if text_button(ui, &trf!("Download English natural voice ({mb} MB)", mb = voice::DOWNLOAD_MB), false).clicked() {
+                    start(st, ui, "kokoro".into());
+                }
+            });
+            form_note(ui, tr("Kokoro: a lifelike English voice with 28 speakers."));
         }
 
         // Other languages: Piper, one small voice per language
-        ui.add_space(4.0);
         for (_, name, pack) in &pipers {
-            ui.horizontal(|ui| {
-                ui.label(tag(*name).color(pal.muted));
-                ui.label(RichText::new(*pack).size(12.0).color(pal.muted));
+            form_row(ui, name, |ui| {
+                ui.add_sized([ui::form_ctrl_w(ui), 20.0], egui::Label::new(RichText::new(*pack).font(mono(11.5)).color(pal.muted)).truncate());
                 if text_button(ui, tr("Preview"), false).clicked() {
-                    if let Err(e) = crate::tts::preview(0, Some(pack), self.settings.tts_rate) {
-                        self.voice_msg = e;
+                    if let Err(e) = crate::tts::preview(0, Some(pack), settings.tts_rate) {
+                        st.msg = e;
                     }
                 }
                 if text_button(ui, tr("Remove"), false).clicked() {
                     voice::remove_piper(pack);
-                    self.voice_msg = trf!("{name} voice removed.", name = name);
+                    st.msg = trf!("{name} voice removed.", name = name);
                 }
             });
         }
@@ -283,28 +288,30 @@ impl App {
         let mut pick: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_default();
         let missing: Vec<_> = voice::PIPER_VOICES.iter().filter(|v| !pipers.iter().any(|p| p.2 == v.2)).collect();
         if !missing.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(tag(tr("Other languages")).color(pal.muted));
+            form_row(ui, tr("Other languages"), |ui| {
                 let label = missing.iter().find(|v| v.2 == pick).map(|v| v.1.to_string()).unwrap_or_else(|| tr("Choose a language…").into());
-                egui::ComboBox::from_id_salt("piper-lang").selected_text(label).width(190.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("piper-lang").selected_text(label).width(ui::form_ctrl_w(ui)).show_ui(ui, |ui| {
                     for v in &missing {
                         ui.selectable_value(&mut pick, v.2.to_string(), format!("{} · {} MB", v.1, v.3 / 1_000_000));
                     }
                 });
                 if missing.iter().any(|v| v.2 == pick) && text_button(ui, &trf!("Download ({mb} MB)", mb = voice::piper_size_mb(&pick)), false).clicked() {
-                    start(self, ui, format!("piper:{pick}"));
+                    start(st, ui, format!("piper:{pick}"));
                     pick.clear();
                 }
             });
             ui.data_mut(|d| d.insert_temp(id, pick));
         }
-        if !self.voice_msg.is_empty() {
-            ui.label(RichText::new(&self.voice_msg).size(12.5).color(pal.muted));
+        if !st.msg.is_empty() {
+            form_note(ui, &st.msg.clone());
         }
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        // one pass per frame: page turns, clicks and key actions are not
+        // idempotent, and a discarded pass would replay the same input
+        ctx.options_mut(|o| o.max_passes = std::num::NonZeroUsize::MIN);
         let (tx, rx) = std::sync::mpsc::channel();
         let settings = AppSettings::load();
         crate::i18n::apply(&settings.language);
@@ -341,8 +348,6 @@ impl App {
             covers: TexLoader::new(&ctx, 2),
             readers: Vec::new(),
             opening: None,
-            voice_install: None,
-            voice_msg: String::new(),
             userlib: UserLib::load(),
             dups: Vec::new(),
             last_watch: Instant::now(),
@@ -1005,6 +1010,12 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let Ok(path) = std::env::var("ZR_SHOT") else { return };
+        if self.debug_start.is_none() {
+            if let Some(p) = std::env::var("ZR_SETTINGS").ok().and_then(|p| p.parse::<usize>().ok()) {
+                self.settings_open = true;
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("settings-page"), p));
+            }
+        }
         let started = *self.debug_start.get_or_insert_with(Instant::now);
         let t = started.elapsed();
         ctx.request_repaint_after(Duration::from_millis(50));
@@ -2496,230 +2507,64 @@ impl App {
     }
 
     fn settings_window(&mut self, ctx: &egui::Context, pal: &Palette) {
+        use ui::{form_row, form_section, FORM_CTRL_W};
         if !self.settings_open {
             return;
         }
         let mut open = true;
         let mut rescan = false;
-        egui::Window::new(tr("Settings")).id(egui::Id::new("win-settings")).open(&mut open).collapsible(false).resizable(false).default_width(540.0).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() - 160.0).show(ui, |ui| {
-                ui.set_width(520.0);
-                ui::section_label(ui, tr("Appearance"));
-                ui.horizontal(|ui| {
-                    for (t, l) in [(UiTheme::System, tr("System")), (UiTheme::Light, tr("Paper")), (UiTheme::Dark, tr("Ink"))] {
-                        if text_button(ui, l, self.settings.ui_theme == t).clicked() {
-                            self.settings.ui_theme = t;
-                        }
-                    }
-                    ui.separator();
-                    ui.checkbox(&mut self.settings.right_panel, tr("Progress column"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Cover size")).color(pal.muted));
-                    ui.add(egui::Slider::new(&mut self.settings.cover_size, 110.0..=260.0).show_value(false));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Interface language")).color(pal.muted));
-                    let native = |code: &str| crate::i18n::LANGS.iter().find(|l| l.0 == code).map(|l| l.1).unwrap_or("English");
-                    let auto = trf!("Auto ({name})", name = native(crate::i18n::detect()));
-                    let shown = if self.settings.language.is_empty() { auto.clone() } else { native(&self.settings.language).to_string() };
-                    egui::ComboBox::from_id_salt("ui-lang").selected_text(shown).width(190.0).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.settings.language, String::new(), auto);
-                        for (code, name, _) in crate::i18n::LANGS {
-                            ui.selectable_value(&mut self.settings.language, code.to_string(), *name);
-                        }
-                    });
-                });
-
-                ui::section_label(ui, tr("Library folders"));
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Downloads")).color(pal.muted));
-                    ui.add(egui::Label::new(RichText::new(&self.settings.download_dir).font(mono(11.5))).truncate());
-                    if text_button(ui, tr("Change"), false).clicked() {
-                        if let Some(d) = rfd::FileDialog::new().set_directory(&self.settings.download_dir).pick_folder() {
-                            self.settings.download_dir = d.to_string_lossy().into_owned();
-                            rescan = true;
+        let screen = ctx.screen_rect();
+        let size = vec2((screen.width() - 80.0).clamp(560.0, 880.0), (screen.height() - 120.0).clamp(420.0, 680.0));
+        let page_id = egui::Id::new("settings-page");
+        let mut page: usize = ctx.data_mut(|d| d.get_temp(page_id)).unwrap_or(0);
+        let pages = [tr("General"), tr("Library"), tr("Reading"), tr("Read aloud"), tr("Sync"), tr("About")];
+        egui::Window::new(tr("Settings")).id(egui::Id::new("win-settings")).open(&mut open).collapsible(false).resizable(false).fixed_size(size).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                // navigation rail
+                ui.allocate_ui_with_layout(vec2(170.0, size.y), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_size(vec2(170.0, size.y));
+                    ui.add_space(6.0);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    for (i, l) in pages.iter().enumerate() {
+                        if ui::form_nav(ui, l, page == i, pal.fg, pal.hover) {
+                            page = i;
                         }
                     }
                 });
-                let mut remove = None;
-                for (i, d) in self.settings.library_dirs.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(tag(format!("{:02}", i + 1)).color(ACCENT));
-                        ui.add(egui::Label::new(RichText::new(d).font(mono(11.5))).truncate());
-                        if text_button(ui, tr("Remove"), false).clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    self.settings.library_dirs.remove(i);
-                    rescan = true;
-                }
-                ui.horizontal(|ui| {
-                    if text_button(ui, tr("+ Add folder"), false).clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                            let s = d.to_string_lossy().into_owned();
-                            if !self.settings.library_dirs.contains(&s) {
-                                self.settings.library_dirs.push(s);
+                ui.add_space(12.0);
+                let (sep, _) = ui.allocate_exact_size(vec2(1.0, size.y), Sense::hover());
+                ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, pal.border));
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().id_salt(("settings-scroll", page)).auto_shrink([false, false]).max_height(size.y).show(ui, |ui| {
+                        ui.set_width(ui.available_width() - 16.0);
+                        ui.add_space(4.0);
+                        match page {
+                            0 => self.settings_general(ui, pal),
+                            1 => rescan |= self.settings_library(ui, pal),
+                            2 => self.settings_reading(ui, pal),
+                            3 => {
+                                form_section(ui, tr("Read aloud"), Some(tr("Choose the voice used when a book is read to you.")), true);
+                                Self::voice_settings(ui, &mut self.settings, pal);
                             }
-                            rescan = true;
-                        }
-                    }
-                    if !self.settings.hidden_paths.is_empty() && text_button(ui, &trf!("Restore {n} removed", n = self.settings.hidden_paths.len()), false).clicked() {
-                        self.settings.hidden_paths.clear();
-                        rescan = true;
-                    }
-                });
-
-                ui.checkbox(&mut self.settings.watch_folders, tr("Watch library folders for new books (checks every 30 s)"));
-                if !self.userlib.collections.is_empty() {
-                    ui::section_label(ui, tr("Collections"));
-                    let mut del = None;
-                    for c in &self.userlib.collections {
-                        ui.horizontal(|ui| {
-                            ui.label(c);
-                            if text_button(ui, tr("Delete"), false).clicked() {
-                                del = Some(c.clone());
-                            }
-                        });
-                    }
-                    if let Some(c) = del {
-                        self.userlib.remove_collection(&c);
-                        self.userlib.save();
-                        self.apply_user_all();
-                        self.index.save();
-                        if self.shelf_open.as_deref() == Some(c.as_str()) {
-                            self.shelf_open = None;
-                        }
-                    }
-                }
-
-                ui::section_label(ui, tr("Import"));
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.clip_busy, |ui| {
-                        if text_button(ui, tr("Kindle My Clippings.txt…"), false).clicked() {
-                            self.import_clippings();
-                        }
-                    });
-                    if !self.clip_status.is_empty() {
-                        ui.add(egui::Label::new(tag(&self.clip_status).color(pal.muted)).wrap());
-                    }
-                });
-
-                ui::section_label(ui, tr("Sources / plugins"));
-                ui.checkbox(&mut self.settings.zlib_enabled, tr("Z-Library — blend results into library search"));
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Proxy")).color(pal.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.proxy).hint_text("socks5://127.0.0.1:9050").desired_width(260.0));
-                });
-
-                ui::section_label(ui, tr("Read aloud"));
-                self.voice_settings(ui, pal);
-
-                ui::section_label(ui, tr("Lookup & reading"));
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Translate to")).color(pal.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.translate_to).desired_width(70.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(tag(tr("Reading speed")).color(pal.muted));
-                    ui.add(egui::Slider::new(&mut self.settings.reading_speed_cpm, 300.0..=4000.0).suffix(" chars/min"));
-                });
-
-                ui::section_label(ui, tr("Progress sync — KOReader compatible"));
-                ui.checkbox(&mut self.settings.kosync.enabled, tr("Sync reading progress"));
-                egui::Grid::new("ks").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                    ui.label(tag(tr("Server")).color(pal.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.server).desired_width(300.0));
-                    ui.end_row();
-                    ui.label(tag(tr("Username")).color(pal.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.username).desired_width(200.0));
-                    ui.end_row();
-                    ui.label(tag(tr("Password")).color(pal.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.kosync_password).password(true).desired_width(200.0).hint_text(if self.settings.kosync.userkey.is_empty() { "" } else { "(saved)" }));
-                    ui.end_row();
-                });
-                ui.horizontal(|ui| {
-                    let mk = |s: &mut App| {
-                        if !s.kosync_password.is_empty() {
-                            s.settings.kosync.userkey = crate::kosync::md5_hex(&s.kosync_password);
-                            s.kosync_password.clear();
-                        }
-                        (s.settings.kosync.clone(), s.settings.proxy_opt(), s.tx.clone(), s.ctx.clone())
-                    };
-                    if text_button(ui, tr("Log in"), false).clicked() {
-                        let (cfg, proxy, tx, ctx) = mk(self);
-                        self.kosync_status = tr("Checking…").into();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(Msg::Kosync(crate::kosync::auth(&cfg, &proxy).map(|_| tr("Logged in").to_string())));
-                            ctx.request_repaint();
-                        });
-                    }
-                    if text_button(ui, tr("Register"), false).clicked() {
-                        let (cfg, proxy, tx, ctx) = mk(self);
-                        self.kosync_status = tr("Registering…").into();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(Msg::Kosync(crate::kosync::register(&cfg, &proxy).map(|_| tr("Account created").to_string())));
-                            ctx.request_repaint();
-                        });
-                    }
-                    ui.label(tag(&self.kosync_status).color(ACCENT));
-                });
-
-                ui::section_label(ui, tr("Notes, highlights & library sync"));
-                ui.label(tag(tr("Syncs highlights, notes, bookmarks, collections, ratings and edited details between machines.")).color(pal.muted));
-                ui.horizontal(|ui| {
-                    for (b, l) in [(store::SyncBackend::Off, tr("Off")), (store::SyncBackend::Folder, tr("Sync folder")), (store::SyncBackend::WebDav, "WebDAV")] {
-                        if ui.selectable_label(self.settings.sync.backend == b, l).clicked() {
-                            self.settings.sync.backend = b;
-                        }
-                    }
-                });
-                match self.settings.sync.backend {
-                    store::SyncBackend::Off => {}
-                    store::SyncBackend::Folder => {
-                        ui.horizontal(|ui| {
-                            ui.label(tag(tr("Folder")).color(pal.muted));
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.folder).desired_width(300.0));
-                            if text_button(ui, tr("Browse…"), false).clicked() {
-                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                                    self.settings.sync.folder = d.to_string_lossy().into_owned();
+                            4 => self.settings_sync(ui, pal),
+                            _ => {
+                                form_section(ui, tr("About"), None, true);
+                                form_row(ui, tr("Version"), |ui| ui.label(format!("{} {}", crate::APP_NAME, env!("CARGO_PKG_VERSION"))));
+                                form_row(ui, tr("Settings folder"), |ui| ui.add(egui::Label::new(RichText::new(store::config_dir().display().to_string()).font(mono(11.5))).truncate()));
+                                form_section(ui, tr("Keyboard"), None, false);
+                                for (k, what) in [("← →", tr("Turn the page")), ("T", tr("Show or hide the toolbar")), ("C", tr("Contents")), ("B", tr("Bookmark")), ("Ctrl+K", tr("Search")), ("F", tr("Full screen")), ("Ctrl ±", tr("Text size")), ("Backspace", tr("Back")), ("Esc", tr("Close"))] {
+                                    form_row(ui, what, |ui| ui.label(RichText::new(k).font(mono(12.0))));
                                 }
                             }
-                        });
-                        ui.label(tag(tr("Use a folder your sync tool (Syncthing, Dropbox, Nextcloud…) keeps in step.")).color(pal.muted));
-                    }
-                    store::SyncBackend::WebDav => {
-                        egui::Grid::new("dav").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                            ui.label(tag("URL").color(pal.muted));
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_url).desired_width(300.0).hint_text("https://cloud.example.com/remote.php/dav/files/me"));
-                            ui.end_row();
-                            ui.label(tag(tr("Username")).color(pal.muted));
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_user).desired_width(200.0));
-                            ui.end_row();
-                            ui.label(tag(tr("Password")).color(pal.muted));
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_pass).password(true).desired_width(200.0));
-                            ui.end_row();
-                        });
-                    }
-                }
-                if self.settings.sync.backend != store::SyncBackend::Off {
-                    ui.checkbox(&mut self.settings.sync.reading_time, tr("Also sync reading time"));
-                    ui.horizontal(|ui| {
-                        if text_button(ui, tr("Sync now"), false).clicked() && !self.sync_busy {
-                            self.settings.save();
-                            self.start_sync(None);
                         }
-                        ui.label(tag(&self.sync_status).color(ACCENT));
+                        ui.add_space(16.0);
+                        let _ = FORM_CTRL_W;
                     });
-                }
-
-                ui::section_label(ui, tr("About"));
-                ui.label(tag(format!("{} {} · {}", crate::APP_NAME, env!("CARGO_PKG_VERSION"), store::config_dir().display())).color(pal.muted));
-                ui.label(RichText::new("← → page · T toolbar · C contents · B bookmark · Ctrl+K search · F fullscreen · Ctrl ± size · Backspace back · Esc close").font(mono(10.5)).color(pal.muted));
+                });
             });
         });
+        ctx.data_mut(|d| d.insert_temp(page_id, page));
         if rescan {
             self.rescan();
         }
@@ -2727,6 +2572,202 @@ impl App {
             self.settings_open = false;
             self.settings.save();
         }
+    }
+
+    fn settings_general(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        use ui::{form_row, form_section, FORM_CTRL_W};
+        let _ = pal;
+        form_section(ui, tr("Appearance"), None, true);
+        form_row(ui, tr("Theme"), |ui| {
+            for (t, l) in [(UiTheme::System, tr("System")), (UiTheme::Light, tr("Paper")), (UiTheme::Dark, tr("Ink"))] {
+                if text_button(ui, l, self.settings.ui_theme == t).clicked() {
+                    self.settings.ui_theme = t;
+                }
+            }
+        });
+        form_row(ui, tr("Cover size"), |ui| ui.add(egui::Slider::new(&mut self.settings.cover_size, 110.0..=260.0).show_value(false)));
+        form_row(ui, tr("Progress column"), |ui| ui.checkbox(&mut self.settings.right_panel, tr("Show on the library page")));
+        form_section(ui, tr("Language"), None, false);
+        form_row(ui, tr("Interface language"), |ui| {
+            let native = |code: &str| crate::i18n::LANGS.iter().find(|l| l.0 == code).map(|l| l.1).unwrap_or("English");
+            let auto = trf!("Auto ({name})", name = native(crate::i18n::detect()));
+            let shown = if self.settings.language.is_empty() { auto.clone() } else { native(&self.settings.language).to_string() };
+            egui::ComboBox::from_id_salt("ui-lang").selected_text(shown).width(FORM_CTRL_W - 60.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.settings.language, String::new(), auto);
+                for (code, name, _) in crate::i18n::LANGS {
+                    ui.selectable_value(&mut self.settings.language, code.to_string(), *name);
+                }
+            });
+        });
+        form_section(ui, tr("Sources"), Some(tr("Z-Library is the only online source; it is off unless you turn it on.")), false);
+        form_row(ui, "Z-Library", |ui| ui.checkbox(&mut self.settings.zlib_enabled, tr("Blend results into library search")));
+        form_row(ui, tr("Proxy"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.proxy).hint_text("socks5://127.0.0.1:9050").desired_width(FORM_CTRL_W)));
+    }
+
+    /// Returns true when the library must be rescanned.
+    fn settings_library(&mut self, ui: &mut egui::Ui, pal: &Palette) -> bool {
+        use ui::{form_note, form_row, form_section};
+        let _ = pal;
+        let mut rescan = false;
+        form_section(ui, tr("Library folders"), Some(tr("Seshat shows every book found in these folders.")), true);
+        form_row(ui, tr("Downloads"), |ui| {
+            ui.add_sized([ui::FORM_CTRL_W, 20.0], egui::Label::new(RichText::new(&self.settings.download_dir).font(mono(11.5))).truncate());
+            if text_button(ui, tr("Change"), false).clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_directory(&self.settings.download_dir).pick_folder() {
+                    self.settings.download_dir = d.to_string_lossy().into_owned();
+                    rescan = true;
+                }
+            }
+        });
+        let mut remove = None;
+        for (i, d) in self.settings.library_dirs.iter().enumerate() {
+            form_row(ui, &trf!("Folder {n}", n = i + 1), |ui| {
+                ui.add_sized([ui::FORM_CTRL_W, 20.0], egui::Label::new(RichText::new(d).font(mono(11.5))).truncate());
+                if text_button(ui, tr("Remove"), false).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.settings.library_dirs.remove(i);
+            rescan = true;
+        }
+        form_row(ui, "", |ui| {
+            if text_button(ui, tr("+ Add folder"), false).clicked() {
+                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                    let s = d.to_string_lossy().into_owned();
+                    if !self.settings.library_dirs.contains(&s) {
+                        self.settings.library_dirs.push(s);
+                    }
+                    rescan = true;
+                }
+            }
+            if !self.settings.hidden_paths.is_empty() && text_button(ui, &trf!("Restore {n} removed", n = self.settings.hidden_paths.len()), false).clicked() {
+                self.settings.hidden_paths.clear();
+                rescan = true;
+            }
+        });
+        form_row(ui, tr("Watch folders"), |ui| ui.checkbox(&mut self.settings.watch_folders, tr("Add new books automatically")));
+        form_note(ui, tr("Checks the folders every 30 seconds."));
+
+        if !self.userlib.collections.is_empty() {
+            form_section(ui, tr("Collections"), None, false);
+            let mut del = None;
+            for c in &self.userlib.collections {
+                form_row(ui, c, |ui| {
+                    if text_button(ui, tr("Delete"), false).clicked() {
+                        del = Some(c.clone());
+                    }
+                });
+            }
+            if let Some(c) = del {
+                self.userlib.remove_collection(&c);
+                self.userlib.save();
+                self.apply_user_all();
+                self.index.save();
+                if self.shelf_open.as_deref() == Some(c.as_str()) {
+                    self.shelf_open = None;
+                }
+            }
+        }
+
+        form_section(ui, tr("Import"), Some(tr("Bring highlights from a Kindle into your notes.")), false);
+        form_row(ui, "Kindle", |ui| {
+            ui.add_enabled_ui(!self.clip_busy, |ui| {
+                if text_button(ui, tr("Kindle My Clippings.txt…"), false).clicked() {
+                    self.import_clippings();
+                }
+            });
+        });
+        if !self.clip_status.is_empty() {
+            form_note(ui, &self.clip_status.clone());
+        }
+        rescan
+    }
+
+    fn settings_reading(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        use ui::{form_note, form_row, form_section};
+        let _ = pal;
+        form_section(ui, tr("Lookup & reading"), None, true);
+        form_row(ui, tr("Translate to"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.translate_to).desired_width(80.0)));
+        form_note(ui, tr("A language code such as en, de or ja."));
+        form_row(ui, tr("Reading speed"), |ui| ui.add(egui::Slider::new(&mut self.settings.reading_speed_cpm, 300.0..=4000.0).suffix(" chars/min")));
+        form_note(ui, tr("Used to estimate the time left in a chapter."));
+    }
+
+    fn settings_sync(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        use ui::{form_note, form_row, form_section, FORM_CTRL_W};
+        form_section(ui, tr("Reading progress"), Some(tr("Compatible with KOReader sync servers.")), true);
+        form_row(ui, tr("Sync"), |ui| ui.checkbox(&mut self.settings.kosync.enabled, tr("Sync reading progress")));
+        form_row(ui, tr("Server"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.server).desired_width(FORM_CTRL_W)));
+        form_row(ui, tr("Username"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.kosync.username).desired_width(FORM_CTRL_W)));
+        let saved = !self.settings.kosync.userkey.is_empty();
+        form_row(ui, tr("Password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.kosync_password).password(true).desired_width(FORM_CTRL_W).hint_text(if saved { "(saved)" } else { "" })));
+        form_row(ui, "", |ui| {
+            let mk = |s: &mut App| {
+                if !s.kosync_password.is_empty() {
+                    s.settings.kosync.userkey = crate::kosync::md5_hex(&s.kosync_password);
+                    s.kosync_password.clear();
+                }
+                (s.settings.kosync.clone(), s.settings.proxy_opt(), s.tx.clone(), s.ctx.clone())
+            };
+            if text_button(ui, tr("Log in"), false).clicked() {
+                let (cfg, proxy, tx, ctx) = mk(self);
+                self.kosync_status = tr("Checking…").into();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Msg::Kosync(crate::kosync::auth(&cfg, &proxy).map(|_| tr("Logged in").to_string())));
+                    ctx.request_repaint();
+                });
+            }
+            if text_button(ui, tr("Register"), false).clicked() {
+                let (cfg, proxy, tx, ctx) = mk(self);
+                self.kosync_status = tr("Registering…").into();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Msg::Kosync(crate::kosync::register(&cfg, &proxy).map(|_| tr("Account created").to_string())));
+                    ctx.request_repaint();
+                });
+            }
+            ui.label(RichText::new(&self.kosync_status).size(12.5).color(ACCENT));
+        });
+
+        form_section(ui, tr("Notes, highlights & library"), Some(tr("Syncs highlights, notes, bookmarks, collections, ratings and edited details between machines.")), false);
+        form_row(ui, tr("Method"), |ui| {
+            for (b, l) in [(store::SyncBackend::Off, tr("Off")), (store::SyncBackend::Folder, tr("Sync folder")), (store::SyncBackend::WebDav, "WebDAV")] {
+                if text_button(ui, l, self.settings.sync.backend == b).clicked() {
+                    self.settings.sync.backend = b;
+                }
+            }
+        });
+        match self.settings.sync.backend {
+            store::SyncBackend::Off => {}
+            store::SyncBackend::Folder => {
+                form_row(ui, tr("Folder"), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.sync.folder).desired_width(FORM_CTRL_W));
+                    if text_button(ui, tr("Browse…"), false).clicked() {
+                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                            self.settings.sync.folder = d.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                form_note(ui, tr("Use a folder your sync tool (Syncthing, Dropbox, Nextcloud…) keeps in step."));
+            }
+            store::SyncBackend::WebDav => {
+                form_row(ui, "URL", |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_url).desired_width(FORM_CTRL_W).hint_text("https://cloud.example.com/remote.php/dav/files/me")));
+                form_row(ui, tr("Username"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_user).desired_width(FORM_CTRL_W)));
+                form_row(ui, tr("Password"), |ui| ui.add(egui::TextEdit::singleline(&mut self.settings.sync.dav_pass).password(true).desired_width(FORM_CTRL_W)));
+            }
+        }
+        if self.settings.sync.backend != store::SyncBackend::Off {
+            form_row(ui, tr("Reading time"), |ui| ui.checkbox(&mut self.settings.sync.reading_time, tr("Also sync reading time")));
+            form_row(ui, "", |ui| {
+                if text_button(ui, tr("Sync now"), false).clicked() && !self.sync_busy {
+                    self.settings.save();
+                    self.start_sync(None);
+                }
+                ui.label(RichText::new(&self.sync_status).size(12.5).color(ACCENT));
+            });
+        }
+        let _ = pal;
     }
 }
 

@@ -175,13 +175,34 @@ fn wikipedia(c: &reqwest::blocking::Client, q: &str, lang: &str) -> Result<Answe
     let v: serde_json::Value = r.json().map_err(|e| e.to_string())?;
     let heading = v.get("title").and_then(|t| t.as_str()).unwrap_or(&title).to_string();
     let mut body = String::new();
-    if let Some(d) = v.get("description").and_then(|d| d.as_str()) {
+    let disamb = v.get("type").and_then(|t| t.as_str()) == Some("disambiguation");
+    if let Some(d) = v.get("description").and_then(|d| d.as_str()).filter(|_| !disamb) {
         body.push_str(d);
         body.push_str("\n\n");
     }
-    body.push_str(v.get("extract").and_then(|e| e.as_str()).unwrap_or(""));
+    let extract = v.get("extract").and_then(|e| e.as_str()).unwrap_or("");
+    if disamb {
+        // "X may refer to:Thriving" — the list itself is dropped from the summary
+        let mut e = String::new();
+        let mut it = extract.chars().peekable();
+        while let Some(ch) = it.next() {
+            e.push(ch);
+            if ch == ':' && it.peek().is_some_and(|n| !n.is_whitespace()) {
+                e.push_str("\n\n");
+            }
+        }
+        body.push_str(&e);
+        body.push_str("\n\n");
+        body.push_str(tr_disamb());
+    } else {
+        body.push_str(extract);
+    }
     let link = v.pointer("/content_urls/desktop/page").and_then(|u| u.as_str()).map(|s| s.to_string());
     Ok(Answer { heading, body, url: link })
+}
+
+fn tr_disamb() -> &'static str {
+    crate::i18n::tr("This term has several meanings. Open in browser to choose one.")
 }
 
 fn translate(c: &reqwest::blocking::Client, text: &str, target: &str) -> Result<Answer, String> {
