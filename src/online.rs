@@ -550,22 +550,56 @@ impl Online {
         });
     }
 
-    /// Download status block for the navigation sidebar.
+    /// Download status block for the navigation sidebar: a heading in line
+    /// with the other sidebar headings, then a card for the book.
     pub fn downloads_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<PathBuf> {
         let mut open = None;
-        if let Some((t, w, total)) = &self.active_dl {
-            ui.label(RichText::new(tr("Downloading")).font(ui::ui_m(12.0)).color(ui::ACCENT));
-            ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
-            self.progress_bar(ui, pal, *w, *total);
+        let heading = |ui: &mut egui::Ui, text: &str, color: Color32| {
+            ui.add_space(14.0);
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+            ui.painter().text(r.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, text, ui::ui_m(11.5), color);
+            ui.add_space(4.0);
+        };
+        let card = |ui: &mut egui::Ui, fill: Color32, body: &mut dyn FnMut(&mut egui::Ui)| {
+            egui::Frame::new()
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, pal.border))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 10 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    body(ui);
+                })
+                .response
+        };
+        if let Some((t, w, total)) = self.active_dl.clone() {
+            heading(ui, tr("Downloading"), ui::ACCENT);
+            card(ui, pal.panel, &mut |ui| {
+                ui.add(egui::Label::new(RichText::new(&t).font(ui::ui_m(13.5)).color(pal.fg)).truncate());
+                ui.add_space(2.0);
+                self.progress_bar(ui, pal, w, total);
+            });
         }
         if !self.dl_error.is_empty() {
-            ui.label(RichText::new(&self.dl_error).size(11.5).color(ui::ACCENT));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(&self.dl_error).size(11.5).color(ui::ACCENT)).wrap());
+            });
         }
-        if let Some((t, p)) = self.recent.first() {
-            ui.label(ui::tag(tr("Downloaded")).color(pal.muted));
-            ui.add(egui::Label::new(RichText::new(t).size(12.5)).truncate());
-            if ui::text_button(ui, tr("Read now →"), false).clicked() {
-                open = Some(p.clone());
+        if let Some((t, p)) = self.recent.first().cloned() {
+            heading(ui, tr("Downloaded"), pal.muted);
+            let id = ui.id().with("dl-card");
+            let hovered = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+            let resp = card(ui, if hovered { pal.hover } else { pal.panel }, &mut |ui| {
+                ui.add(egui::Label::new(RichText::new(&t).font(ui::ui_m(13.5)).color(pal.fg)).truncate().selectable(false));
+                ui.label(RichText::new(tr("Read now →")).font(ui::ui_m(12.0)).color(ui::ACCENT));
+            });
+            let resp = resp.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.ctx().data_mut(|d| d.insert_temp(id, resp.hovered()));
+            if resp.clicked() {
+                open = Some(p);
             }
         }
         open

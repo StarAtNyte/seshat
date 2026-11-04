@@ -1027,6 +1027,10 @@ impl App {
         }
         let Ok(path) = std::env::var("ZR_SHOT") else { return };
         if self.debug_start.is_none() {
+            // ZR_RECENT=<title> shows a finished download in the sidebar
+            if let Ok(t) = std::env::var("ZR_RECENT") {
+                self.online.recent.insert(0, (t, PathBuf::new()));
+            }
             if let Some(p) = std::env::var("ZR_SETTINGS").ok().and_then(|p| p.parse::<usize>().ok()) {
                 self.settings_open = true;
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("settings-page"), p));
@@ -1430,7 +1434,6 @@ impl App {
                 let pill = Rect::from_min_size(pos2(m.left(), y), m.size());
                 ui.painter().set(pill_layer, egui::Shape::rect_filled(pill, CornerRadius::same(8), ACCENT.linear_multiply(0.11)));
             }
-            ui.add_space(12.0);
             if let Some(p) = self.online.downloads_ui(ui, pal) {
                 self.open_path(&p);
             }
