@@ -109,7 +109,8 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_app_id("seshat")
-            .with_inner_size([1200.0, 800.0])
+            // ZR_SIZE=WxH (debug aid): a fixed window size for recordings
+            .with_inner_size(std::env::var("ZR_SIZE").ok().and_then(|v| v.split_once('x').and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))).unwrap_or([1200.0, 800.0]))
             .with_maximized(true)
             .with_min_inner_size([560.0, 420.0])
             .with_drag_and_drop(true)

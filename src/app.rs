@@ -1127,6 +1127,8 @@ impl eframe::App for App {
         if std::env::var("ZR_READER_IN_ROOT").is_ok() && !self.readers.is_empty() {
             if let Ok(keys) = std::env::var("ZR_READER_KEYS") {
                 let started = *self.debug_start.get_or_insert_with(Instant::now);
+                // keep frames coming so scripted keys fire on time
+                ctx.request_repaint_after(Duration::from_millis(30));
                 let steps: Vec<&str> = keys.split(',').filter(|k| !k.is_empty()).collect();
                 let n = ((started.elapsed().as_millis() as i64 - 2500) / 700).max(-1);
                 if n >= 0 && (n as usize) < steps.len() && self.debug_keys_sent <= n as usize {

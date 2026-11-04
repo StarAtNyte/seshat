@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/cover-open.gif" width="820" alt="A book opening: the hardcover swings open onto a two-page spread">
+  <img src="docs/screenshots/demo.gif" width="820" alt="A book opening: the hardcover swings open, then pages turn with a paper flip">
 </p>
 
 ---

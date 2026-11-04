@@ -689,7 +689,13 @@ impl Reader {
         let turn = self.turn.filter(|t| paginated && ((t.section == l.section && t.from != self.page) || (t.section != l.section && prev_ok(t))));
         let cross = turn.is_some_and(|t| t.section != l.section);
         let dur = if self.motion == 0 { 0.55 } else { 0.22 };
-        let turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
+        #[allow(unused_mut)]
+        let mut turn_t = turn.map(|t| (now - t.at).as_secs_f32() / dur).unwrap_or(1.0);
+        // debug aid: ZR_TURN_T=0.5 freezes a page turn for captures
+        #[cfg(debug_assertions)]
+        if let (Some(_), Some(f)) = (turn, std::env::var("ZR_TURN_T").ok().and_then(|v| v.parse::<f32>().ok())) {
+            turn_t = f;
+        }
         // the 3D leaf is built for left-to-right books; rtl books use the sweep
         let flip3d = self.motion == 0 && turn_t < 1.0 && !rtl;
         if turn_t < 1.0 {
