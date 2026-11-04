@@ -422,7 +422,8 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
-            download_dir: dirs::download_dir().unwrap_or_else(|| PathBuf::from(".")).to_string_lossy().into_owned(),
+            // a folder of its own: the whole Downloads folder is full of unrelated files
+            download_dir: dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads"))).unwrap_or_else(|| PathBuf::from(".")).join("Seshat").to_string_lossy().into_owned(),
             library_dirs: Vec::new(),
             extra_files: Vec::new(),
             hidden_paths: Vec::new(),

@@ -519,5 +519,17 @@
  "This term has several meanings. Open in browser to choose one.": "У этого термина несколько значений. Откройте в браузере, чтобы выбрать.",
  "Add a shortcut": "Добавить сочетание",
  "Click a key to remove it; + adds another.": "Нажмите на клавишу, чтобы убрать её; + добавляет новую.",
- "Covers turn like a hardcover; pages curl over the spine.": "Обложки открываются как у книги в твёрдом переплёте; страницы изгибаются у корешка."
+ "Covers turn like a hardcover; pages curl over the spine.": "Обложки открываются как у книги в твёрдом переплёте; страницы изгибаются у корешка.",
+ "Select": "Выбрать",
+ "{n} selected": "Выбрано: {n}",
+ "Remove {n} from library": "Убрать из библиотеки ({n})",
+ "Delete {n} files…": "Удалить файлы ({n})…",
+ "Clear selection": "Снять выделение",
+ "Select all": "Выбрать все",
+ "Hide from the library; the files stay on disk": "Скрыть из библиотеки; файлы останутся на диске",
+ "Delete files…": "Удалить файлы…",
+ "Clear": "Снять",
+ "Delete {n} files?": "Удалить файлы ({n})?",
+ "{n} books will be permanently deleted from disk:": "Книги ({n}) будут безвозвратно удалены с диска:",
+ "and {n} more": "и ещё {n}"
 }

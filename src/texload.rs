@@ -24,6 +24,22 @@ pub struct Loaded {
     pub tex: TextureHandle,
     /// Natural pixel size of the source image.
     pub size: [usize; 2],
+    /// Mean colour of the image (a book's binding takes its cover's colour).
+    pub avg: egui::Color32,
+}
+
+/// Mean colour, sampled on a coarse grid.
+fn mean(img: &ColorImage) -> egui::Color32 {
+    let step = (img.pixels.len() / 4096).max(1);
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for p in img.pixels.iter().step_by(step) {
+        r += p.r() as u64;
+        g += p.g() as u64;
+        b += p.b() as u64;
+        n += 1;
+    }
+    let n = n.max(1);
+    egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
 }
 
 pub enum State {
@@ -135,7 +151,10 @@ impl TexLoader {
         let changed = !done.is_empty();
         for (key, res) in done {
             let st = match res {
-                Some((img, natural)) => State::Ready(Loaded { tex: self.ctx.load_texture(&key, img, TextureOptions::LINEAR), size: natural }),
+                Some((img, natural)) => {
+                    let avg = mean(&img);
+                    State::Ready(Loaded { tex: self.ctx.load_texture(&key, img, TextureOptions::LINEAR), size: natural, avg })
+                }
                 None => State::Failed,
             };
             self.map.insert(key, st);

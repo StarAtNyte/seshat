@@ -519,5 +519,17 @@
  "This term has several meanings. Open in browser to choose one.": "该词有多个含义。请在浏览器中打开以选择其一。",
  "Add a shortcut": "添加快捷键",
  "Click a key to remove it; + adds another.": "点击按键可将其移除；+ 可添加新的。",
- "Covers turn like a hardcover; pages curl over the spine.": "封面像精装书一样翻开，书页沿书脊卷动。"
+ "Covers turn like a hardcover; pages curl over the spine.": "封面像精装书一样翻开，书页沿书脊卷动。",
+ "Select": "选择",
+ "{n} selected": "已选择 {n} 项",
+ "Remove {n} from library": "从书库移除 {n} 项",
+ "Delete {n} files…": "删除 {n} 个文件…",
+ "Clear selection": "清除选择",
+ "Select all": "全选",
+ "Hide from the library; the files stay on disk": "从书库中隐藏；文件仍保留在磁盘上",
+ "Delete files…": "删除文件…",
+ "Clear": "清除",
+ "Delete {n} files?": "删除 {n} 个文件？",
+ "{n} books will be permanently deleted from disk:": "{n} 本书将从磁盘永久删除：",
+ "and {n} more": "以及另外 {n} 项"
 }

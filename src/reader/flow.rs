@@ -171,13 +171,19 @@ impl Reader {
             vertical: self.book.meta.vertical,
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (si, typo.key(), known, s.layout == Layout::Paginated || self.book.meta.vertical).hash(&mut h);
+        let paged = s.layout == Layout::Paginated || self.book.meta.vertical;
+        // a spread opens on the right page, facing the blank inside of the cover
+        let lead = paged && si == 0 && g.cols == 2 && !self.book.meta.vertical;
+        (si, typo.key(), known, paged, lead).hash(&mut h);
         let key = h.finish();
         if self.layout.as_ref().is_some_and(|l| l.key == key) {
             return;
         }
         let tex = &self.tex;
-        let lay = SectionLayout::build(ctx, si, sec, &typo, &|k| tex.get(k).map(|l| l.size), key);
+        let mut lay = SectionLayout::build(ctx, si, sec, &typo, &|k| tex.get(k).map(|l| l.size), key);
+        if lead {
+            lay.pages.insert(0, super::layout::Page { u0: 0, u1: 0, top: 0.0, bottom: 0.0 });
+        }
         self.step = g.cols;
         if self.go_end {
             self.go_end = false;
@@ -481,13 +487,15 @@ impl Reader {
         let cg = self.cover_geo(&g, side);
         let ps = if cg.off.abs() > 1.0 { 0.3 } else { 0.0 };
         // full motion: (swing progress 0 = board on its open side, slide progress)
+        // one smoothstep over the whole move, so the slide flows into the swing
+        // without stopping in between
+        let smooth = |x: f32| x * x * (3.0 - 2.0 * x);
         let (k, slide) = if side == Cover::Front {
-            let u = 1.0 - c;
-            if ps > 0.0 { (((u - ps) / (1.0 - ps)).clamp(0.0, 1.0), 1.0 - super::ease(u / ps)) } else { (u, 0.0) }
-        } else if ps > 0.0 {
-            ((c / (1.0 - ps)).clamp(0.0, 1.0), super::ease((c - (1.0 - ps)) / ps))
+            let e = smooth(1.0 - c);
+            if ps > 0.0 { (((e - ps) / (1.0 - ps)).clamp(0.0, 1.0), 1.0 - (e / ps).min(1.0)) } else { (e, 0.0) }
         } else {
-            (c, 0.0)
+            let e = smooth(c);
+            if ps > 0.0 { ((e / (1.0 - ps)).min(1.0), ((e - (1.0 - ps)) / ps).clamp(0.0, 1.0)) } else { (e, 0.0) }
         };
         let pages_visible = c < 1.0 && if !full || side == Cover::Open { true } else if side == Cover::Front { k > 0.0 } else { k < 1.0 };
         if !pages_visible {
@@ -678,9 +686,10 @@ impl Reader {
         }
 
         // chapter numeral hanging in the margin on a chapter's first page
+        let lead_col = (paginated && g.cols == 2 && l.pages.len() > 1 && l.pages[0].u0 == l.pages[0].u1).then(|| if self.page_col(&g, 1) == 1 { 1 } else { 0 });
         if paginated && self.page == 0 && g.pad >= 64.0 {
             let n = self.book.toc_index_for(self.loc).map(|i| i + 1).unwrap_or(self.loc.section + 1);
-            painter.text(pos2(g.origin(0).x - 16.0, g.top - 6.0), egui::Align2::RIGHT_TOP, format!("{n:02}"), ui::ui_b(34.0), ACCENT);
+            painter.text(pos2(g.origin(lead_col.unwrap_or(0)).x - 16.0, g.top - 6.0), egui::Align2::RIGHT_TOP, format!("{n:02}"), ui::ui_b(34.0), ACCENT);
         }
 
         // running heads and folios, set like a printed book
@@ -691,11 +700,18 @@ impl Reader {
             let cut = if t.chars().count() > n { t.chars().take(n).collect::<String>() + "…" } else { t.to_string() };
             crate::book::script::visual(&cut).into_owned()
         };
+        // the blank leaf facing the first page of a spread carries no running heads
+        let lead = paginated && l.pages.len() > 1 && l.pages[0].u0 == l.pages[0].u1;
+        let blank = |col: usize| lead && self.page + self.page_col(&g, col) == 0;
         if s.show_header {
             if g.cols == 2 {
                 let (l0, l1) = (g.sheet(0), g.sheet(1));
-                painter.text(pos2(l0.center().x, l0.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&self.book.meta.title, 60), small.clone(), pal.muted);
-                painter.text(pos2(l1.center().x, l1.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&chapter, 60), small.clone(), pal.muted);
+                if !blank(0) {
+                    painter.text(pos2(l0.center().x, l0.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&self.book.meta.title, 60), small.clone(), pal.muted);
+                }
+                if !blank(1) {
+                    painter.text(pos2(l1.center().x, l1.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&chapter, 60), small.clone(), pal.muted);
+                }
             } else {
                 let sh = g.sheet(0);
                 painter.text(pos2(sh.center().x, sh.top() + 24.0), egui::Align2::CENTER_CENTER, trunc(&chapter, 80), small.clone(), pal.muted);
@@ -712,15 +728,17 @@ impl Reader {
                 if paginated {
                     for col in 0..g.cols {
                         let pi = self.page + self.page_col(&g, col);
-                        if pi < l.pages.len() {
+                        if pi < l.pages.len() && !blank(col) {
                             let sh = g.sheet(col);
                             let (x, al) = if col == 0 && g.cols == 2 { (sh.left() + g.pad, egui::Align2::LEFT_CENTER) } else { (sh.right() - g.pad, egui::Align2::RIGHT_CENTER) };
-                            painter.text(pos2(x, y), al, format!("{}", pi + 1), ui::ui_b(13.0), pal.muted);
+                            painter.text(pos2(x, y), al, format!("{}", pi + 1 - lead as usize), ui::ui_b(13.0), pal.muted);
                         }
                     }
                 }
-                painter.text(pos2(first.center().x, y), egui::Align2::CENTER_CENTER, left_txt, small.clone(), pal.muted);
-                if g.cols == 2 {
+                if !blank(0) {
+                    painter.text(pos2(first.center().x, y), egui::Align2::CENTER_CENTER, left_txt, small.clone(), pal.muted);
+                }
+                if g.cols == 2 && !blank(g.cols - 1) {
                     painter.text(pos2(last.center().x, y), egui::Align2::CENTER_CENTER, trf!("{pct}% of the book", pct = pct), small, pal.muted);
                 }
             }
@@ -773,8 +791,7 @@ impl Reader {
         if c > 0.0 {
             let top = ui.painter_at(rect);
             if full {
-                let e = k * k * (3.0 - 2.0 * k); // smoothstep: slow start, slow landing
-                self.paint_swing(&top, &cg, side, e * std::f32::consts::PI, pal);
+                self.paint_swing(&top, &cg, side, k * std::f32::consts::PI, pal);
             } else {
                 let mut p = top;
                 p.multiply_opacity(c);
@@ -847,13 +864,9 @@ impl Reader {
                 painter.image(id, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
             (Cover::Front, None) => ui::paint_placeholder_cover(painter, r, &crate::book::script::visual(&self.book.meta.title), &self.book.meta.author),
+            // the back board: plain cloth in the front cover's colour
             _ => {
                 painter.rect_filled(r, CornerRadius::same(3), self.board_color());
-                let c = r.center();
-                painter.text(pos2(c.x, r.bottom() - r.height() * 0.16), egui::Align2::CENTER_CENTER, ui::fit_painter(painter, &crate::book::script::visual(&self.book.meta.title), ui::ui_b(15.0), r.width() - 60.0), ui::ui_b(15.0), self.board_ink());
-                if !self.book.meta.author.is_empty() {
-                    painter.text(pos2(c.x, r.bottom() - r.height() * 0.16 + 22.0), egui::Align2::CENTER_CENTER, &self.book.meta.author, ui::ui_m(12.0), ui::mix(self.board_ink(), self.board_color(), 0.4));
-                }
             }
         }
         // rounded spine: shading into the hinge, then the pressed groove
@@ -874,9 +887,13 @@ impl Reader {
         painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_black_alpha(50)), egui::StrokeKind::Inside);
     }
 
-    /// Colour of the binding: the generated cover's, or ink behind a cover image.
+    /// Colour of the binding: the cover image's mean colour, or the generated cover's.
     fn board_color(&self) -> Color32 {
-        if self.book.meta.cover.is_some() { ui::INK } else { ui::placeholder_colors(&crate::book::script::visual(&self.book.meta.title)).0 }
+        match self.tex.get("__cover") {
+            Some(t) => t.avg,
+            None if self.book.meta.cover.is_some() => ui::INK,
+            None => ui::placeholder_colors(&crate::book::script::visual(&self.book.meta.title)).0,
+        }
     }
 
     fn board_ink(&self) -> Color32 {
@@ -889,10 +906,11 @@ impl Reader {
         let (hinge, top, bot, d) = (cg.hinge, cg.top, cg.bot, cg.d);
         // front boards start lying forward of the hinge; back boards end lying behind it
         let fx = hinge + d * cg.bw * theta.cos();
-        let lift = theta.sin() * (bot - top) * 0.07; // the free edge comes toward you
+        let lift = theta.sin() * (bot - top) * 0.04; // the free edge comes toward you
         let half = theta < std::f32::consts::FRAC_PI_2;
         let outside = if side == Cover::Front { half } else { !half };
-        let shade = (theta.sin() * 0.35).min(0.5);
+        // the cloth side darkens as it turns from the light; the paper side only a little
+        let shade = theta.sin() * if outside { 0.35 } else { 0.12 };
         let tint = Color32::from_gray((255.0 * (1.0 - shade)) as u8);
         let cover = if outside && side == Cover::Front { self.tex.get("__cover").map(|t| t.tex.id()) } else { None };
         // shadow the board casts on the pages beneath it
@@ -904,7 +922,8 @@ impl Reader {
             Some(id) => egui::Mesh::with_texture(id),
             None => egui::Mesh::default(),
         };
-        let board = if outside { self.board_color() } else { ui::mix(pal.bg, pal.fg, 0.1) };
+        // inside of the board: a blank leaf, the same paper as the pages
+        let board = if outside { self.board_color() } else { pal.bg };
         // texture u runs from the spine edge of the cover to its fore edge
         let uvs = if d > 0.0 { [pos2(0.0, 0.0), pos2(1.0, 0.0), pos2(1.0, 1.0), pos2(0.0, 1.0)] } else { [pos2(1.0, 0.0), pos2(0.0, 0.0), pos2(0.0, 1.0), pos2(1.0, 1.0)] };
         for (p, uv) in quad.iter().zip(uvs) {

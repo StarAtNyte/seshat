@@ -519,5 +519,17 @@
  "This term has several meanings. Open in browser to choose one.": "इस शब्द के कई अर्थ हैं। किसी एक को चुनने के लिए ब्राउज़र में खोलें।",
  "Add a shortcut": "शॉर्टकट जोड़ें",
  "Click a key to remove it; + adds another.": "हटाने के लिए किसी कुंजी पर क्लिक करें; + नई जोड़ता है।",
- "Covers turn like a hardcover; pages curl over the spine.": "कवर हार्डकवर किताब की तरह खुलते हैं; पन्ने जिल्द पर मुड़ते हैं।"
+ "Covers turn like a hardcover; pages curl over the spine.": "कवर हार्डकवर किताब की तरह खुलते हैं; पन्ने जिल्द पर मुड़ते हैं।",
+ "Select": "चुनें",
+ "{n} selected": "{n} चुने गए",
+ "Remove {n} from library": "लाइब्रेरी से {n} हटाएँ",
+ "Delete {n} files…": "{n} फ़ाइलें मिटाएँ…",
+ "Clear selection": "चयन साफ़ करें",
+ "Select all": "सभी चुनें",
+ "Hide from the library; the files stay on disk": "लाइब्रेरी से छिपाएँ; फ़ाइलें डिस्क पर रहेंगी",
+ "Delete files…": "फ़ाइलें मिटाएँ…",
+ "Clear": "साफ़ करें",
+ "Delete {n} files?": "{n} फ़ाइलें मिटाएँ?",
+ "{n} books will be permanently deleted from disk:": "{n} किताबें डिस्क से स्थायी रूप से मिटा दी जाएँगी:",
+ "and {n} more": "और {n} अन्य"
 }

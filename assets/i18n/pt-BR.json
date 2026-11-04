@@ -519,5 +519,17 @@
  "This term has several meanings. Open in browser to choose one.": "Este termo tem vários significados. Abra no navegador para escolher um.",
  "Add a shortcut": "Adicionar um atalho",
  "Click a key to remove it; + adds another.": "Clique numa tecla para removê-la; + adiciona outra.",
- "Covers turn like a hardcover; pages curl over the spine.": "As capas abrem como num livro de capa dura; as páginas se curvam sobre a lombada."
+ "Covers turn like a hardcover; pages curl over the spine.": "As capas abrem como num livro de capa dura; as páginas se curvam sobre a lombada.",
+ "Select": "Selecionar",
+ "{n} selected": "{n} selecionados",
+ "Remove {n} from library": "Remover {n} da biblioteca",
+ "Delete {n} files…": "Excluir {n} arquivos…",
+ "Clear selection": "Limpar seleção",
+ "Select all": "Selecionar tudo",
+ "Hide from the library; the files stay on disk": "Ocultar da biblioteca; os arquivos continuam no disco",
+ "Delete files…": "Excluir arquivos…",
+ "Clear": "Limpar",
+ "Delete {n} files?": "Excluir {n} arquivos?",
+ "{n} books will be permanently deleted from disk:": "{n} livros serão excluídos permanentemente do disco:",
+ "and {n} more": "e mais {n}"
 }

@@ -134,7 +134,17 @@ pub struct App {
     /// BookData for the Details window, loaded once per opened book.
     details_data: Option<(String, BookData)>,
     settings_open: bool,
-    confirm_delete: Option<String>,
+    /// Books awaiting the "delete file" confirmation (ids).
+    confirm_delete: Option<Vec<String>>,
+    /// Paths to drop from the library once this frame is drawn (never mid-draw:
+    /// the views iterate over entry indices).
+    pending_remove: Vec<String>,
+    /// Multi-selection in the library (ids), its range anchor, and the ids
+    /// drawn this frame / last frame (for "select all" and shift-ranges).
+    selected: HashSet<String>,
+    sel_anchor: Option<String>,
+    drawn_ids: Vec<String>,
+    last_drawn: Vec<String>,
     style_key: Option<(Color32, Color32, bool)>,
     kosync_password: String,
     kosync_status: String,
@@ -370,6 +380,11 @@ impl App {
             details_data: None,
             settings_open: false,
             confirm_delete: None,
+            pending_remove: Vec::new(),
+            selected: HashSet::new(),
+            sel_anchor: None,
+            drawn_ids: Vec::new(),
+            last_drawn: Vec::new(),
             style_key: None,
             kosync_password: String::new(),
             kosync_status: String::new(),
@@ -386,6 +401,7 @@ impl App {
             debug_keys_sent: 0,
             debug_shot_requested: false,
         };
+        app.migrate_download_dir();
         app.apply_user_all();
         app.refresh_dups();
         app.refresh_overview();
@@ -1042,8 +1058,17 @@ impl App {
                     }
                 } else if let Some(text) = name.strip_prefix("type:") {
                     ctx.input_mut(|inp| inp.events.push(egui::Event::Text(text.to_string())));
-                } else if let Some(k) = egui::Key::from_name(name) {
-                    ctx.input_mut(|inp| inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }));
+                } else {
+                    let (mods, key) = match name.strip_prefix("ctrl+") {
+                        Some(k) => (egui::Modifiers::COMMAND, k),
+                        None => (egui::Modifiers::NONE, name),
+                    };
+                    if let Some(k) = egui::Key::from_name(key) {
+                        ctx.input_mut(|inp| {
+                            inp.modifiers = mods;
+                            inp.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: mods });
+                        });
+                    }
                 }
             }
         }
@@ -1143,6 +1168,14 @@ impl eframe::App for App {
             self.set_view(View::All);
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("lib-search")));
         }
+        self.apply_pending();
+        self.last_drawn = std::mem::take(&mut self.drawn_ids);
+        if !self.selected.is_empty() && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.confirm_delete.is_none() {
+            self.selected.clear();
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::A) && i.modifiers.command) && matches!(self.view, View::All | View::Reading | View::Unread | View::Finished) {
+            self.selected.extend(self.last_drawn.iter().cloned());
+        }
         let q = self.query.clone();
         self.online.tick(&q, &self.settings);
         self.title_bar(ctx, &pal);
@@ -1177,6 +1210,7 @@ impl eframe::App for App {
                 });
             }
         }
+        self.selection_bar(ctx, &pal);
         self.details_window(ctx, &pal);
         self.settings_window(ctx, &pal);
         self.status_overlays(ctx, &pal);
@@ -1824,6 +1858,7 @@ impl App {
         let painter = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
         let mut x = row.left() - off;
         let mut open = None;
+        self.drawn_ids.extend(idx.iter().map(|&i| self.index.entries[i].id.clone()));
         for (n, &i) in idx.iter().enumerate() {
             let cw = widths[n];
             if x > row.right() {
@@ -1836,6 +1871,9 @@ impl App {
                 let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.15);
                 let cover = Rect::from_min_size(r.min + vec2(0.0, 6.0 - 6.0 * t), vec2(cw, h));
                 self.paint_cover(&painter, cover, &e);
+                if self.selected.contains(&e.id) {
+                    paint_selected(&painter, cover);
+                }
                 if e.fraction > 0.0 {
                     painter.rect_filled(Rect::from_min_size(pos2(cover.left(), cover.bottom() - 3.0), vec2(cw * e.fraction, 3.0)), CornerRadius::ZERO, if e.finished { pal.fg } else { ACCENT });
                 }
@@ -1847,10 +1885,16 @@ impl App {
                 job.wrap.max_rows = 1;
                 job.wrap.overflow_character = Some('…');
                 painter.galley(pos2(x, row.top() + h + 32.0), painter.layout_job(job), pal.muted);
-                if resp.clicked() {
+                if resp.clicked() && self.book_click(ui, &e, idx) {
                     open = Some(e.path.clone());
                 }
-                resp.context_menu(|ui| self.book_menu(ui, &e));
+                resp.context_menu(|ui| {
+                    if self.selected.len() > 1 && self.selected.contains(&e.id) {
+                        self.selection_menu(ui)
+                    } else {
+                        self.book_menu(ui, &e)
+                    }
+                });
             }
             x += cw + gap;
         }
@@ -1982,6 +2026,7 @@ impl App {
             }
             placed.push((ei, r, ch));
         }
+        self.drawn_ids.extend(items.iter().map(|&i| self.index.entries[i].id.clone()));
         let total = heights.iter().cloned().fold(0.0, f32::max);
         let (area, _) = ui.allocate_exact_size(vec2(avail, total), Sense::hover());
         let clip = ui.clip_rect();
@@ -2008,6 +2053,9 @@ impl App {
                 painter.rect_filled(cover.translate(vec2(7.0 * t, 7.0 * t)), CornerRadius::ZERO, pal.fg);
             }
             self.paint_cover(&painter, cover, &e);
+                if self.selected.contains(&e.id) {
+                    paint_selected(&painter, cover);
+                }
             if t > 0.01 {
                 let sh = 28.0 * t;
                 let strip = Rect::from_min_max(pos2(cover.left(), cover.bottom() - sh), cover.max);
@@ -2035,10 +2083,16 @@ impl App {
             job.wrap.max_rows = 1;
             job.wrap.overflow_character = Some('…');
             painter.galley(pos2(r.left(), y + 20.0 + th), painter.layout_job(job), pal.muted);
-            if resp.clicked() {
+            if resp.clicked() && self.book_click(ui, &e, items) {
                 open = Some(e.path.clone());
             }
-            resp.context_menu(|ui| self.book_menu(ui, &e));
+            resp.context_menu(|ui| {
+                    if self.selected.len() > 1 && self.selected.contains(&e.id) {
+                        self.selection_menu(ui)
+                    } else {
+                        self.book_menu(ui, &e)
+                    }
+                });
         }
         if let Some(p) = open {
             self.open_path(Path::new(&p));
@@ -2053,6 +2107,7 @@ impl App {
             ui.painter().text(pos2(hr.left() + x, hr.center().y), egui::Align2::LEFT_CENTER, h, mono(9.5), pal.muted);
         }
         let mut open = None;
+        self.drawn_ids.extend(items.iter().map(|&i| self.index.entries[i].id.clone()));
         for (n, &ei) in items.iter().enumerate() {
             let e = self.index.entries[ei].clone();
             let (r, resp) = ui.allocate_exact_size(vec2(w, 42.0), Sense::click());
@@ -2061,6 +2116,10 @@ impl App {
             // hover: an accent bar wipes in from the left
             if t > 0.01 {
                 ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * t, r.height())), CornerRadius::ZERO, pal.hover);
+                ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(3.0, r.height())), CornerRadius::ZERO, ACCENT);
+            }
+            if self.selected.contains(&e.id) {
+                ui.painter().rect_filled(r, CornerRadius::ZERO, ACCENT.linear_multiply(0.12));
                 ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(3.0, r.height())), CornerRadius::ZERO, ACCENT);
             }
             let y = r.center().y;
@@ -2077,10 +2136,16 @@ impl App {
             let pr = if e.finished { tr("DONE").to_string() } else { format!("{:.0}%", e.fraction * 100.0) };
             ui.painter().text(pos2(r.left() + cols[4], y), egui::Align2::LEFT_CENTER, pr, mono(11.0), if e.fraction > 0.0 && !e.finished { ACCENT } else { pal.muted });
             ui.painter().text(pos2(r.left() + cols[5], y), egui::Align2::LEFT_CENTER, if e.last_read > 0 { store::relative_time(e.last_read) } else { "—".into() }, mono(10.5), pal.muted);
-            if resp.clicked() {
+            if resp.clicked() && self.book_click(ui, &e, items) {
                 open = Some(e.path.clone());
             }
-            resp.context_menu(|ui| self.book_menu(ui, &e));
+            resp.context_menu(|ui| {
+                    if self.selected.len() > 1 && self.selected.contains(&e.id) {
+                        self.selection_menu(ui)
+                    } else {
+                        self.book_menu(ui, &e)
+                    }
+                });
         }
         if let Some(p) = open {
             self.open_path(Path::new(&p));
@@ -2186,17 +2251,138 @@ impl App {
             ui.close_menu();
         }
         ui.separator();
+        if ui.button(tr("Select")).clicked() {
+            self.selected.insert(e.id.clone());
+            self.sel_anchor = Some(e.id.clone());
+            ui.close_menu();
+        }
         if ui.button(tr("Remove from library")).clicked() {
-            self.settings.hidden_paths.push(e.path.clone());
-            self.settings.extra_files.retain(|f| f != &e.path);
-            self.index.entries.retain(|x| x.id != e.id);
-            self.index.save();
+            self.pending_remove.push(e.path.clone());
             ui.close_menu();
         }
         if ui.button(RichText::new(tr("Delete file…")).color(ACCENT)).clicked() {
-            self.confirm_delete = Some(e.id.clone());
+            self.confirm_delete = Some(vec![e.id.clone()]);
             ui.close_menu();
         }
+    }
+
+    /// Right-click on a book that is part of a multi-selection.
+    fn selection_menu(&mut self, ui: &mut egui::Ui) {
+        let n = self.selected.len();
+        ui.label(RichText::new(trf!("{n} selected", n = n)).font(ui_m(12.0)).color(ui.visuals().weak_text_color()));
+        ui.separator();
+        if ui.button(trf!("Remove {n} from library", n = n)).clicked() {
+            self.remove_selected();
+            ui.close_menu();
+        }
+        if ui.button(RichText::new(trf!("Delete {n} files…", n = n)).color(ACCENT)).clicked() {
+            self.confirm_delete = Some(self.selected.iter().cloned().collect());
+            ui.close_menu();
+        }
+        if ui.button(tr("Clear selection")).clicked() {
+            self.selected.clear();
+            ui.close_menu();
+        }
+    }
+
+    fn remove_selected(&mut self) {
+        let paths: Vec<String> = self.index.entries.iter().filter(|e| self.selected.contains(&e.id)).map(|e| e.path.clone()).collect();
+        self.pending_remove.extend(paths);
+        self.selected.clear();
+    }
+
+    /// A click on a book: true = open it. With Ctrl/Cmd, Shift, or while a
+    /// selection exists, the click changes the selection instead.
+    fn book_click(&mut self, ui: &egui::Ui, e: &Entry, order: &[usize]) -> bool {
+        let m = ui.input(|i| i.modifiers);
+        if m.shift && (m.command || !self.selected.is_empty()) || m.shift && self.sel_anchor.is_some() && !self.selected.is_empty() {
+            let ids: Vec<&str> = order.iter().filter_map(|&i| self.index.entries.get(i)).map(|x| x.id.as_str()).collect();
+            let a = self.sel_anchor.as_deref().and_then(|a| ids.iter().position(|x| *x == a));
+            let b = ids.iter().position(|x| *x == e.id);
+            if let (Some(a), Some(b)) = (a, b) {
+                for id in &ids[a.min(b)..=a.max(b)] {
+                    self.selected.insert(id.to_string());
+                }
+                return false;
+            }
+        }
+        if m.command || m.shift || !self.selected.is_empty() {
+            if !self.selected.remove(&e.id) {
+                self.selected.insert(e.id.clone());
+            }
+            self.sel_anchor = Some(e.id.clone());
+            return false;
+        }
+        true
+    }
+
+    /// Apply removals queued while drawing.
+    fn apply_pending(&mut self) {
+        if self.pending_remove.is_empty() {
+            return;
+        }
+        let paths = std::mem::take(&mut self.pending_remove);
+        for path in &paths {
+            if !self.settings.hidden_paths.iter().any(|h| h == path) {
+                self.settings.hidden_paths.push(path.clone());
+            }
+            self.settings.extra_files.retain(|f| f != path);
+            for e in &mut self.index.entries {
+                e.dup_paths.retain(|p| p != path);
+            }
+        }
+        self.index.entries.retain(|e| !paths.contains(&e.path));
+        self.selected.retain(|id| self.index.entries.iter().any(|e| &e.id == id));
+        self.index.save();
+        self.settings.save();
+        self.refresh_dups();
+        self.refresh_overview();
+    }
+
+    /// Older versions downloaded into (and scanned) the whole Downloads folder.
+    /// Move to Downloads/Seshat; books from Downloads you have opened stay.
+    fn migrate_download_dir(&mut self) {
+        let Some(plain) = dirs::download_dir() else { return };
+        if Path::new(&self.settings.download_dir) != plain {
+            return;
+        }
+        let new = plain.join("Seshat");
+        self.settings.download_dir = new.to_string_lossy().into_owned();
+        for e in &self.index.entries {
+            let p = Path::new(&e.path);
+            if p.starts_with(&plain) && !p.starts_with(&new) && (e.last_read > 0 || e.fraction > 0.0) && !self.settings.extra_files.contains(&e.path) {
+                self.settings.extra_files.push(e.path.clone());
+            }
+        }
+        self.settings.save();
+    }
+
+    /// Floating bar while books are selected.
+    fn selection_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if self.selected.is_empty() || !matches!(self.view, View::All | View::Reading | View::Unread | View::Finished) {
+            return;
+        }
+        egui::Area::new("sel-bar".into()).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -24.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            egui::Frame::new().fill(pal.bg).stroke(Stroke::new(1.0, pal.border)).corner_radius(24).inner_margin(egui::Margin::symmetric(18, 10)).shadow(egui::epaint::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(36) }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(RichText::new(trf!("{n} selected", n = self.selected.len())).font(ui_b(14.0)).color(pal.fg));
+                    ui.add_space(8.0);
+                    if text_button(ui, tr("Select all"), false).clicked() {
+                        self.selected.extend(self.last_drawn.iter().cloned());
+                    }
+                    if text_button(ui, tr("Remove from library"), false).on_hover_text(tr("Hide from the library; the files stay on disk")).clicked() {
+                        self.remove_selected();
+                    }
+                    if text_button(ui, tr("Delete files…"), false).clicked() {
+                        self.confirm_delete = Some(self.selected.iter().cloned().collect());
+                    }
+                    if text_button(ui, tr("Clear"), false).on_hover_text("Esc").clicked() {
+                        self.selected.clear();
+                    }
+                });
+            });
+        });
     }
 
     // ---------- marginalia ----------
@@ -2475,30 +2661,45 @@ impl App {
                 self.error = None;
             }
         }
-        if let Some(id) = self.confirm_delete.clone() {
-            let e = self.index.entries.iter().find(|e| e.id == id).cloned();
-            let mut keep = true;
-            egui::Window::new(tr("Delete file?")).id(egui::Id::new("win-delete")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-                if let Some(e) = &e {
-                    ui.label(trf!("“{title}” will be permanently deleted from disk:", title = e.title));
-                    ui.label(RichText::new(&e.path).font(mono(10.5)).color(pal.muted));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(RichText::new(tr("DELETE")).font(mono_m(11.5)).color(PAPER)).fill(ACCENT)).clicked() {
+        if let Some(ids) = self.confirm_delete.clone() {
+            let books: Vec<Entry> = self.index.entries.iter().filter(|e| ids.contains(&e.id)).cloned().collect();
+            let mut keep = !books.is_empty();
+            let title = if books.len() == 1 { tr("Delete file?").to_string() } else { trf!("Delete {n} files?", n = books.len()) };
+            egui::Window::new(title).id(egui::Id::new("win-delete")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                if books.len() == 1 {
+                    ui.label(trf!("“{title}” will be permanently deleted from disk:", title = books[0].title));
+                    ui.add(egui::Label::new(RichText::new(&books[0].path).font(mono(10.5)).color(pal.muted)).wrap());
+                } else {
+                    ui.label(trf!("{n} books will be permanently deleted from disk:", n = books.len()));
+                    ui.add_space(4.0);
+                    for e in books.iter().take(6) {
+                        ui.add(egui::Label::new(RichText::new(format!("· {}", e.title)).color(pal.muted)).truncate());
+                    }
+                    if books.len() > 6 {
+                        ui.label(RichText::new(trf!("and {n} more", n = books.len() - 6)).color(pal.muted));
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new(tr("DELETE")).font(mono_m(11.5)).color(PAPER)).fill(ACCENT)).clicked() {
+                        for e in &books {
                             let _ = std::fs::remove_file(&e.path);
                             let _ = std::fs::remove_file(library::cover_path(&e.id));
-                            self.index.entries.retain(|x| x.id != e.id);
                             self.settings.extra_files.retain(|f| f != &e.path);
-                            self.index.save();
-                            keep = false;
+                            self.selected.remove(&e.id);
                         }
-                        if text_button(ui, tr("Cancel"), false).clicked() {
-                            keep = false;
-                        }
-                    });
-                } else {
-                    keep = false;
-                }
+                        self.index.entries.retain(|x| !ids.contains(&x.id));
+                        self.index.save();
+                        self.settings.save();
+                        self.refresh_dups();
+                        self.refresh_overview();
+                        keep = false;
+                    }
+                    if text_button(ui, tr("Cancel"), false).clicked() {
+                        keep = false;
+                    }
+                });
             });
             if !keep {
                 self.confirm_delete = None;
@@ -2769,6 +2970,15 @@ impl App {
         }
         let _ = pal;
     }
+}
+
+/// Selected cover: accent outline and a check badge.
+fn paint_selected(painter: &egui::Painter, cover: Rect) {
+    painter.rect_stroke(cover.expand(3.0), CornerRadius::same(4), Stroke::new(3.0, ACCENT), egui::StrokeKind::Outside);
+    let c = cover.left_top() + vec2(16.0, 16.0);
+    painter.circle_filled(c, 11.0, ACCENT);
+    painter.line_segment([c + vec2(-5.0, 0.0), c + vec2(-1.5, 3.5)], Stroke::new(2.0, PAPER));
+    painter.line_segment([c + vec2(-1.5, 3.5), c + vec2(5.0, -3.5)], Stroke::new(2.0, PAPER));
 }
 
 fn view_match(v: View, e: &Entry) -> bool {

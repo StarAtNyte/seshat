@@ -519,5 +519,17 @@
  "This term has several meanings. Open in browser to choose one.": "この語には複数の意味があります。ブラウザで開いて選んでください。",
  "Add a shortcut": "ショートカットを追加",
  "Click a key to remove it; + adds another.": "キーをクリックで削除、+ で追加します。",
- "Covers turn like a hardcover; pages curl over the spine.": "表紙はハードカバーのように開き、ページは背でめくれます。"
+ "Covers turn like a hardcover; pages curl over the spine.": "表紙はハードカバーのように開き、ページは背でめくれます。",
+ "Select": "選択",
+ "{n} selected": "{n} 件選択中",
+ "Remove {n} from library": "ライブラリから {n} 件を削除",
+ "Delete {n} files…": "{n} 件のファイルを削除…",
+ "Clear selection": "選択を解除",
+ "Select all": "すべて選択",
+ "Hide from the library; the files stay on disk": "ライブラリから非表示にします。ファイルはディスクに残ります",
+ "Delete files…": "ファイルを削除…",
+ "Clear": "解除",
+ "Delete {n} files?": "{n} 件のファイルを削除しますか？",
+ "{n} books will be permanently deleted from disk:": "{n} 冊の本がディスクから完全に削除されます：",
+ "and {n} more": "ほか {n} 件"
 }
