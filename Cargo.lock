@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "seshat"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "chardetng",
  "dirs",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "seshat-voice"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bzip2 0.6.1",
  "rodio",
