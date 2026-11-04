@@ -180,6 +180,8 @@ pub struct Reader {
     cover_anim: Option<(Instant, bool, Cover)>,
     /// Where the book was when it was closed at the back (a jump elsewhere reopens it).
     back_at: Option<Loc>,
+    /// The cover picture inside the text (section, block), found once.
+    cover_block: std::cell::OnceCell<Option<(usize, usize)>>,
     turn: Option<Turn>,
     motion: u8,
     motion_hint: bool,
@@ -286,6 +288,7 @@ impl Reader {
             cover: Cover::Open,
             cover_anim: None,
             back_at: None,
+            cover_block: Default::default(),
             turn: None,
             motion: 0,
             motion_hint: false,

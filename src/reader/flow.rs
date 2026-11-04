@@ -173,13 +173,25 @@ impl Reader {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let paged = s.layout == Layout::Paginated || self.book.meta.vertical;
         // a spread opens on the right page, facing the blank inside of the cover
-        let lead = paged && si == 0 && g.cols == 2 && !self.book.meta.vertical;
+        let lead = paged && si == self.start_sec() && g.cols == 2 && !self.book.meta.vertical;
         (si, typo.key(), known, paged, lead).hash(&mut h);
         let key = h.finish();
         if self.layout.as_ref().is_some_and(|l| l.key == key) {
             return;
         }
         let tex = &self.tex;
+        // the cover picture at the top of the text: the hardcover already shows it
+        let trimmed;
+        let sec = match self.cover_block() {
+            Some((cs, cb)) if cs == si => {
+                let mut t = sec.clone();
+                t.blocks[cb].kind = BlockKind::Para;
+                t.blocks[cb].spans.clear();
+                trimmed = t;
+                &trimmed
+            }
+            _ => sec,
+        };
         let mut lay = SectionLayout::build(ctx, si, sec, &typo, &|k| tex.get(k).map(|l| l.size), key);
         if lead {
             lay.pages.insert(0, super::layout::Page { u0: 0, u1: 0, top: 0.0, bottom: 0.0 });
@@ -208,6 +220,32 @@ impl Reader {
             }
         }
         self.layout = Some(lay);
+    }
+
+    /// Where reading starts. An opening section that holds nothing but the
+    /// cover picture is skipped: the hardcover already shows it.
+    pub(super) fn start_sec(&self) -> usize {
+        let Some(f) = self.book.flow() else { return 0 };
+        let Some(first) = f.sections.first() else { return 0 };
+        let only_pictures = first.blocks.iter().all(|b| matches!(b.kind, BlockKind::Image(_)) || b.text().trim().is_empty());
+        usize::from(f.sections.len() > 1 && self.cover_block().is_some() && only_pictures)
+    }
+
+    /// The book's own cover picture at the top of the first section, if it is
+    /// there: the same image as the cover, or the opening picture of a section
+    /// called "Cover".
+    pub(super) fn cover_block(&self) -> Option<(usize, usize)> {
+        *self.cover_block.get_or_init(|| {
+            let f = self.book.flow()?;
+            let sec = f.sections.first()?;
+            let (bi, key) = sec.blocks.iter().enumerate().take(6).find_map(|(i, b)| match &b.kind {
+                BlockKind::Image(k) => Some(Some((i, k))),
+                _ if b.text().trim().is_empty() => None,
+                _ => Some(None),
+            })??;
+            let same = self.book.meta.cover.as_ref().is_some_and(|c| f.resources.get(key).and_then(|r| r.load()).is_some_and(|b| &b == c));
+            (same || sec.title.trim().eq_ignore_ascii_case("cover")).then_some((0, bi))
+        })
     }
 
     pub(super) fn next_page(&mut self) {
@@ -266,7 +304,7 @@ impl Reader {
         let Some(l) = &self.layout else { return };
         let scrolled = self.data.settings.as_ref().map(|s| s.layout).unwrap_or(self.last_layout) == Layout::Scrolled && !self.book.meta.vertical;
         // before the first page: the front cover closes
-        if l.section == 0 && self.book.flow().is_some() && if scrolled { self.scroll_y <= 1.0 } else { self.page < self.step.max(1) } {
+        if l.section <= self.start_sec() && self.book.flow().is_some() && if scrolled { self.scroll_y <= 1.0 } else { self.page < self.step.max(1) } {
             return self.set_cover(Cover::Front, Cover::Front);
         }
         if scrolled {
@@ -428,6 +466,11 @@ impl Reader {
         let rtl = self.book.meta.rtl;
         let g = self.geometry(rect, s);
         self.view_h = g.page_h;
+        // the cover-picture section is part of the cover: reading starts after it
+        let start = Loc::new(self.start_sec(), 0, 0);
+        if self.loc.section < start.section {
+            self.loc = start;
+        }
         self.ensure_layout(ui.ctx(), s, pal, env, &g);
         self.motion = s.motion;
         if self.opened_at.is_none() {
@@ -435,7 +478,7 @@ impl Reader {
             // no opening animation: a book at its very start rests on its closed
             // front cover until the first page turn; anywhere else opens as is
             self.opened_at = Some(Instant::now());
-            if self.loc == Loc::new(0, 0, 0) {
+            if self.loc == start {
                 self.cover = Cover::Front;
             }
             // debug aid: ZR_SIDE=toc|notes|marks|find|notebook|settings opens a panel for captures
@@ -460,7 +503,7 @@ impl Reader {
             }
         }
         // a jump elsewhere (contents, search, progress) opens a closed book
-        if (self.cover == Cover::Front && self.loc != Loc::new(0, 0, 0)) || (self.cover == Cover::Back && self.back_at != Some(self.loc)) {
+        if (self.cover == Cover::Front && self.loc != start) || (self.cover == Cover::Back && self.back_at != Some(self.loc)) {
             self.cover = Cover::Open;
             self.cover_anim = None;
         }
@@ -676,7 +719,7 @@ impl Reader {
             for (col, (old, pi)) in base.into_iter().enumerate() {
                 let lay = if old { self.prev_layout.as_ref().unwrap_or(l) } else { l };
                 let no_decos: Vec<Deco> = Vec::new();
-                if let Some(pg) = lay.pages.get(pi) {
+                if let Some(pg) = lay.pages.get(pi).filter(|p| p.u1 > p.u0) {
                     lay.paint(&text_painter, g.origin(col), pg.top, pg.bottom, &texfn, if old { &no_decos } else { &decos }, pal.fg, dim);
                 }
             }
@@ -944,7 +987,7 @@ impl Reader {
     fn page_meshes(&self, ctx: &egui::Context, from_prev: bool, page: usize, origin: Pos2, fg: Color32, dim: bool) -> Vec<egui::Mesh> {
         let l = if from_prev { self.prev_layout.as_ref().or(self.layout.as_ref()) } else { self.layout.as_ref() };
         let Some(l) = l else { return Vec::new() };
-        let Some(pg) = l.pages.get(page) else { return Vec::new() };
+        let Some(pg) = l.pages.get(page).filter(|p| p.u1 > p.u0) else { return Vec::new() };
         let (top, bottom) = (pg.top, pg.bottom);
         let clip = Rect::from_min_max(pos2(origin.x - 40.0, origin.y - 1.0), pos2(origin.x + l.width + 40.0, origin.y + (bottom - top) + 1.0));
         let mut shapes = Vec::new();

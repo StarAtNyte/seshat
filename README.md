@@ -9,6 +9,10 @@
   Named after the Egyptian goddess of writing, called the "Mistress of the House of Books".
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/cover-open.gif" width="820" alt="A book opening: the hardcover swings open onto a two-page spread">
+</p>
+
 ---
 
 Seshat is an ebook reader first. It is built around one idea: opening a book
@@ -17,14 +21,36 @@ a spreadsheet. Each book opens in its own window as a two-page spread, pages
 turn with a real (and optional) paper flip, and everything else stays out of
 the way until you reach for it.
 
-It is a single native binary of about 20 MB, with no browser engine and no
-Electron. It starts in well under a second and turns pages instantly, even in
+It is a single native binary of about 25 MB (an 8 MB download), with no
+browser engine and no Electron. It starts in well under a second and turns pages instantly, even in
 very long books.
 
 If you also use Z-Library, there is an optional add-on that lets you search for
 books and pull them straight onto your shelves. It is off to the side: Seshat
 is not a Z-Library client with a reader attached, it is a reader that can talk
 to Z-Library if you want it to.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/library.png" width="820" alt="The library: covers on an index grid, with filters, shelves and reading statistics">
+  <br><em>The library</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/spread.png" width="820" alt="A two-page spread with running heads and page numbers">
+  <br><em>A two-page spread</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/dark.png" width="820" alt="Dark theme with the contents sidebar open">
+  <br><em>Dark theme, with the contents sidebar</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/settings.png" width="820" alt="Sepia theme with the reading settings drawer open">
+  <br><em>Sepia theme, with the reading settings</em>
+</p>
 
 ## Download
 
