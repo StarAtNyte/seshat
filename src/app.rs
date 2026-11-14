@@ -1193,12 +1193,15 @@ impl eframe::App for App {
         }
         match self.view {
             View::Source => {
-                if let Some(p) = self.online.ui(ctx, &mut self.settings, &pal) {
+                if let Some(p) = self.online.ui(ctx, &mut self.settings, &pal).or_else(|| self.online.open_request.take()) {
                     self.open_path(&p);
                 }
             }
             _ => {
                 self.online.side_details(ctx, &mut self.settings, &pal);
+                if let Some(p) = self.online.open_request.take() {
+                    self.open_path(&p);
+                }
                 let show_right = self.settings.right_panel && ctx.screen_rect().width() > 1280.0 && matches!(self.view, View::All | View::Reading) && !self.index.entries.is_empty();
                 if show_right {
                     self.right_column(ctx, &pal);

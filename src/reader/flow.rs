@@ -197,6 +197,12 @@ impl Reader {
             lay.pages.insert(0, super::layout::Page { u0: 0, u1: 0, top: 0.0, bottom: 0.0 });
         }
         self.step = g.cols;
+        // characters per page, for book-wide page numbers; short sections
+        // (title pages, a chapter's last page) say little, so prefer long ones
+        let content_pages = lay.pages.len() - usize::from(lead);
+        if content_pages > 0 && (content_pages >= 3 || self.cpp == 0.0) {
+            self.cpp = (sec.chars as f32 / content_pages as f32).max(50.0);
+        }
         if self.go_end {
             self.go_end = false;
             let last = lay.pages.len().saturating_sub(1);
@@ -643,17 +649,11 @@ impl Reader {
                 }
             } else if paginated {
                 if s.wheel_turns_page {
-                    self.wheel_acc += raw.y + raw.x;
-                    if self.last_turn.elapsed() > Duration::from_millis(180) {
-                        if self.wheel_acc <= -40.0 {
-                            self.wheel_acc = 0.0;
-                            self.next_page();
-                        } else if self.wheel_acc >= 40.0 {
-                            self.wheel_acc = 0.0;
-                            self.prev_page();
-                        }
-                    } else {
-                        self.wheel_acc = 0.0;
+                    let (lines, points) = Self::wheel_input(ui.ctx());
+                    match self.wheel_turn(lines, points) {
+                        1 => self.next_page(),
+                        -1 => self.prev_page(),
+                        _ => {}
                     }
                 }
             } else if smooth.y != 0.0 {

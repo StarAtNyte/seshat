@@ -40,6 +40,8 @@ pub struct Hit {
 pub enum Msg {
     Search { gen: u64, hits: Vec<Hit>, done: bool },
     PdfTexts(Arc<Vec<String>>),
+    /// Character boxes of PDF pages, for selection and highlights.
+    PdfGlyphs(Vec<(usize, Arc<crate::book::pdf::PageText>)>),
     PdfAspects(Vec<f32>),
     /// Detected content box (l, t, r, b as page fractions) per page.
     Crops(Vec<Option<[f32; 4]>>),
@@ -110,6 +112,9 @@ pub struct Reader {
     go_end: bool,
     history: Vec<Loc>,
     wheel_acc: f32,
+    /// Last wheel event, and whether the current gesture may still turn a page.
+    wheel_last: Instant,
+    wheel_armed: bool,
     last_turn: Instant,
     step: usize,
     view_h: f32,
@@ -132,6 +137,8 @@ pub struct Reader {
     sec_chars: Option<SecChars>,
     /// TOC entry fractions (flow books), computed once
     toc_fracs: Vec<f32>,
+    /// Characters per page in the current layout (flow books), for book-wide page numbers.
+    cpp: f32,
     sel: Option<(Pt, Pt)>,
     sel_popup: Option<Pos2>,
     hl_popup: Option<(u64, Pos2)>,
@@ -239,6 +246,8 @@ impl Reader {
             go_end: false,
             history: Vec::new(),
             wheel_acc: 0.0,
+            wheel_last: Instant::now(),
+            wheel_armed: true,
             last_turn: Instant::now(),
             step: 1,
             view_h: 600.0,
@@ -255,6 +264,7 @@ impl Reader {
             pending_tap: None,
             sec_chars: None,
             toc_fracs: Vec::new(),
+            cpp: 0.0,
             sel: None,
             sel_popup: None,
             hl_popup: None,
@@ -384,6 +394,90 @@ impl Reader {
         &self.toc_fracs
     }
 
+    /// Book-wide page count for flowing text, estimated from how many
+    /// characters fit a page in the current layout.
+    pub(super) fn total_pages(&self) -> Option<usize> {
+        match &self.book.content {
+            Content::Flow(f) if self.cpp > 0.0 => Some(((f.total_chars() as f32 / self.cpp).ceil() as usize).max(1)),
+            Content::Flow(_) => None,
+            Content::Fixed(f) => Some(f.pages),
+        }
+    }
+
+    /// 1-based page at a fraction of the book.
+    pub(super) fn page_at(&self, frac: f32) -> Option<usize> {
+        let n = self.total_pages()?;
+        Some(((frac.clamp(0.0, 1.0) * n as f32) as usize + 1).min(n))
+    }
+
+    /// (current page, total pages) for the reader's position.
+    pub(super) fn page_pos(&self) -> Option<(usize, usize)> {
+        match &self.book.content {
+            Content::Fixed(f) => Some((self.fx.page + 1, f.pages)),
+            Content::Flow(_) => Some((self.page_at(self.fraction())?, self.total_pages()?)),
+        }
+    }
+
+    /// This frame's wheel input as (mouse-wheel notches in points, trackpad points).
+    pub(super) fn wheel_input(ctx: &egui::Context) -> (f32, f32) {
+        ctx.input(|i| {
+            i.events.iter().fold((0.0, 0.0), |(l, p), e| match e {
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. } => (l, p + delta.y + delta.x),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, .. } => (l + (delta.y + delta.x) * 40.0, p),
+                egui::Event::MouseWheel { delta, .. } => (l + (delta.y + delta.x) * 400.0, p),
+                _ => (l, p),
+            })
+        })
+    }
+
+    /// Page turns from the wheel, at most one per gesture: a trackpad swipe
+    /// (and its inertia) or a free-spinning wheel keeps sending events long
+    /// after the turn, which used to flip several pages at once. A new turn
+    /// needs the wheel to rest briefly, or for a notched wheel, a deliberate
+    /// pause since the last turn. Returns 1 forward, -1 back, 0 nothing.
+    pub(super) fn wheel_turn(&mut self, lines: f32, points: f32) -> i8 {
+        let delta = lines + points;
+        if delta == 0.0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let quiet = now.duration_since(self.wheel_last) > Duration::from_millis(200);
+        let notch_again = lines != 0.0 && self.last_turn.elapsed() > Duration::from_millis(350);
+        self.wheel_last = now;
+        if quiet || notch_again {
+            if !self.wheel_armed || quiet {
+                self.wheel_acc = 0.0;
+            }
+            self.wheel_armed = true;
+        }
+        if !self.wheel_armed {
+            return 0;
+        }
+        self.wheel_acc += delta;
+        if self.wheel_acc.abs() >= 40.0 {
+            let dir = if self.wheel_acc < 0.0 { 1 } else { -1 };
+            self.wheel_acc = 0.0;
+            self.wheel_armed = false;
+            return dir;
+        }
+        0
+    }
+
+    /// Wheel movement that scrolled within the page uses up the gesture, so
+    /// reaching the bottom edge doesn't also turn the page.
+    pub(super) fn wheel_spent(&mut self, lines: f32, points: f32) {
+        if lines + points != 0.0 {
+            self.wheel_last = Instant::now();
+            self.wheel_armed = false;
+            self.wheel_acc = 0.0;
+        }
+    }
+
+    /// Text can be selected and highlighted: flowing books and PDFs.
+    pub(super) fn selectable(&self) -> bool {
+        self.book.flow().is_some() || self.book.fixed().is_some_and(|f| matches!(f.kind, crate::book::FixedKind::Pdf))
+    }
+
     fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -457,6 +551,12 @@ impl Reader {
                     self.fx.texts_loading = false;
                 }
                 Msg::Crops(c) => self.fx.set_crops(c),
+                Msg::PdfGlyphs(v) => {
+                    for (p, g) in v {
+                        self.fx.glyphs_pending.remove(&p);
+                        self.fx.glyphs.insert(p, g);
+                    }
+                }
                 Msg::PdfAspects(a) => {
                     if !a.is_empty() {
                         self.fx.aspects = a;
@@ -557,6 +657,13 @@ impl Reader {
 
     fn selection_text(&self) -> Option<String> {
         let ((b0, c0), (b1, c1)) = self.sel?;
+        if self.book.fixed().is_some() {
+            // PDF: (page, char) points, one page at a time
+            let g = self.fx.glyphs.get(&b0)?;
+            let end = if b1 == b0 { c1 } else { g.chars.len() };
+            let t: String = g.chars.get(c0.min(end)..end.min(g.chars.len()))?.iter().collect();
+            return Some(t.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
         let flow = self.book.flow()?;
         let sec = flow.sections.get(self.loc.section)?;
         let mut out = String::new();
@@ -626,8 +733,9 @@ impl Reader {
         let Some(((b0, c0), (b1, c1))) = self.sel else { return };
         let text = self.selection_text().unwrap_or_default();
         let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64).max(self.data.annotations.iter().map(|a| a.id + 1).max().unwrap_or(1));
-        let start = Loc::new(self.loc.section, b0, c0);
-        let a = Annotation { id, start, end: Loc::new(self.loc.section, b1, c1), color, style: HlStyle::Highlight, note: String::new(), text, chapter: self.chapter_title(start), created: store::now() };
+        // PDF points are (page, char); flow points are (block, char) in the current section
+        let (start, end) = if self.book.fixed().is_some() { (Loc::new(b0, 0, c0), Loc::new(b1, 0, c1)) } else { (Loc::new(self.loc.section, b0, c0), Loc::new(self.loc.section, b1, c1)) };
+        let a = Annotation { id, start, end, color, style: HlStyle::Highlight, note: String::new(), text, chapter: self.chapter_title(start), created: store::now() };
         self.data.annotations.push(a);
         self.data.annotations.sort_by_key(|a| a.start);
         if with_note {
@@ -1005,7 +1113,7 @@ impl Reader {
                 A::Notebook => self.notebook = !self.notebook,
                 A::Settings => self.settings_open = !self.settings_open,
                 A::Fullscreen => self.toggle_fullscreen(ctx),
-                A::Highlighter if self.book.flow().is_some() => {
+                A::Highlighter if self.selectable() => {
                     self.hl_mode = if self.hl_mode.is_some() { None } else { Some(HlColor::Yellow) };
                 }
                 A::Highlighter => {}
@@ -1151,6 +1259,9 @@ impl Reader {
                 let left = self.chars_after(self.loc) as f32 / cpm.max(100.0);
                 if left >= 1.0 {
                     s.push_str(&format!(" · {}", trf!("{n} min left", n = left.round())));
+                }
+                if let Some((n, total)) = self.page_pos() {
+                    s = format!("{} · {s}", trf!("Page {n} of {total}", n = n, total = total));
                 }
                 format!("{s} · {pct}%")
             }
@@ -1317,7 +1428,11 @@ impl Reader {
                             }
                         }
                         ui.add_space(6.0);
+                        let flow = self.book.flow().is_some();
                         for (k, label) in [("note", tr("Note")), ("copy", tr("Copy")), ("dict", tr("Define")), ("wiki", tr("Wiki")), ("translate", tr("Translate")), ("speak", tr("Listen")), ("search", tr("Find"))] {
+                            if k == "speak" && !flow {
+                                continue;
+                            }
                             if ui::text_button(ui, label, false).clicked() {
                                 act = Some(k);
                             }

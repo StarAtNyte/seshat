@@ -18,9 +18,9 @@ enum Msg {
     ConfirmDone(Result<api::Session, String>),
     ResendDone(Result<(), String>),
     SearchDone(Result<api::SearchPage, String>),
-    DetailsDone(Result<api::Book, String>),
-    DlProgress(u64, Option<u64>),
-    DlDone(Result<(String, PathBuf), String>),
+    DetailsDone(String, Result<api::Book, String>),
+    DlProgress(String, u64, Option<u64>),
+    DlDone(String, Result<(String, PathBuf), String>),
     Quiet(u64, Result<api::SearchPage, String>),
     CoverFetched(String, bool),
     Quota(Result<(u32, u32), String>),
@@ -37,6 +37,15 @@ enum Screen {
     Connecting,
     Login,
     Search,
+}
+
+#[derive(Clone)]
+struct Dl {
+    id: String,
+    title: String,
+    written: u64,
+    total: Option<u64>,
+    started: std::time::Instant,
 }
 
 pub struct Online {
@@ -70,7 +79,12 @@ pub struct Online {
     selected: Option<api::Book>,
     details: Option<Result<api::Book, String>>,
     fetching_details: bool,
-    active_dl: Option<(String, u64, Option<u64>)>,
+    /// Downloads in flight, one per book.
+    downloads: Vec<Dl>,
+    /// Books downloaded this session (id → file), offered as "Read".
+    got: std::collections::HashMap<String, PathBuf>,
+    /// A downloaded book the user asked to read, for the app to open.
+    pub open_request: Option<PathBuf>,
     dl_error: String,
     /// Finished downloads (title, path) for the app to pick up.
     pub downloaded: Vec<(String, PathBuf)>,
@@ -81,8 +95,6 @@ pub struct Online {
     quota: Option<(u32, u32)>,
     refresh_quota_after: bool,
     quota_asked: bool,
-    dl_started: std::time::Instant,
-    dl_book: Option<String>,
     quiet_q: String,
     quiet_sent: String,
     quiet_changed: std::time::Instant,
@@ -125,7 +137,9 @@ impl Online {
             selected: None,
             details: None,
             fetching_details: false,
-            active_dl: None,
+            downloads: Vec::new(),
+            got: Default::default(),
+            open_request: None,
             dl_error: String::new(),
             downloaded: Vec::new(),
             covers_updated: Vec::new(),
@@ -134,8 +148,6 @@ impl Online {
             quota: None,
             refresh_quota_after: false,
             quota_asked: false,
-            dl_started: std::time::Instant::now(),
-            dl_book: None,
             quiet_q: String::new(),
             quiet_sent: String::new(),
             quiet_changed: std::time::Instant::now(),
@@ -146,7 +158,7 @@ impl Online {
     }
 
     pub fn is_downloading(&self) -> bool {
-        self.active_dl.is_some()
+        !self.downloads.is_empty()
     }
 
     fn spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
@@ -266,14 +278,17 @@ impl Online {
                         Err(e) => self.search_error = e,
                     }
                 }
-                Msg::DetailsDone(r) => {
-                    self.fetching_details = false;
-                    self.details = Some(r);
+                Msg::DetailsDone(id, r) => {
+                    // a reply for a book that is no longer selected is stale
+                    if self.selected.as_ref().is_some_and(|b| b.id == id) {
+                        self.fetching_details = false;
+                        self.details = Some(r);
+                    }
                 }
-                Msg::DlProgress(w, t) => {
-                    if let Some(d) = self.active_dl.as_mut() {
-                        d.1 = w;
-                        d.2 = t;
+                Msg::DlProgress(id, w, t) => {
+                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                        d.written = w;
+                        d.total = t;
                     }
                 }
                 Msg::Quota(r) => self.quota = r.ok(),
@@ -290,11 +305,12 @@ impl Online {
                         self.quiet = Some(r.map(|p| p.books));
                     }
                 }
-                Msg::DlDone(r) => {
-                    self.active_dl = None;
+                Msg::DlDone(id, r) => {
+                    self.downloads.retain(|d| d.id != id);
                     match r {
                         Ok((title, p)) => {
                             self.dl_error.clear();
+                            self.got.insert(id, p.clone());
                             self.downloaded.push((title.clone(), p.clone()));
                             self.recent.insert(0, (title, p));
                             self.refresh_quota_after = true;
@@ -344,30 +360,31 @@ impl Online {
         self.details = None;
         let proxy = app.proxy_opt();
         let (id, hash) = (book.id.clone(), book.hash.clone());
-        self.spawn(move || Msg::DetailsDone(api::book_details(&sess, &proxy, &id, &hash)));
+        self.spawn(move || Msg::DetailsDone(id.clone(), api::book_details(&sess, &proxy, &id, &hash)));
     }
 
     fn do_download(&mut self, book: api::Book, app: &AppSettings) {
-        if self.active_dl.is_some() {
+        if self.dl_of(&book.id).is_some() {
             return;
         }
         let Some(sess) = self.session.clone() else { return };
         self.dl_error.clear();
-        self.dl_started = std::time::Instant::now();
         let proxy = app.proxy_opt();
         let dest = PathBuf::from(&app.download_dir);
         let title = book.title.clone();
-        self.active_dl = Some((title.clone(), 0, None));
+        let id = book.id.clone();
+        self.downloads.push(Dl { id: id.clone(), title: title.clone(), written: 0, total: None, started: std::time::Instant::now() });
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let ctx2 = ctx.clone();
             let mut last = std::time::Instant::now();
+            let id2 = id.clone();
             let res = api::download_book(&sess, &proxy, &book, &dest, move |w, t| {
                 if last.elapsed().as_millis() > 100 {
                     last = std::time::Instant::now();
-                    let _ = tx2.send(Msg::DlProgress(w, t));
+                    let _ = tx2.send(Msg::DlProgress(id2.clone(), w, t));
                     ctx2.request_repaint();
                 }
             });
@@ -375,9 +392,13 @@ impl Online {
                 // carry the catalogue's cover and metadata over to the library
                 attach_catalogue_data(p, &book, &proxy);
             }
-            let _ = tx.send(Msg::DlDone(res.map(|p| (title, p))));
+            let _ = tx.send(Msg::DlDone(id, res.map(|p| (title, p))));
             ctx.request_repaint();
         });
+    }
+
+    fn dl_of(&self, id: &str) -> Option<&Dl> {
+        self.downloads.iter().find(|d| d.id == id)
     }
 
     /// Look a local book up in the catalogue and adopt its cover.
@@ -573,13 +594,16 @@ impl Online {
                 })
                 .response
         };
-        if let Some((t, w, total)) = self.active_dl.clone() {
+        if !self.downloads.is_empty() {
             heading(ui, tr("Downloading"), ui::ACCENT);
-            card(ui, pal.panel, &mut |ui| {
-                ui.add(egui::Label::new(RichText::new(&t).font(ui::ui_m(13.5)).color(pal.fg)).truncate());
-                ui.add_space(2.0);
-                self.progress_bar(ui, pal, w, total);
-            });
+            for d in self.downloads.clone() {
+                card(ui, pal.panel, &mut |ui| {
+                    ui.add(egui::Label::new(RichText::new(&d.title).font(ui::ui_m(13.5)).color(pal.fg)).truncate());
+                    ui.add_space(2.0);
+                    self.progress_bar(ui, pal, &d);
+                });
+                ui.add_space(4.0);
+            }
         }
         if !self.dl_error.is_empty() {
             ui.add_space(8.0);
@@ -605,15 +629,16 @@ impl Online {
         open
     }
 
-    fn progress_bar(&self, ui: &mut egui::Ui, pal: &Palette, w: u64, total: Option<u64>) {
+    fn progress_bar(&self, ui: &mut egui::Ui, pal: &Palette, d: &Dl) {
+        let (w, total) = (d.written, d.total);
         let frac = total.map(|t| w as f32 / t.max(1) as f32).unwrap_or(0.0).clamp(0.0, 1.0);
         let r = ui.available_rect_before_wrap();
         let bar = egui::Rect::from_min_size(r.min + vec2(0.0, 2.0), vec2(r.width(), 6.0));
         ui.painter().rect_filled(bar, CornerRadius::same(3), pal.border);
-        let shown = ui.ctx().animate_value_with_time(egui::Id::new("dl-frac"), frac, 0.25);
+        let shown = ui.ctx().animate_value_with_time(egui::Id::new(("dl-frac", &d.id)), frac, 0.25);
         ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * shown, 6.0)), CornerRadius::same(3), ui::ACCENT);
         ui.add_space(12.0);
-        let secs = self.dl_started.elapsed().as_secs_f64().max(0.1);
+        let secs = d.started.elapsed().as_secs_f64().max(0.1);
         let speed = w as f64 / secs / 1_048_576.0;
         let size = match total {
             Some(t) => format!("{:.1} of {:.1} MB · {:.0}%", w as f64 / 1_048_576.0, t as f64 / 1_048_576.0, frac * 100.0),
@@ -839,7 +864,6 @@ impl Online {
         let proxy = app.proxy_opt();
         let mut clicked = None;
         let mut get: Option<api::Book> = None;
-        let downloading = self.active_dl.clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             for b in &books {
                 let sel = self.selected.as_ref().is_some_and(|s| s.id == b.id);
@@ -875,9 +899,8 @@ impl Online {
                 let meta = [b.year.as_str(), &b.extension.to_uppercase(), &b.size, &b.language].iter().filter(|s| !s.is_empty() && **s != "0").cloned().collect::<Vec<_>>().join("  ·  ");
                 ui.painter().text(egui::pos2(x, rect.top() + 62.0), egui::Align2::LEFT_TOP, meta, ui::ui_m(11.5), pal.muted);
                 // row actions (or this row's download progress)
-                let is_dl = downloading.as_ref().is_some_and(|d| d.0 == b.title) && self.dl_book.as_deref() == Some(b.id.as_str());
-                if is_dl {
-                    let (_, wr, total) = downloading.clone().unwrap();
+                if let Some(d) = self.dl_of(&b.id) {
+                    let (wr, total) = (d.written, d.total);
                     let frac = total.map(|t| wr as f32 / t.max(1) as f32).unwrap_or(0.0).clamp(0.0, 1.0);
                     let bar = egui::Rect::from_min_size(egui::pos2(rect.right() - actions_w - 4.0, rect.center().y - 3.0), vec2(actions_w - 8.0, 6.0));
                     ui.painter().rect_filled(bar, CornerRadius::same(3), pal.border);
@@ -885,8 +908,10 @@ impl Online {
                     ui.painter().text(egui::pos2(bar.center().x, bar.bottom() + 12.0), egui::Align2::CENTER_CENTER, format!("{:.0}%", frac * 100.0), ui::ui_m(11.0), pal.muted);
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
                 } else {
-                    let online = !b.read_online_url.is_empty();
-                    for (i, (icon, tip, read)) in [(ui::Icon::Download, tr("Add to library (uses one download from today's quota)"), false), (ui::Icon::Book, if online { tr("Read online in your browser (no download, no quota)") } else { tr("Not available to read online") }, true)].into_iter().enumerate() {
+                    let have = self.got.get(&b.id).cloned();
+                    let online = !b.read_online_url.is_empty() && have.is_none();
+                    let first = if have.is_some() { (ui::Icon::Book, tr("Read — already in your library"), false) } else { (ui::Icon::Download, tr("Add to library (uses one download from today's quota)"), false) };
+                    for (i, (icon, tip, read)) in [first, (ui::Icon::Book, if online { tr("Read online in your browser (no download, no quota)") } else { tr("Not available to read online") }, true)].into_iter().enumerate() {
                         if read && !online {
                             continue;
                         }
@@ -900,7 +925,9 @@ impl Online {
                         if bresp.on_hover_text(tip).clicked() {
                             if read {
                                 crate::platform::open_url(&b.read_online_url);
-                            } else if downloading.is_none() {
+                            } else if let Some(p) = &have {
+                                self.open_request = Some(p.clone());
+                            } else {
                                 get = Some(b.clone());
                             }
                         }
@@ -922,7 +949,6 @@ impl Online {
             });
         });
         if let Some(b) = get {
-            self.dl_book = Some(b.id.clone());
             self.do_download(b, app);
         }
         if let Some(b) = clicked {
@@ -974,8 +1000,12 @@ impl Online {
                 Some(Ok(d)) => {
                     let d = d.clone();
                     self.quota_ui(ui, pal);
-                    if let Some((_, w, total)) = self.active_dl.clone() {
-                        self.progress_bar(ui, pal, w, total);
+                    if let Some(dl) = self.dl_of(&book.id).cloned() {
+                        self.progress_bar(ui, pal, &dl);
+                    } else if let Some(p) = self.got.get(&book.id).cloned() {
+                        if ui::primary_button(ui, tr("Read")).clicked() {
+                            self.open_request = Some(p);
+                        }
                     } else {
                         ui.horizontal(|ui| {
                             if ui::primary_button(ui, tr("Add to library")).clicked() {

@@ -239,7 +239,10 @@ fn toc(r: &mut Reader, ui: &mut egui::Ui, pal: &Palette) {
             let indent = 10.0 + e.depth.min(4) as f32 * 16.0;
             let font = ui::ui_m(if e.depth == 0 { 14.0 } else { 13.5 });
             let color = if active { ACCENT } else if e.depth == 0 { pal.fg } else { pal.muted.lerp_to_gamma(pal.fg, 0.45) };
-            let right = if let (Content::Flow(_), Some(fr)) = (&book.content, fracs.get(i)) { format!("{}%", (fr * 100.0).round()) } else { format!("{}", e.loc.section + 1) };
+            let right = match (&book.content, fracs.get(i)) {
+                (Content::Flow(_), Some(fr)) => r.page_at(*fr).map(|p| p.to_string()).unwrap_or_else(|| format!("{}%", (fr * 100.0).round())),
+                _ => format!("{}", e.loc.section + 1),
+            };
             let rw = 44.0;
             let title = ui::fit(ui, &crate::book::script::visual(&e.title), font.clone(), w - indent - rw - 10.0);
             ui.painter().text(pos2(rect.left() + indent, rect.center().y), egui::Align2::LEFT_CENTER, title, font, color);

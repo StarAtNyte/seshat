@@ -127,6 +127,9 @@ impl Reader {
                 ui.add_space(6.0);
                 let pct = (self.fraction() * 100.0).round();
                 ui.label(RichText::new(format!("{pct}%")).font(ui_b(14.0)).color(ACCENT));
+                if let Some((n, total)) = self.page_pos() {
+                    ui.label(RichText::new(format!("{n} / {total}")).font(ui::ui_m(12.5)).color(pal.muted)).on_hover_text(tr("Page"));
+                }
                 sep(ui, pal);
                 if ui::icon_toggle(ui, Icon::Fullscreen, tr("Fullscreen (F)"), self.fullscreen).clicked() {
                     self.toggle_fullscreen(ctx);
@@ -335,7 +338,7 @@ impl Reader {
         if ui::icon_toggle(ui, if bm { Icon::BookmarkOn } else { Icon::Bookmark }, tr("Bookmark this page (B)"), bm).clicked() {
             self.toggle_bookmark();
         }
-        if flow {
+        if self.selectable() {
             if let Some(c) = self.hl_mode {
                 for col in store::HL_COLORS.iter().rev() {
                     let [r, g, b] = col.rgb();

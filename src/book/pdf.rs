@@ -202,9 +202,34 @@ fn walk(node: &Dict, depth: usize, page_ids: &[Option<(u32, i32)>], dests: Optio
 
 // ---------- text extraction ----------
 
+/// A page's text with where each character sits, for selection and
+/// highlights. `boxes[i]` is the box of `chars[i]` as page fractions
+/// (l, t, r, b); spaces and line breaks the extractor inserted have none.
+#[derive(Default)]
+pub struct PageText {
+    pub chars: Vec<char>,
+    pub boxes: Vec<Option<[f32; 4]>>,
+}
+
+impl PageText {
+    pub fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+}
+
 struct TextDevice {
-    out: String,
-    last: Option<(f64, f64)>,
+    out: PageText,
+    /// Pen position after the previous glyph and its font size (points).
+    last: Option<(f64, f64, f64)>,
+    page_w: f64,
+    page_h: f64,
+}
+
+impl TextDevice {
+    fn push(&mut self, c: char, b: Option<[f32; 4]>) {
+        self.out.chars.push(c);
+        self.out.boxes.push(b);
+    }
 }
 
 impl<'a> Device<'a> for TextDevice {
@@ -213,28 +238,54 @@ impl<'a> Device<'a> for TextDevice {
     fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
     fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, _: &DrawMode) {
         for g in run.glyphs() {
+            // glyph space is 1/1000 em, so the transform's scale is size / 1000
             let t = props.transform * g.transform();
+            let [_, _, c, d, _, _] = t.as_coeffs();
+            let size = ((c * c + d * d).sqrt() * 1000.0).max(1.0);
             let p = t.translation();
-            if let Some((lx, ly)) = self.last {
-                let size = t.as_coeffs()[3].abs().max(1.0);
+            if let Some((lx, ly, lsize)) = self.last {
+                let em = size.max(lsize);
                 let dy = (p.y - ly).abs();
-                if dy > size * 0.6 {
-                    self.out.push('\n');
+                if dy > em * 0.6 {
+                    self.push('\n', None);
                     // a clearly larger gap marks a paragraph break (used by the reflow view)
-                    if dy > size * 1.9 {
-                        self.out.push('\n');
+                    if dy > em * 1.9 {
+                        self.push('\n', None);
                     }
-                } else if p.x - lx > size * 0.25 && !self.out.ends_with(' ') {
-                    self.out.push(' ');
+                } else if (p.x - lx > em * 0.15 || p.x < lx - em * 2.0) && !self.out.chars.last().is_some_and(|c| c.is_whitespace()) {
+                    self.push(' ', None);
                 }
             }
-            match g.as_unicode() {
-                Some(hayro::hayro_interpret::hayro_cmap::BfString::Char(c)) => self.out.push(c),
-                Some(hayro::hayro_interpret::hayro_cmap::BfString::String(s)) => self.out.push_str(&s),
-                None => {}
+            let adv = match &**g {
+                hayro::hayro_interpret::font::Glyph::Outline(o) => o.advance_width(),
+                hayro::hayro_interpret::font::Glyph::Type3(t3) => t3.advance_width(),
             }
-            let adv = 0.5 * t.as_coeffs()[0].abs();
-            self.last = Some((p.x + adv, p.y));
+            .filter(|w| *w > 0.0)
+            .unwrap_or(500.0) as f64;
+            // corners of the glyph cell (advance × descender..ascender) in page space
+            let pts = [(0.0, -200.0), (adv, -200.0), (0.0, 800.0), (adv, 800.0)].map(|(x, y)| t * hayro::kurbo::Point::new(x, y));
+            let (mut l, mut tp, mut r, mut bt) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for q in pts {
+                l = l.min(q.x);
+                r = r.max(q.x);
+                tp = tp.min(q.y);
+                bt = bt.max(q.y);
+            }
+            let bx = [(l / self.page_w) as f32, (tp / self.page_h) as f32, (r / self.page_w) as f32, (bt / self.page_h) as f32];
+            let text: Vec<char> = match g.as_unicode() {
+                Some(hayro::hayro_interpret::hayro_cmap::BfString::Char(c)) => vec![c],
+                Some(hayro::hayro_interpret::hayro_cmap::BfString::String(s)) => s.chars().collect(),
+                None => Vec::new(),
+            };
+            // ligatures: share the cell between their letters
+            let n = text.len().max(1) as f32;
+            for (k, ch) in text.into_iter().enumerate() {
+                let w = (bx[2] - bx[0]) / n;
+                let x0 = bx[0] + w * k as f32;
+                self.push(ch, Some([x0, bx[1], x0 + w, bx[3]]));
+            }
+            let end = t * hayro::kurbo::Point::new(adv, 0.0);
+            self.last = Some((end.x, p.y, size));
         }
     }
     fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
@@ -242,12 +293,55 @@ impl<'a> Device<'a> for TextDevice {
     fn pop_transparency_group(&mut self) {}
 }
 
-pub fn page_text(pdf: &Pdf, idx: usize) -> String {
+/// Text of page `idx` with a box per character.
+pub fn page_glyphs(pdf: &Pdf, idx: usize) -> PageText {
     let pages = pdf.pages();
-    let Some(page) = pages.get(idx) else { return String::new() };
+    let Some(page) = pages.get(idx) else { return PageText::default() };
+    let (w, h) = page.render_dimensions();
     let cache = InterpreterCache::new();
     let mut ctx = Context::new(page.initial_transform(true).to_kurbo(), hayro::kurbo::Rect::new(0.0, 0.0, 1e6, 1e6), &cache, page.xref(), InterpreterSettings::default());
-    let mut dev = TextDevice { out: String::new(), last: None };
+    let mut dev = TextDevice { out: PageText::default(), last: None, page_w: (w as f64).max(1.0), page_h: (h as f64).max(1.0) };
     interpret_page(page, &mut ctx, &mut dev);
     dev.out
+}
+
+/// Plain text of page `idx`; char offsets match [`page_glyphs`].
+pub fn page_text(pdf: &Pdf, idx: usize) -> String {
+    page_glyphs(pdf, idx).text()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extraction stats on a real PDF: `PDF=path cargo test pdf_words -- --ignored`.
+    #[test]
+    #[ignore]
+    fn pdf_words() {
+        let pdf = load(Path::new(&std::env::var("PDF").unwrap())).unwrap();
+        for i in [5, 20, 40] {
+            let t = page_glyphs(&pdf, i);
+            let s = t.text();
+            let words = s.split_whitespace().count().max(1);
+            let letters = s.chars().filter(|c| c.is_alphabetic()).count();
+            let inside = t.boxes.iter().flatten().filter(|b| b[0] >= -0.01 && b[2] <= 1.01 && b[1] >= -0.05 && b[3] <= 1.05 && b[0] < b[2] && b[1] < b[3]).count();
+            eprintln!("page {i}: letters/word {:.1}, boxes ok {}/{}", letters as f32 / words as f32, inside, t.boxes.iter().flatten().count());
+            // with OUT=dir, also save the page with every character box outlined
+            if let (Ok(dir), Some((w, h, mut px))) = (std::env::var("OUT"), render(&pdf, i, 800)) {
+                for b in t.boxes.iter().flatten() {
+                    let (x0, y0, x1, y1) = ((b[0] * w as f32) as i64, (b[1] * h as f32) as i64, (b[2] * w as f32) as i64, (b[3] * h as f32) as i64);
+                    for x in x0..=x1 {
+                        for y in [y0, y1] {
+                            if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                                let k = ((y as u32 * w + x as u32) * 4) as usize;
+                                px[k..k + 3].copy_from_slice(&[255, 0, 0]);
+                            }
+                        }
+                    }
+                }
+                let img = image::RgbaImage::from_raw(w, h, px).unwrap();
+                img.save(format!("{dir}/page{i}.png")).unwrap();
+            }
+        }
+    }
 }
