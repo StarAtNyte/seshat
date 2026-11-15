@@ -138,6 +138,8 @@ pub struct App {
     confirm_delete: Option<Vec<String>>,
     /// Paths to drop from the library once this frame is drawn (never mid-draw:
     /// the views iterate over entry indices).
+    frame_ms: Vec<f32>,
+    timed: bool,
     pending_remove: Vec<String>,
     /// Multi-selection in the library (ids), its range anchor, and the ids
     /// drawn this frame / last frame (for "select all" and shift-ranges).
@@ -380,6 +382,8 @@ impl App {
             details_data: None,
             settings_open: false,
             confirm_delete: None,
+            frame_ms: Vec::new(),
+            timed: false,
             pending_remove: Vec::new(),
             selected: HashSet::new(),
             sel_anchor: None,
@@ -1103,7 +1107,22 @@ impl eframe::App for App {
         self.index.save();
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if !self.timed {
+            self.timed = true;
+            crate::timing("first frame");
+        }
+        // SESHAT_TIMING: CPU time per frame (previous frame), summarised every 120 frames
+        if std::env::var_os("SESHAT_TIMING").is_some() {
+            if let Some(c) = frame.info().cpu_usage {
+                self.frame_ms.push(c * 1000.0);
+                if self.frame_ms.len() >= 120 {
+                    let mut v = std::mem::take(&mut self.frame_ms);
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    eprintln!("[timing] frame cpu ms: p50 {:.2}  p95 {:.2}  max {:.2}", v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1]);
+                }
+            }
+        }
         if crate::i18n::apply(&self.settings.language).1 {
             ctx.request_repaint();
         }

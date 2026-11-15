@@ -70,3 +70,11 @@ codegen-units = 1
 panic = "abort"
 lto = true
 strip = true
+
+# `cargo build --profile profiling`: release code with symbols, for perf
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+lto = "thin"
+codegen-units = 16

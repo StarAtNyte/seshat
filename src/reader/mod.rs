@@ -106,6 +106,8 @@ pub struct Reader {
     pub loc: Loc,
     layout: Option<SectionLayout>,
     prev_layout: Option<SectionLayout>,
+    /// The neighbouring chapter, laid out ahead of time while idle.
+    spare_layout: Option<SectionLayout>,
     page: usize,
     scroll_y: f32,
     overscroll: f32,
@@ -240,6 +242,7 @@ impl Reader {
             loc,
             layout: None,
             prev_layout: None,
+            spare_layout: None,
             page: 0,
             scroll_y: 0.0,
             overscroll: 0.0,

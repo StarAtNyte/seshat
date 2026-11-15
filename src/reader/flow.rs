@@ -130,28 +130,60 @@ impl Reader {
         }
     }
 
+    /// The layout cache key of section `si` under `typo` (requesting its
+    /// images on the way: how many have arrived changes the layout).
+    fn section_key(&mut self, si: usize, typo: &Typo, paged: bool, g: &Geo) -> (u64, bool) {
+        let book = self.book.clone();
+        let Some(flow) = book.flow() else { return (0, false) };
+        let mut known = 0usize;
+        for b in &flow.sections[si].blocks {
+            if let BlockKind::Image(k) = &b.kind {
+                self.tex.request(k, || flow.resources.get(k).cloned().map(Src::Res), 2048);
+                if !self.tex.is_pending(k) {
+                    known += 1;
+                }
+            }
+        }
+        // a spread opens on the right page, facing the blank inside of the cover
+        let lead = paged && si == self.start_sec() && g.cols == 2 && !self.book.meta.vertical;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (si, typo.key(), known, paged, lead).hash(&mut h);
+        (h.finish(), lead)
+    }
+
+    /// Lay out section `si` (the slow part: shaping every line of the chapter).
+    fn build_section(&self, ctx: &egui::Context, si: usize, typo: &Typo, key: u64, lead: bool) -> Option<SectionLayout> {
+        let flow = self.book.flow()?;
+        let sec = &flow.sections[si];
+        // the cover picture at the top of the text: the hardcover already shows it
+        let trimmed;
+        let sec = match self.cover_block() {
+            Some((cs, cb)) if cs == si => {
+                let mut t = sec.clone();
+                t.blocks[cb].kind = BlockKind::Para;
+                t.blocks[cb].spans.clear();
+                trimmed = t;
+                &trimmed
+            }
+            _ => sec,
+        };
+        let t0 = std::time::Instant::now();
+        let tex = &self.tex;
+        let mut lay = SectionLayout::build(ctx, si, sec, typo, &|k| tex.get(k).map(|l| l.size), key);
+        if std::env::var_os("SESHAT_TIMING").is_some() {
+            eprintln!("[timing] layout section {si}: {:.1} ms, {} pages", t0.elapsed().as_secs_f64() * 1000.0, lay.pages.len());
+        }
+        if lead {
+            lay.pages.insert(0, super::layout::Page { u0: 0, u1: 0, top: 0.0, bottom: 0.0 });
+        }
+        Some(lay)
+    }
+
     fn ensure_layout(&mut self, ctx: &egui::Context, s: &ReaderSettings, pal: &Palette, env: &Env, g: &Geo) {
         let book = self.book.clone();
         let Some(flow) = book.flow() else { return };
         let si = self.loc.section.min(flow.sections.len() - 1);
         self.ensure_sec_chars(si);
-        let sec = &flow.sections[si];
-        // request images of this section (and the next one, as prefetch)
-        let mut known = 0usize;
-        for (k, idx) in sec.blocks.iter().filter_map(|b| if let BlockKind::Image(k) = &b.kind { Some((k, si)) } else { None }) {
-            let _ = idx;
-            self.tex.request(k, || flow.resources.get(k).cloned().map(Src::Res), 2048);
-            if !self.tex.is_pending(k) {
-                known += 1;
-            }
-        }
-        if let Some(next) = flow.sections.get(si + 1) {
-            for b in next.blocks.iter().take(30) {
-                if let BlockKind::Image(k) = &b.kind {
-                    self.tex.request(k, || flow.resources.get(k).cloned().map(Src::Res), 2048);
-                }
-            }
-        }
         let typo = Typo {
             size: s.font_size,
             line_height: s.line_height,
@@ -170,32 +202,26 @@ impl Reader {
             lang: self.book.meta.language.clone(),
             vertical: self.book.meta.vertical,
         };
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         let paged = s.layout == Layout::Paginated || self.book.meta.vertical;
-        // a spread opens on the right page, facing the blank inside of the cover
-        let lead = paged && si == self.start_sec() && g.cols == 2 && !self.book.meta.vertical;
-        (si, typo.key(), known, paged, lead).hash(&mut h);
-        let key = h.finish();
+        let (key, lead) = self.section_key(si, &typo, paged, g);
         if self.layout.as_ref().is_some_and(|l| l.key == key) {
+            self.prefetch_neighbour(ctx, &typo, paged, g);
             return;
         }
-        let tex = &self.tex;
-        // the cover picture at the top of the text: the hardcover already shows it
-        let trimmed;
-        let sec = match self.cover_block() {
-            Some((cs, cb)) if cs == si => {
-                let mut t = sec.clone();
-                t.blocks[cb].kind = BlockKind::Para;
-                t.blocks[cb].spans.clear();
-                trimmed = t;
-                &trimmed
+        // the neighbouring chapter may already be laid out (built while idle)
+        let lay = match self.spare_layout.take() {
+            Some(l) if l.key == key => {
+                if std::env::var_os("SESHAT_TIMING").is_some() {
+                    eprintln!("[timing] section {si}: ready (laid out ahead)");
+                }
+                l
             }
-            _ => sec,
+            _ => {
+                let Some(l) = self.build_section(ctx, si, &typo, key, lead) else { return };
+                l
+            }
         };
-        let mut lay = SectionLayout::build(ctx, si, sec, &typo, &|k| tex.get(k).map(|l| l.size), key);
-        if lead {
-            lay.pages.insert(0, super::layout::Page { u0: 0, u1: 0, top: 0.0, bottom: 0.0 });
-        }
+        let sec = &flow.sections[si];
         self.step = g.cols;
         // characters per page, for book-wide page numbers; short sections
         // (title pages, a chapter's last page) say little, so prefer long ones
@@ -226,6 +252,39 @@ impl Reader {
             }
         }
         self.layout = Some(lay);
+    }
+
+    /// Near either end of a chapter, once page turning has paused, lay out the
+    /// chapter you are heading into, so crossing into it costs nothing.
+    fn prefetch_neighbour(&mut self, ctx: &egui::Context, typo: &Typo, paged: bool, g: &Geo) {
+        let Some(n) = self.book.flow().map(|f| f.sections.len()) else { return };
+        let Some(l) = &self.layout else { return };
+        let (si, pages, step) = (l.section, l.pages.len(), self.step.max(1));
+        let target = if paged {
+            if self.page + step * 3 >= pages && si + 1 < n {
+                Some(si + 1)
+            } else if self.page < step * 3 && si > self.start_sec() && self.prev_layout.as_ref().is_none_or(|p| p.section != si - 1) {
+                Some(si - 1)
+            } else {
+                None
+            }
+        } else {
+            (si + 1 < n && self.scroll_y + self.view_h * 3.0 >= l.height).then_some(si + 1)
+        };
+        let Some(t) = target else { return };
+        let idle = self.turn.is_none() && self.cover_anim.is_none() && self.last_turn.elapsed() > Duration::from_millis(350);
+        let (key, lead) = self.section_key(t, typo, paged, g);
+        if self.spare_layout.as_ref().is_some_and(|s| s.key == key) {
+            return;
+        }
+        if !idle {
+            ctx.request_repaint_after(Duration::from_millis(400));
+            return;
+        }
+        if std::env::var_os("SESHAT_TIMING").is_some() {
+            eprintln!("[timing] laying out section {t} ahead, while idle");
+        }
+        self.spare_layout = self.build_section(ctx, t, typo, key, lead);
     }
 
     /// Where reading starts. An opening section that holds nothing but the
@@ -480,6 +539,7 @@ impl Reader {
         self.ensure_layout(ui.ctx(), s, pal, env, &g);
         self.motion = s.motion;
         if self.opened_at.is_none() {
+            crate::timing("first page");
             let _ = self.cover_tex();
             // no opening animation: a book at its very start rests on its closed
             // front cover until the first page turn; anywhere else opens as is

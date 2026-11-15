@@ -29,7 +29,17 @@ mod ui;
 mod voice;
 mod widgets;
 
+/// Process start, for `SESHAT_TIMING=1` (prints startup and first-page times).
+pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn timing(what: &str) {
+    if std::env::var_os("SESHAT_TIMING").is_some() {
+        eprintln!("[timing] {what}: {:.0} ms", STARTED.get().map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0));
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    STARTED.get_or_init(std::time::Instant::now);
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a == "--make-icons").unwrap_or(false) {
         let dir = std::path::PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "icons".into()));
