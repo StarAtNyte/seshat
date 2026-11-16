@@ -94,7 +94,7 @@ jobs:
 
   macos:
     # One universal app (Apple Silicon + Intel) built on an arm64 runner.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -179,7 +179,7 @@ jobs:
           path: dist/*
 
   voice-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
