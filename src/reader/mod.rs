@@ -99,7 +99,7 @@ pub struct Reader {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     ctx: egui::Context,
-    dirty: bool,
+    pub(crate) dirty: bool,
     last_save: Instant,
 
     // flow state
@@ -701,16 +701,17 @@ impl Reader {
     }
 
     fn toggle_bookmark(&mut self) {
-        if let Some(i) = self.bookmark_here() {
+        let (loc, excerpt) = match &self.book.content {
+            Content::Flow(f) => {
+                let t = f.sections.get(self.loc.section).and_then(|s| s.blocks.get(self.loc.block)).map(|b| b.text()).unwrap_or_default();
+                (self.loc, t.chars().skip(self.loc.offset).take(120).collect::<String>())
+            }
+            Content::Fixed(_) => (Loc::new(self.fx.page, 0, 0), trf!("Page {n}", n = self.fx.page + 1)),
+        };
+        // already marked (on this page, or at exactly this spot): remove it instead of saving a copy
+        if let Some(i) = self.bookmark_here().or_else(|| self.data.bookmarks.iter().position(|b| b.loc == loc)) {
             self.data.bookmarks.remove(i);
         } else {
-            let (loc, excerpt) = match &self.book.content {
-                Content::Flow(f) => {
-                    let t = f.sections.get(self.loc.section).and_then(|s| s.blocks.get(self.loc.block)).map(|b| b.text()).unwrap_or_default();
-                    (self.loc, t.chars().skip(self.loc.offset).take(120).collect::<String>())
-                }
-                Content::Fixed(_) => (Loc::new(self.fx.page, 0, 0), trf!("Page {n}", n = self.fx.page + 1)),
-            };
             let chapter = self.chapter_title(loc);
             self.data.bookmarks.push(Bookmark { loc, excerpt, chapter, created: store::now() });
             self.data.bookmarks.sort_by_key(|b| b.loc);
@@ -734,10 +735,26 @@ impl Reader {
 
     fn add_annotation(&mut self, color: HlColor, with_note: bool) {
         let Some(((b0, c0), (b1, c1))) = self.sel else { return };
-        let text = self.selection_text().unwrap_or_default();
-        let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64).max(self.data.annotations.iter().map(|a| a.id + 1).max().unwrap_or(1));
         // PDF points are (page, char); flow points are (block, char) in the current section
         let (start, end) = if self.book.fixed().is_some() { (Loc::new(b0, 0, c0), Loc::new(b1, 0, c1)) } else { (Loc::new(self.loc.section, b0, c0), Loc::new(self.loc.section, b1, c1)) };
+        // Highlighting text that is already highlighted never saves a second copy:
+        // the same colour again removes it (toggle), another colour recolours it.
+        if let Some(i) = self.data.annotations.iter().position(|a| a.style == HlStyle::Highlight && a.start <= start && end <= a.end) {
+            let a = &mut self.data.annotations[i];
+            let exact = a.start == start && a.end == end;
+            if with_note {
+                self.note_edit = Some((a.id, a.note.clone()));
+            } else if a.color != color {
+                a.color = color;
+            } else if exact && a.note.is_empty() {
+                self.data.annotations.remove(i);
+            }
+            self.clear_selection();
+            self.mark_dirty();
+            return;
+        }
+        let text = self.selection_text().unwrap_or_default();
+        let id = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) as u64).max(self.data.annotations.iter().map(|a| a.id + 1).max().unwrap_or(1));
         let a = Annotation { id, start, end, color, style: HlStyle::Highlight, note: String::new(), text, chapter: self.chapter_title(start), created: store::now() };
         self.data.annotations.push(a);
         self.data.annotations.sort_by_key(|a| a.start);

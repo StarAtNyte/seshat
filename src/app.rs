@@ -452,6 +452,22 @@ impl App {
         self.rebuild_overview();
     }
 
+    /// Edit one book's notes/bookmarks from the main window: in the open reader if
+    /// there is one, otherwise on disk.
+    fn edit_book_data(&mut self, id: &str, f: impl FnOnce(&mut BookData)) {
+        let d = if let Some(r) = self.readers.iter_mut().find(|r| r.id == id) {
+            f(&mut r.data);
+            r.dirty = true;
+            r.data.clone()
+        } else {
+            let mut d = BookData::load(id);
+            f(&mut d);
+            d.save(id);
+            d
+        };
+        self.update_overview_book(id, &d);
+    }
+
     fn rebuild_overview(&mut self) {
         let mut o = Overview::default();
         for e in &self.index.entries {
@@ -1575,7 +1591,8 @@ impl App {
         v.sort_by(|&a, &b| {
             let (x, y) = (&es[a], &es[b]);
             let o = match key {
-                SortKey::Recent => x.last_read.cmp(&y.last_read).then(x.added.cmp(&y.added)),
+                // a freshly imported book counts as recent, so it lands at the top
+                SortKey::Recent => x.last_read.max(x.added).cmp(&y.last_read.max(y.added)).then(x.added.cmp(&y.added)),
                 SortKey::Added => x.added.cmp(&y.added),
                 SortKey::Title => y.title.to_lowercase().cmp(&x.title.to_lowercase()),
                 SortKey::Author => y.author.to_lowercase().cmp(&x.author.to_lowercase()),
@@ -2431,6 +2448,7 @@ impl App {
             return;
         }
         let mut open = None;
+        let mut del: Option<(String, u64)> = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let mut groups: Vec<(String, String, Vec<Annotation>)> = Vec::new();
             for (id, title, a) in &self.overview.notes {
@@ -2459,7 +2477,12 @@ impl App {
                             if !a.note.is_empty() {
                                 ui.label(RichText::new(&a.note).font(ui_m(14.0)).color(ACCENT));
                             }
-                            ui.label(tag(format!("{} · {}", a.chapter, store::relative_time(a.created))).color(pal.muted));
+                            ui.horizontal(|ui| {
+                                ui.label(tag(format!("{} · {}", a.chapter, store::relative_time(a.created))).color(pal.muted));
+                                if ui::text_button(ui, tr("Delete"), false).clicked() {
+                                    del = Some((id.clone(), a.id));
+                                }
+                            });
                             resp
                         });
                         let x = inner.response.rect.left() - 14.0;
@@ -2474,6 +2497,9 @@ impl App {
             }
             ui.add_space(40.0);
         });
+        if let Some((book, ann)) = del {
+            self.edit_book_data(&book, |d| d.annotations.retain(|a| a.id != ann));
+        }
         if let Some((id, l)) = open {
             self.open_at(&id, l);
         }
@@ -2490,6 +2516,7 @@ impl App {
             return;
         }
         let mut open = None;
+        let mut del: Option<(String, Loc, i64)> = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let w = ui.available_width();
             for (n, (id, title, b)) in self.overview.bookmarks.iter().enumerate() {
@@ -2503,11 +2530,19 @@ impl App {
                 ui.painter().text(pos2(r.left() + 70.0 + 6.0 * t, r.top() + 10.0), egui::Align2::LEFT_TOP, trunc(title, 60), ui_m(16.0), pal.fg);
                 ui.painter().text(pos2(r.left() + 70.0 + 6.0 * t, r.top() + 36.0), egui::Align2::LEFT_TOP, trunc(&format!("{} — {}", b.chapter, b.excerpt), 110), egui::FontId::proportional(12.5), pal.muted);
                 ui.painter().text(pos2(r.right() - 6.0, r.top() + 14.0), egui::Align2::RIGHT_TOP, store::relative_time(b.created).to_uppercase(), mono(10.0), pal.muted);
-                if resp.clicked() {
+                let drect = Rect::from_min_size(pos2(r.right() - 72.0, r.top() + 34.0), vec2(72.0, 24.0));
+                let dresp = ui.interact(drect, ui.id().with(("bm-del", n)), Sense::click()).on_hover_text(tr("Delete bookmark"));
+                ui.painter().text(drect.right_center(), egui::Align2::RIGHT_CENTER, tr("Delete").to_uppercase(), mono(10.0), if dresp.hovered() { ACCENT } else { pal.muted });
+                if dresp.clicked() {
+                    del = Some((id.clone(), b.loc, b.created));
+                } else if resp.clicked() {
                     open = Some((id.clone(), b.loc));
                 }
             }
         });
+        if let Some((book, loc, created)) = del {
+            self.edit_book_data(&book, |d| d.bookmarks.retain(|b| !(b.loc == loc && b.created == created)));
+        }
         if let Some((id, l)) = open {
             self.open_at(&id, l);
         }
