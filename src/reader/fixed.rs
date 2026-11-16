@@ -743,7 +743,7 @@ impl Reader {
                 }
             }
         }
-        if resp.hovered() {
+        if resp.hovered() && !ui.ctx().is_pointer_over_area() {
             let (raw, smooth, cmd) = ui.input(|i| (i.raw_scroll_delta, i.smooth_scroll_delta, i.modifiers.command));
             let zoom_delta = ui.input(|i| i.zoom_delta());
             let (lines, points) = Self::wheel_input(ui.ctx());

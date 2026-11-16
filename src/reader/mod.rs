@@ -1653,7 +1653,7 @@ impl Reader {
                             ui.add_space(12.0);
                             ui::rule(ui);
                             ui.add_space(12.0);
-                            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height((ctx.screen_rect().height() * 0.72 - 150.0).max(320.0)).auto_shrink([false, true]).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 let mut first = true;
                                 for para in a.body.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {

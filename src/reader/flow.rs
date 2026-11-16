@@ -736,7 +736,7 @@ impl Reader {
                 }
             }
         }
-        if hover.is_some_and(|p| rect.contains(p)) {
+        if hover.is_some_and(|p| rect.contains(p)) && !ui.ctx().is_pointer_over_area() {
             let (raw, smooth, cmd) = ui.input(|i| (i.raw_scroll_delta, i.smooth_scroll_delta, i.modifiers.command));
             if cmd {
                 // ctrl+wheel = font size
