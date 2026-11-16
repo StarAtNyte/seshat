@@ -13,6 +13,9 @@ use super::{deco_color, Cover, Env, Reader};
 use crate::book::{BlockKind, Loc};
 use crate::store::{HlStyle, Layout, ReaderSettings};
 use crate::texload::Src;
+
+/// Blank space between two chapters in scrolled mode.
+const SEAM: f32 = 32.0;
 use crate::ui::{self, Palette, ACCENT};
 
 /// A cover board's placement (see `Reader::cover_geo`).
@@ -249,6 +252,9 @@ impl Reader {
                 // selection points are block indices of the old section; they mean nothing here
                 self.clear_selection();
                 self.prev_layout = Some(old);
+            } else {
+                // same chapter re-laid out (font, width, images): the neighbour above is stale
+                self.prev_layout = None;
             }
         }
         self.layout = Some(lay);
@@ -414,7 +420,37 @@ impl Reader {
         let max = (l.height - self.view_h + 40.0).max(0.0);
         let n = self.book.flow().map(|f| f.sections.len()).unwrap_or(1);
         let target = self.scroll_y + dy;
-        if target > max + 1.0 {
+        // Next chapter already laid out: let it run on below this one, no jump.
+        let next_ready = l.section + 1 < n && self.spare_layout.as_ref().is_some_and(|x| x.section == l.section + 1 && x.width == l.width && !x.vertical);
+        let prev_ready = l.section > 0 && self.prev_layout.as_ref().is_some_and(|x| x.section + 1 == l.section && x.width == l.width && !x.vertical);
+        if next_ready && target >= l.height + SEAM {
+            let carry = target - (l.height + SEAM);
+            self.clear_selection();
+            if let (Some(nx), Some(old)) = (self.spare_layout.take(), self.layout.take()) {
+                self.scroll_y = carry;
+                self.prev_layout = Some(old);
+                let u = nx.unit_at_y(carry);
+                self.loc = nx.units.get(u).map(|u| Loc::new(nx.section, u.block, u.c0)).unwrap_or(Loc::new(nx.section, 0, 0));
+                self.layout = Some(nx);
+            }
+            self.dirty = true;
+            return;
+        }
+        if prev_ready && target < 0.0 {
+            self.clear_selection();
+            if let (Some(pv), Some(old)) = (self.prev_layout.take(), self.layout.take()) {
+                self.scroll_y = (pv.height + SEAM + target).max(0.0);
+                let u = pv.unit_at_y(self.scroll_y);
+                self.loc = pv.units.get(u).map(|u| Loc::new(pv.section, u.block, u.c0)).unwrap_or(Loc::new(pv.section, 0, 0));
+                self.spare_layout = Some(old);
+                self.layout = Some(pv);
+            }
+            self.dirty = true;
+            return;
+        }
+        if next_ready {
+            self.scroll_y = target.max(0.0);
+        } else if target > max + 1.0 {
             if self.scroll_y >= max - 1.0 && l.section + 1 < n {
                 self.loc = Loc::new(l.section + 1, 0, 0);
                 self.clear_selection();
@@ -791,7 +827,27 @@ impl Reader {
             }
         } else {
             let clip = Rect::from_min_max(pos2(rect.left(), g.top - 4.0), pos2(rect.right(), g.top + g.page_h + 4.0));
-            l.paint(&text_painter.with_clip_rect(clip), g.origin(0), self.scroll_y, self.scroll_y + g.page_h, &texfn, &decos, pal.fg, dim);
+            let tp = text_painter.with_clip_rect(clip);
+            l.paint(&tp, g.origin(0), self.scroll_y, self.scroll_y + g.page_h, &texfn, &decos, pal.fg, dim);
+            // the neighbouring chapters run on above and below, so the seam scrolls like any other text
+            let none: Vec<Deco> = Vec::new();
+            let neighbour = |n: &SectionLayout, oy: f32| {
+                let (top, bottom) = ((-oy).max(0.0), (g.page_h - oy).min(n.height));
+                if bottom > top {
+                    let o = g.origin(0);
+                    n.paint(&tp, pos2(o.x, o.y + oy + top), top, bottom, &texfn, &none, pal.fg, dim);
+                }
+            };
+            {
+                if let Some(nx) = self.spare_layout.as_ref().filter(|x| x.section == l.section + 1 && x.width == l.width && !x.vertical) {
+                    neighbour(nx, l.height + SEAM - self.scroll_y);
+                }
+            }
+            {
+                if let Some(pv) = self.prev_layout.as_ref().filter(|x| x.section + 1 == l.section && x.width == l.width && !x.vertical) {
+                    neighbour(pv, -self.scroll_y - SEAM - pv.height);
+                }
+            }
         }
 
         // chapter numeral hanging in the margin on a chapter's first page

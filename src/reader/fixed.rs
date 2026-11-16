@@ -520,7 +520,7 @@ impl Reader {
         let area = Rect::from_min_max(rect.min + vec2(12.0, 30.0), rect.max - vec2(12.0, 30.0));
         self.view_h = area.height();
         self.fx.spread = self.fx.zoom == 0 && area.width() > area.height() * 1.15 && n > 2;
-        let pages = self.spread_pages();
+        let mut pages = self.spread_pages();
         let base_aspect = |p: usize, me: &Reader| -> f32 {
             let (k, _, _) = me.src_for(p, 0);
             if !is_pdf {
@@ -536,34 +536,85 @@ impl Reader {
         };
         let gap = 6.0;
         let count = pages.len() as f32;
-        // compute display size of each page
-        let mut sizes = Vec::new();
-        for &p in &pages {
-            let a = aspect(p, self);
-            let (w, h) = if self.fx.zoom == 0 {
-                let mut h = area.height() * self.fx.scale;
+        // display size of a page
+        let size_of = |p: usize, me: &Reader| -> egui::Vec2 {
+            let a = aspect(p, me);
+            let (w, h) = if me.fx.zoom == 0 {
+                let mut h = area.height() * me.fx.scale;
                 let mut w = h / a;
-                let maxw = (area.width() - gap * (count - 1.0)) / count * self.fx.scale;
+                let maxw = (area.width() - gap * (count - 1.0)) / count * me.fx.scale;
                 if w > maxw {
                     w = maxw;
                     h = w * a;
                 }
                 (w, h)
             } else {
-                let w = area.width().min(1400.0) * self.fx.scale;
+                let w = area.width().min(1400.0) * me.fx.scale;
                 (w, w * a)
             };
-            sizes.push(vec2(w, h));
+            vec2(w, h)
+        };
+        // One page on screen: pages run on in a continuous column, so scrolling never snaps.
+        let stack = pages.len() == 1;
+        if stack {
+            let half = area.height() / 2.0;
+            let mut p = pages[0];
+            let mut sc = self.fx.scroll;
+            while p + 1 < n && sc >= size_of(p, self).y + gap - half {
+                sc -= size_of(p, self).y + gap;
+                p += 1;
+            }
+            while p > 0 && sc < -half {
+                p -= 1;
+                sc += size_of(p, self).y + gap;
+            }
+            if p == 0 {
+                sc = sc.max(0.0);
+            }
+            if p + 1 == n {
+                sc = sc.min((size_of(p, self).y - area.height()).max(0.0));
+            }
+            if p != self.fx.page {
+                self.fx.page = p;
+                self.dirty = true;
+                self.last_turn = Instant::now();
+            }
+            self.fx.scroll = sc;
+            pages = vec![p];
         }
+        let sizes: Vec<egui::Vec2> = pages.iter().map(|&p| size_of(p, self)).collect();
         let total_w: f32 = sizes.iter().map(|s| s.x).sum::<f32>() + gap * (count - 1.0);
         let max_h = sizes.iter().map(|s| s.y).fold(0.0, f32::max);
         let max_scroll = (max_h - area.height()).max(0.0);
-        self.fx.scroll = self.fx.scroll.clamp(0.0, max_scroll);
+        if !stack {
+            self.fx.scroll = self.fx.scroll.clamp(0.0, max_scroll);
+        }
         let max_pan = ((total_w - area.width()) / 2.0).max(0.0);
         self.fx.pan_x = self.fx.pan_x.clamp(-max_pan, max_pan);
 
         // where each shown page sits on screen (also used for paint below)
         let place = |me: &Reader| -> Vec<(usize, Rect)> {
+            if stack {
+                let p = pages[0];
+                let mut out = Vec::new();
+                let mut y = area.top() - me.fx.scroll;
+                let mut q = p;
+                while q < n && y < area.bottom() + 1.0 {
+                    let sz = size_of(q, me);
+                    out.push((q, Rect::from_min_size(pos2(area.center().x - sz.x / 2.0 + me.fx.pan_x, y), sz)));
+                    y += sz.y + gap;
+                    q += 1;
+                }
+                let mut top = area.top() - me.fx.scroll;
+                let mut q = p;
+                while q > 0 && top > area.top() - 1.0 {
+                    q -= 1;
+                    let sz = size_of(q, me);
+                    top -= sz.y + gap;
+                    out.insert(0, (q, Rect::from_min_size(pos2(area.center().x - sz.x / 2.0 + me.fx.pan_x, top), sz)));
+                }
+                return out;
+            }
             let mut x = area.center().x - total_w / 2.0 + me.fx.pan_x;
             pages
                 .iter()
@@ -578,7 +629,8 @@ impl Reader {
                 .collect()
         };
         if is_pdf {
-            self.want_glyphs(&pages);
+            let vis: Vec<usize> = place(self).iter().map(|x| x.0).collect();
+            self.want_glyphs(&vis);
         }
 
         // input
@@ -699,6 +751,11 @@ impl Reader {
                 self.fx.scale = (self.fx.scale * if raw.y > 0.0 { 1.1 } else { 1.0 / 1.1 }).clamp(0.3, 5.0);
             } else if zoom_delta != 1.0 {
                 self.fx.scale = (self.fx.scale * zoom_delta).clamp(0.3, 5.0);
+            } else if stack {
+                self.fx.scroll -= smooth.y;
+                if self.fx.page + 1 == n && self.fx.scroll >= max_scroll - 0.5 && lines + points < 0.0 {
+                    self.data.finished = true;
+                }
             } else if max_scroll > 1.0 {
                 // scroll within the page; past its edge, a fresh gesture turns it
                 let before = self.fx.scroll;
@@ -725,18 +782,15 @@ impl Reader {
                 }
             }
         }
-        let pages = self.spread_pages();
+        let placed = place(self);
+        let pages: Vec<usize> = placed.iter().map(|x| x.0).collect();
 
         // render requests + paint
         let ppp = ui.ctx().pixels_per_point();
         let painter = ui.painter_at(rect);
-        let mut x = area.center().x - total_w / 2.0 + self.fx.pan_x;
         let mut wanted: Vec<String> = Vec::new();
-        for (i, &p) in pages.iter().enumerate() {
-            let sz = sizes.get(i).copied().unwrap_or(vec2(100.0, 140.0));
-            let y = if sz.y <= area.height() { area.center().y - sz.y / 2.0 } else { area.top() - self.fx.scroll };
-            let r = Rect::from_min_size(pos2(x, y), sz);
-            x += sz.x + gap;
+        for &(p, r) in &placed {
+            let sz = r.size();
             let cb = self.fx.crop_of(p);
             let bucket = ((((sz.x / (cb[2] - cb[0])) * ppp) / 256.0).ceil() as u32 * 256).clamp(256, 4096);
             let (key, src, max_dim) = self.src_for(p, bucket);
@@ -763,7 +817,7 @@ impl Reader {
         }
         // prefetch neighbours at the same resolution
         let cw0 = pages.first().map(|&p| { let c = self.fx.crop_of(p); c[2] - c[0] }).unwrap_or(1.0);
-        let bucket = sizes.first().map(|s| (((s.x / cw0 * ppp) / 256.0).ceil() as u32 * 256).clamp(256, 4096)).unwrap_or(1024);
+        let bucket = placed.first().map(|(_, r)| (((r.width() / cw0 * ppp) / 256.0).ceil() as u32 * 256).clamp(256, 4096)).unwrap_or(1024);
         let lo = pages.iter().min().copied().unwrap_or(0);
         let hi = pages.iter().max().copied().unwrap_or(0);
         for p in [hi + 1, hi + 2, lo.wrapping_sub(1)] {
