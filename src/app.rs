@@ -2477,12 +2477,11 @@ impl App {
                             if !a.note.is_empty() {
                                 ui.label(RichText::new(&a.note).font(ui_m(14.0)).color(ACCENT));
                             }
-                            ui.horizontal(|ui| {
-                                ui.label(tag(format!("{} · {}", a.chapter, store::relative_time(a.created))).color(pal.muted));
-                                if ui::text_button(ui, tr("Delete"), false).clicked() {
-                                    del = Some((id.clone(), a.id));
-                                }
-                            });
+                            ui.label(tag(format!("{} · {}", a.chapter, store::relative_time(a.created))).color(pal.muted));
+                            ui.add_space(2.0);
+                            if ui::text_button(ui, tr("Delete"), false).clicked() {
+                                del = Some((id.clone(), a.id));
+                            }
                             resp
                         });
                         let x = inner.response.rect.left() - 14.0;
@@ -2520,19 +2519,23 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let w = ui.available_width();
             for (n, (id, title, b)) in self.overview.bookmarks.iter().enumerate() {
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 66.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 92.0), Sense::click());
                 let t = ui.ctx().animate_bool_with_time(ui.id().with(("bm", n)), resp.hovered(), 0.15);
                 ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0, pal.border));
                 if t > 0.01 {
                     ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * t, r.height())), CornerRadius::ZERO, pal.hover);
                 }
+                let tx = r.left() + 70.0 + 6.0 * t;
+                // title stays clear of the time stamp, the excerpt gets the full width
+                let title_clip = Rect::from_min_max(r.min, pos2(r.right() - 120.0, r.bottom()));
+                let body_clip = Rect::from_min_max(r.min, pos2(r.right() - 8.0, r.bottom()));
                 ui.painter().text(pos2(r.left(), r.top() + 12.0), egui::Align2::LEFT_TOP, format!("{:03}", n + 1), ui_b(22.0), ACCENT);
-                ui.painter().text(pos2(r.left() + 70.0 + 6.0 * t, r.top() + 10.0), egui::Align2::LEFT_TOP, trunc(title, 60), ui_m(16.0), pal.fg);
-                ui.painter().text(pos2(r.left() + 70.0 + 6.0 * t, r.top() + 36.0), egui::Align2::LEFT_TOP, trunc(&format!("{} — {}", b.chapter, b.excerpt), 110), egui::FontId::proportional(12.5), pal.muted);
+                ui.painter().with_clip_rect(title_clip).text(pos2(tx, r.top() + 10.0), egui::Align2::LEFT_TOP, trunc(title, 60), ui_m(16.0), pal.fg);
+                ui.painter().with_clip_rect(body_clip).text(pos2(tx, r.top() + 36.0), egui::Align2::LEFT_TOP, trunc(&format!("{} — {}", b.chapter, b.excerpt), 110), egui::FontId::proportional(12.5), pal.muted);
                 ui.painter().text(pos2(r.right() - 6.0, r.top() + 14.0), egui::Align2::RIGHT_TOP, store::relative_time(b.created).to_uppercase(), mono(10.0), pal.muted);
-                let drect = Rect::from_min_size(pos2(r.right() - 72.0, r.top() + 34.0), vec2(72.0, 24.0));
+                let drect = Rect::from_min_size(pos2(tx, r.top() + 62.0), vec2(80.0, 22.0));
                 let dresp = ui.interact(drect, ui.id().with(("bm-del", n)), Sense::click()).on_hover_text(tr("Delete bookmark"));
-                ui.painter().text(drect.right_center(), egui::Align2::RIGHT_CENTER, tr("Delete").to_uppercase(), mono(10.0), if dresp.hovered() { ACCENT } else { pal.muted });
+                ui.painter().text(drect.left_center(), egui::Align2::LEFT_CENTER, tr("Delete").to_uppercase(), mono(10.0), if dresp.hovered() { ACCENT } else { pal.muted });
                 if dresp.clicked() {
                     del = Some((id.clone(), b.loc, b.created));
                 } else if resp.clicked() {
@@ -3262,21 +3265,26 @@ impl App {
                     ui.label(tag(tr(g.reason)).color(pal.muted));
                 });
                 for it in &g.items {
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.add_space(34.0);
                         ui.vertical(|ui| {
-                            ui.label(tag(format!("{} · {} · {}", it.format, library::fmt_size(it.size), it.author)).color(pal.muted));
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            ui.add(egui::Label::new(tag(format!("{} · {} · {}", it.format, library::fmt_size(it.size), it.author)).color(pal.muted)).truncate());
                             ui.add(egui::Label::new(RichText::new(&it.path).font(mono(10.5))).truncate());
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if text_button(ui, tr("Remove from library"), false).clicked() {
-                                remove = Some(it.path.clone());
-                            }
-                            if text_button(ui, tr("Open folder"), false).clicked() {
-                                crate::platform::reveal(Path::new(&it.path));
-                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                if text_button(ui, tr("Open folder"), false).clicked() {
+                                    crate::platform::reveal(Path::new(&it.path));
+                                }
+                                if text_button(ui, tr("Remove from library"), false).clicked() {
+                                    remove = Some(it.path.clone());
+                                }
+                            });
                         });
                     });
+                    ui.add_space(6.0);
+                    ui::rule(ui);
                 }
             }
             ui.add_space(40.0);
